@@ -26,8 +26,8 @@ DEFAULT_MODELS = [
     ("vertex_ai/gemini-3.5-flash", "high"),
     ("vertex_ai/gemini-3.6-flash", "low"),
     ("vertex_ai/gemini-3.6-flash", "high"),
-    ("vertex_ai/gemini-3.7-flash", "low"),
-    ("vertex_ai/gemini-3.7-flash", "high"),
+    ("vertex_ai/gemini-3.8-flash", "low"),
+    ("vertex_ai/gemini-3.8-flash", "high"),
 ]
 
 def score_dedup_partition(db_findings: List[Dict[str, Any]], ground_truth: Dict[str, Any]) -> Dict[str, Any]:

@@ -173,13 +173,13 @@ except Exception:  # pragma: no cover - only when pydantic itself is absent
     FindingVerdict = None
     ExtendedReviewVerdict = None
 
-DEFAULT_MODEL = "vertex_ai/gemini-3.7-flash"
+DEFAULT_MODEL = "vertex_ai/gemini-3.8-flash"
 SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce")
 RECOMMENDED_MODELS = (
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "claude-opus-5",
-    "vertex_ai/gemini-3.7-flash",
+    "vertex_ai/gemini-3.8-flash",
     "vertex_ai/gemini-3.5-flash-lite",
     "vertex_ai/claude-opus-5",
     "vertex_ai/zai_org/glm-5.2-maas",
@@ -395,6 +395,14 @@ class MantisAuthError(RuntimeError):
     def __init__(self, message: str, original_exception: Optional[Exception] = None):
         super().__init__(message)
         self.original_exception = original_exception
+
+
+# Process exit status for a MantisAuthError. Distinct from 1 (a scan that
+# failed) and 2 (a budget pause) so a caller can recognize "the provider
+# rejected the credentials" from the status alone. Log text is not a safe
+# channel for that: the pipeline echoes file names and file contents that the
+# code under audit controls, so any marker string can be forged there.
+EXIT_AUTH = 4
 
 
 class MantisStreamingTruncationError(RuntimeError):
@@ -630,27 +638,56 @@ def _largest_message_summary(messages: Any) -> str:
     )
 
 
+def resolve_input_token_cap() -> Optional[int]:
+    """An absolute per-request input ceiling from MANTIS_MAX_INPUT_TOKENS, or None.
+
+    The window-relative guard below bounds a request by the MODEL's limit, which is
+    whatever the model happens to have (a million tokens, say) and nothing at all for a
+    model litellm does not know. This cap is the OPERATOR's limit: a number of tokens
+    one request may carry regardless of model, so the cost of one call has a ceiling
+    that does not move when the model changes and does not vanish behind a gateway.
+    Unset, empty, zero, or unparsable means no cap, which is the previous behaviour.
+    """
+    raw = str(os.environ.get("MANTIS_MAX_INPUT_TOKENS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def enforce_context_budget(model: Any, messages: Any, tools: Any = None) -> None:
-    """Refuses a request that cannot fit the model's context window, before dispatching it."""
+    """Refuses a request that cannot fit the model's context window, or that exceeds the
+    operator's per-request input cap, before dispatching it."""
     limit = resolve_context_limit(model)
-    if not limit:
+    cap = resolve_input_token_cap()
+    if not limit and not cap:
         return
 
     estimated = estimate_prompt_tokens(messages, tools)
-    budget = int(limit * _CONTEXT_BUDGET_RATIO)
+    window_budget = int(limit * _CONTEXT_BUDGET_RATIO) if limit else None
+    budget = min(b for b in (window_budget, cap) if b is not None)
     if estimated <= budget:
         return
 
+    capped = cap is not None and (window_budget is None or cap <= window_budget)
+    if capped:
+        reason = (f"Request to '{model}' exceeds the per-request input cap: estimated "
+                  f"~{estimated:,} input tokens against MANTIS_MAX_INPUT_TOKENS={cap:,}.")
+    else:
+        reason = (f"Request to '{model}' is too large for its context window: estimated "
+                  f"~{estimated:,} input tokens against a {limit:,}-token window "
+                  f"({estimated / limit:.1f}x the window, budget {budget:,}).")
     raise ContextBudgetExceededError(
-        f"Request to '{model}' is too large for its context window: estimated "
-        f"~{estimated:,} input tokens against a {limit:,}-token window "
-        f"({estimated / limit:.1f}x the window, budget {budget:,})."
-        f"{_largest_message_summary(messages)}"
+        reason
+        + f"{_largest_message_summary(messages)}"
         " Refused before dispatch; retrying the identical request cannot succeed. "
         "Narrow the tool output feeding this node (for example, pass a 'directory' to "
         "list_files or a smaller range to read_file).",
         estimated_tokens=estimated,
-        limit=limit,
+        limit=cap if capped else limit,
     )
 
 
@@ -2058,26 +2095,36 @@ def get_llm_kwargs(
         if project:
             llm_kwargs["vertex_project"] = project
             llm_kwargs["vertex_location"] = location
-        # Relax safety filters for Gemini models that sometimes trigger erroneously on
-        # defensive security analysis and vulnerability remediation workflows.
-        if "gemini" in resolved_model:
-            safety_settings = [
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            ]
-            llm_kwargs["safety_settings"] = safety_settings
-            try:
-                import litellm
-                litellm.vertex_ai_safety_settings = safety_settings
-            except Exception:
-                pass
 
         if os.environ.get("VERTEX_FLEX") in ("1", "true", "True") or os.environ.get("VERTEXAI_SERVICE_TIER", "").lower() == "flex":
             headers = llm_kwargs.get("extra_headers") or {}
             headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
             llm_kwargs["extra_headers"] = headers
+
+    # Relax the category filters for Gemini models, which sometimes trigger on
+    # defensive security analysis and vulnerability remediation. Applied on
+    # every route that reaches a Gemini model natively (vertex_ai/ and
+    # gemini/), not only Vertex: the Gemini API route used to run with the
+    # provider defaults, so the same prompt could be filtered through an API
+    # key and pass through a project. Keyed on the provider prefix, not on
+    # the substring "gemini": a Gemini model behind an OpenAI-compatible
+    # gateway (openai/gemini-*) takes OpenAI parameters, and litellm rejects
+    # this one there. The litellm global stays Vertex-scoped; it only exists
+    # for callers that bypass these kwargs.
+    if resolved_model.startswith(("gemini/", "vertex_ai/")) and "gemini" in resolved_model:
+        safety_settings = [
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
+        llm_kwargs["safety_settings"] = safety_settings
+        if resolved_model.startswith("vertex_ai/"):
+            try:
+                import litellm
+                litellm.vertex_ai_safety_settings = safety_settings
+            except Exception:
+                pass
 
     return resolved_model, llm_kwargs
 

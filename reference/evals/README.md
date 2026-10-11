@@ -81,7 +81,7 @@ belongs only in `research_target/ground_truth.json`.
 python3 evals/run_eval.py --stage research --runs 3
 
 # Single configuration, explicit toolset A/B:
-python3 evals/research_eval.py --model vertex_ai/gemini-3.7-flash \
+python3 evals/research_eval.py --model vertex_ai/gemini-3.8-flash \
     --effort low --toolset baseline --json-out /tmp/baseline.json
 ```
 

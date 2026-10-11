@@ -398,15 +398,48 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
 # --- The gate ---------------------------------------------------------------------
 
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
-    """New-side changed line numbers per file from a unified diff. Never raises."""
+    """New-side changed line numbers per file from a unified diff. Never raises.
+
+    File headers are recognized only between hunks. Inside a hunk the
+    `@@ -a,b +c,d @@` counts say exactly how many old-side and new-side lines
+    follow, and every one of them is content -- including a content line
+    that reads `+++ b/other.py`, which the author of the diffed file
+    controls. Treating such a line as a header would re-attribute the rest
+    of the file's hunks to another path, or to nothing.
+    """
     changed: Dict[str, List[int]] = {}
     current = ""
     new_line = 0
+    old_left = 0  # old-side lines still owed by the open hunk
+    new_left = 0  # new-side lines still owed by the open hunk
     for raw in str(diff_text or "").splitlines():
+        in_hunk = old_left > 0 or new_left > 0
+        if in_hunk:
+            if raw.startswith("\\"):
+                continue  # "\ No newline at end of file": not a counted line
+            if raw.startswith("+"):
+                if current:
+                    changed[current].append(new_line)
+                new_line += 1
+                new_left -= 1
+            elif raw.startswith("-"):
+                # Old-side line: the new-side counter does not advance, but
+                # the deletion itself anchors here -- a hunk that only
+                # removes lines (the deleted-guard regression) must still map
+                # to its enclosing function, or the blast radius comes back
+                # empty.
+                if current:
+                    changed[current].append(max(1, new_line))
+                old_left -= 1
+            else:
+                new_line += 1
+                old_left -= 1
+                new_left -= 1
+            continue
         if raw.startswith("+++ "):
             path = raw[4:].strip()
             path = path.split("\t")[0]
@@ -418,23 +451,10 @@ def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
             continue
         m = _HUNK_RE.match(raw)
         if m:
-            new_line = int(m.group(1))
+            old_left = int(m.group(1)) if m.group(1) is not None else 1
+            new_line = int(m.group(2))
+            new_left = int(m.group(3)) if m.group(3) is not None else 1
             continue
-        if not current or new_line <= 0:
-            continue
-        if raw.startswith("+") and not raw.startswith("+++"):
-            changed[current].append(new_line)
-            new_line += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
-            # Old-side line: the new-side counter does not advance, but the
-            # deletion itself anchors here -- a hunk that only removes lines
-            # (the deleted-guard regression) must still map to its enclosing
-            # function, or the blast radius comes back empty.
-            changed[current].append(max(1, new_line))
-        elif raw.startswith("\\"):
-            continue  # "\ No newline at end of file"
-        else:
-            new_line += 1
     return {f: sorted(set(lines)) for f, lines in changed.items()}
 
 

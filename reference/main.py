@@ -35,7 +35,7 @@ from core.sandbox import build_sandbox
 from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
 from core.context import RunContext, current_run_context
 from core.paths import resolve_db_path
-from core.config import MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
+from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
 from core.compactor import MantisEventsSummarizer
 from core.llm_gateway import strip_terminal_control
 
@@ -231,7 +231,7 @@ async def execute_sub_task(
                 if budget_controller and usage and getattr(usage, "total_token_count", None):
                     total_tokens = int(usage.total_token_count)
                     cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
-                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens, cache_discount=0.1)
+                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens)
 
                 if hasattr(event, 'content') and event.content:
                     is_partial = getattr(event, "partial", False)
@@ -463,6 +463,44 @@ _CONFIRM_CAMPAIGN_FLOOR = 50
 # callers and tests. A dict mutation rather than a module global so no caller
 # needs a `global` statement.
 _WORK_PLAN_DISCLOSURE: dict = {"focus": ""}
+
+
+# The run's BudgetController, parked here by the pipeline so that the process
+# exit path can write --spend-report whatever way the run ended: finished,
+# paused at a ceiling, failed, or refused by the provider. A driver that gives
+# this process a token allowance needs the figure in every one of those cases,
+# and a pause is the one case the spend ledger deliberately leaves out.
+_SPEND_REPORT: dict = {"controller": None}
+
+
+def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
+    """Writes the run's spend as JSON to `path`. Never raises.
+
+    Written atomically (temp file + rename) so a reader never sees a partial
+    document. A run that ended before a controller existed reports zeros:
+    nothing was spent, and the absence of a file should mean only "killed
+    before it could say", not "nothing to say".
+    """
+    if not path:
+        return False
+    ctrl = _SPEND_REPORT.get("controller")
+    if ctrl is not None:
+        report = ctrl.spend_snapshot()
+    else:
+        report = {"run_id": "", "tokens": 0, "fresh_tokens": 0, "cached_tokens": 0,
+                  "cache_discount": None, "llm_calls": 0, "graph_steps": 0,
+                  "elapsed_seconds": 0.0, "max_tokens": None, "max_llm_calls": None,
+                  "pause_trigger": ""}
+    report["exit_code"] = exit_code
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        print(f"[SPEND REPORT WARNING] could not write {path}: {exc}", file=sys.stderr)
+        return False
 
 
 def _confirm_work_plan(
@@ -1013,6 +1051,8 @@ async def pipeline(
     enable_context_cache: Optional[bool] = None,
     max_llm_calls_override: Optional[int] = None,
     max_node_tool_calls_override: Optional[int] = None,
+    max_tokens_override: Optional[int] = None,
+    cache_discount_override: Optional[float] = None,
     exclude_override: Optional[list] = None,
     precomputed_astm: Optional[dict] = None,
     scan_mode_override: Optional[str] = None,
@@ -1172,6 +1212,10 @@ async def pipeline(
         resolved_budget.max_llm_calls = max_llm_calls_override
     if max_node_tool_calls_override is not None:
         resolved_budget.max_node_tool_calls = max_node_tool_calls_override
+    if max_tokens_override is not None:
+        resolved_budget.max_tokens = max(0, int(max_tokens_override))
+    if cache_discount_override is not None:
+        resolved_budget.cache_discount = cache_discount_override
     # --no-budget: for operators with dedicated hardware or deep pockets. Zeroes
     # (= disables) exactly the two RUN-level spend ceilings. The campaign-level
     # runaway-loop guards keep their configured values on purpose: they answer
@@ -1182,6 +1226,9 @@ async def pipeline(
         resolved_budget.max_wall_clock_seconds = 0.0
         resolved_budget.max_tokens = 0
     budget_ctrl = BudgetController(config=resolved_budget, run_id=run_id)
+    # Kept where the process exit path can reach it: --spend-report writes
+    # this controller's totals however the run ends.
+    _SPEND_REPORT["controller"] = budget_ctrl
 
     # Target isolation: host target is treated as strictly read-only.
     # Mutations occur only in isolated guest sandboxes or under workspace/.
@@ -2065,6 +2112,11 @@ async def pipeline(
                     finally:
                         replan_lock.release()
             except BudgetExceededError as be:
+                # The first ceiling to trip names the pause; the ADK-raised
+                # call limit never passes through check_budget(), so it is
+                # recorded here rather than there.
+                if not run_budget.pause_trigger:
+                    run_budget.pause_trigger = str(be.trigger or "budget_exceeded")
                 # Report COVERAGE, not just budget. The banner already prints tokens,
                 # steps and elapsed time, but for a file-by-file scan the number that
                 # decides whether the result means anything is how much of the tree was
@@ -2092,11 +2144,11 @@ async def pipeline(
                 break
             except MantisAuthError as ae:
                 print(f"\n{ae}", file=sys.stderr)
-                return 1
+                return EXIT_AUTH
             except Exception as e:
                 if is_auth_error(e):
                     print(f"\n{format_auth_error_message(e)}", file=sys.stderr)
-                    return 1
+                    return EXIT_AUTH
                 print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
             finally:
@@ -2286,7 +2338,7 @@ if __name__ == "__main__":
         sys.exit(_launch_main())
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_AUTH)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         sys.exit(130)

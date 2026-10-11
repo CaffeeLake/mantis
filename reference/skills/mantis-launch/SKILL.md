@@ -43,7 +43,7 @@ target repositories.
     a root repository directory (e.g. `.` or `/path/to/repo`).
   - `--sandbox` / `-s`: Override sandbox mechanism (`static-only`, `gvisor`,
     `microsandbox`, `gce`).
-  - `--model` / `-m`: Override AI model (e.g. `gemini-3.7-flash`,
+  - `--model` / `-m`: Override AI model (e.g. `gemini-3.8-flash`,
     `vertex_ai/claude-opus-5`, `vertex_ai/zai_org/glm-5.2-maas`,
     `openai/{MODEL_ID}`).
   - `--api-base`: Custom endpoint URL for OpenAI-compatible LLM deployments

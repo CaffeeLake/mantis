@@ -632,7 +632,7 @@ class StructuralIndexNodeTest(unittest.IsolatedAsyncioTestCase):
     def _spec(self, node_id: str) -> dict:
         return {
             "name": "wf_intercept_test",
-            "config": {"default_model": "vertex_ai/gemini-3.7-flash"},
+            "config": {"default_model": "vertex_ai/gemini-3.8-flash"},
             "nodes": [
                 {
                     "id": node_id,

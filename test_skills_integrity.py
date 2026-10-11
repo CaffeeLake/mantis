@@ -8,6 +8,7 @@ Checks the skill surface itself; the reference implementation has its own
 suites under reference/, which require reference/install.sh.
 """
 
+import ast
 import pathlib
 import re
 import subprocess
@@ -62,6 +63,43 @@ class ReferenceLinkTests(unittest.TestCase):
                     self.assertEqual(
                         rc, 0, "target exists but is not git-tracked"
                     )
+
+
+class TestLayoutTests(unittest.TestCase):
+    """Every test module that runs itself must do so from its last statement.
+
+    A `unittest.main()` guard in the middle of a file exits before the
+    classes below it are even defined, so `python tests/test_x.py` reports
+    a fraction of the suite as all of it. One file carried 34 silent test
+    classes that way; this keeps the next one from getting past review.
+    """
+
+    TEST_FILES = sorted(
+        list(REPO_ROOT.glob("test_*.py"))
+        + list((REPO_ROOT / "reference").glob("test_*.py"))
+        + list((REPO_ROOT / "reference" / "tests").glob("test_*.py"))
+    )
+
+    @staticmethod
+    def _is_main_guard(node: ast.stmt) -> bool:
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            return False
+        left = node.test.left
+        return isinstance(left, ast.Name) and left.id == "__name__"
+
+    def test_main_guard_is_the_last_statement(self):
+        self.assertGreater(len(self.TEST_FILES), 10)
+        for path in self.TEST_FILES:
+            with self.subTest(file=path.relative_to(REPO_ROOT).as_posix()):
+                body = ast.parse(path.read_text(encoding="utf-8")).body
+                guards = [i for i, n in enumerate(body) if self._is_main_guard(n)]
+                if not guards:
+                    continue
+                self.assertEqual(
+                    guards, [len(body) - 1],
+                    f"{len(body) - 1 - guards[0]} top-level statement(s) follow the "
+                    "__main__ guard and never run under direct execution",
+                )
 
 
 if __name__ == "__main__":

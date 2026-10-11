@@ -3,7 +3,7 @@
   "config": {
     "db_path": "knowledge.db",
     "retry_attempts": 3,
-    "default_model": "vertex_ai/gemini-3.7-flash",
+    "default_model": "vertex_ai/gemini-3.8-flash",
     "reasoning_effort": "medium",
     "timeout": 180,
     "seed_prompt": "Initial Task Input: Evaluate {filepath}",

@@ -115,6 +115,29 @@ class TestParseUnifiedDiff(unittest.TestCase):
         self.assertEqual(mcp_server.parse_unified_diff("not a diff at all"), {})
         self.assertEqual(mcp_server.parse_unified_diff("+++ \n@@ junk @@\n+x"), {})
 
+    def test_header_lookalike_inside_a_hunk_is_content(self):
+        # The author of evil.py wrote "++ b/README.md" as its first line; in
+        # the diff that is "+++ b/README.md" inside the hunk. The hunk header
+        # says three new-side lines follow, so all three are evil.py's.
+        diff = (
+            "diff --git a/evil.py b/evil.py\n"
+            "--- /dev/null\n"
+            "+++ b/evil.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+++ b/README.md\n"
+            "+import os\n"
+            "+os.system(input())\n"
+            "diff --git a/README.md b/README.md\n"
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1 +1,2 @@\n"
+            " # docs\n"
+            "+more\n"
+        )
+        out = mcp_server.parse_unified_diff(diff)
+        self.assertEqual(out["evil.py"], [1, 2, 3])
+        self.assertEqual(out["README.md"], [2])
+
 
 class TestPathsMatch(unittest.TestCase):
     def test_component_aligned_suffix(self):

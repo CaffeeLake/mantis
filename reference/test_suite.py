@@ -2819,16 +2819,16 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         # Test get_llm_kwargs directly with global and node overrides
         model_id, kwargs_default = get_llm_kwargs(
             model_id=None,
-            default_model="vertex_ai/gemini-3.7-flash",
+            default_model="vertex_ai/gemini-3.8-flash",
             default_reasoning_effort="medium",
         )
-        self.assertEqual(model_id, "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(model_id, "vertex_ai/gemini-3.8-flash")
         self.assertEqual(kwargs_default.get("reasoning_effort"), "medium")
 
         # Test node override
         model_id_node, kwargs_node = get_llm_kwargs(
             model_id="vertex_ai/gemini-3.5-flash-lite",
-            default_model="vertex_ai/gemini-3.7-flash",
+            default_model="vertex_ai/gemini-3.8-flash",
             reasoning_effort="low",
             default_reasoning_effort="medium",
         )
@@ -2839,7 +2839,7 @@ class TestMantisReferenceSuite(unittest.IsolatedAsyncioTestCase):
         wf_path = os.path.join(os.path.dirname(__file__), "workflow.json")
         wf, wf_config = load_workflow_from_json(wf_path, load_local=False)
         self.assertIsNotNone(wf)
-        self.assertEqual(wf_config.get("default_model"), "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(wf_config.get("default_model"), "vertex_ai/gemini-3.8-flash")
         self.assertEqual(wf_config.get("reasoning_effort"), "medium")
         # P4: on_enter_status is exported empty -- completion stamps moved to
         # success-only after_agent_callback so a crashed node cannot stamp
@@ -3553,7 +3553,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             "name": "test_pipeline",
             "config": {
                 "db_path": "test_knowledge.db",
-                "default_model": "vertex_ai/gemini-3.7-flash",
+                "default_model": "vertex_ai/gemini-3.8-flash",
                 "sandbox": {
                     "type": "gce",
                     "options": {
@@ -3600,7 +3600,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_placeholder("todo-app-prod"))
         self.assertFalse(is_placeholder("acme-todo-svc"))
         self.assertFalse(is_placeholder("my-gcp-project-123"))
-        self.assertFalse(is_placeholder("vertex_ai/gemini-3.7-flash"))
+        self.assertFalse(is_placeholder("vertex_ai/gemini-3.8-flash"))
         self.assertFalse(is_placeholder("openai/gpt-4o"))
 
     def test_is_default_or_unconfigured(self):
@@ -3608,7 +3608,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 1. Unconfigured with default YOUR_PROJECT_ID
         cfg_unconf = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
         }
         with patch.dict(os.environ, {}, clear=True):
@@ -3618,7 +3618,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 2. Configured static-only sandbox
         cfg_static = {
-            "default_model": "gemini-3.7-flash",
+            "default_model": "gemini-3.8-flash",
             "sandbox": {"type": "static-only", "options": {}}
         }
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "valid-proj"}):
@@ -3628,7 +3628,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 3. Configured GCE sandbox with real project
         cfg_gce = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "gce", "options": {"project": "my-real-project"}}
         }
         with patch("shutil.which", return_value="/usr/bin/gcloud"):
@@ -3647,7 +3647,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 5. gVisor missing docker/podman
         cfg_gv = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "gvisor"}
         }
         with patch("shutil.which", return_value=None):
@@ -3697,7 +3697,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # Base workflow.json on disk remains unchanged
         base_raw = load_workflow_dict(self.sample_wf_path, load_local=False)
-        self.assertEqual(base_raw["config"]["default_model"], "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(base_raw["config"]["default_model"], "vertex_ai/gemini-3.8-flash")
 
         # Merged load reflects overlay
         reloaded = load_workflow_dict(self.sample_wf_path, load_local=True)
@@ -3723,7 +3723,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             json.dump({
                 "name": "overlay_workflow",
                 "config": {
-                    "default_model": "vertex_ai/gemini-3.7-flash",
+                    "default_model": "vertex_ai/gemini-3.8-flash",
                     "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
                 },
                 "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
@@ -3754,7 +3754,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 1. Static sandbox passes preflight instantly
         cfg_static = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "static-only"}
         }
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
@@ -3764,7 +3764,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 2. GCE sandbox with placeholder project fails preflight
         cfg_gce_bad = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
         }
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
@@ -3774,7 +3774,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 3. GCE sandbox with valid credentials tests softened preflight message
         cfg_gce_good = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "gce", "options": {"project": "my-gce-project"}}
         }
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "my-gce-project"}):
@@ -3955,7 +3955,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rc, 0)
 
         # 5. Test CLI save-tracked flag modifies base workflow.json
-        test_args = ["--workflow", self.sample_wf_path, "--model", "gemini-3.7-flash", "--save-tracked"]
+        test_args = ["--workflow", self.sample_wf_path, "--model", "gemini-3.8-flash", "--save-tracked"]
         with patch("sys.argv", ["configure.py"] + test_args):
             with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
                 rc = configure_main()
@@ -3968,14 +3968,14 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {}, clear=True):
             # 1. Fallback to config["project"]
             m, kwargs = get_llm_kwargs(
-                model_id="vertex_ai/gemini-3.7-flash",
+                model_id="vertex_ai/gemini-3.8-flash",
                 config={"project": "fallback-project-alpha"}
             )
             self.assertEqual(kwargs.get("vertex_project"), "fallback-project-alpha")
 
             # 2. Fallback to config["sandbox"]["options"]["project"]
             m, kwargs = get_llm_kwargs(
-                model_id="vertex_ai/gemini-3.7-flash",
+                model_id="vertex_ai/gemini-3.8-flash",
                 config={"sandbox": {"options": {"project": "fallback-sb-project"}}}
             )
             self.assertEqual(kwargs.get("vertex_project"), "fallback-sb-project")
@@ -3984,14 +3984,14 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             with patch("google.auth.default", side_effect=Exception("No credentials")):
                 with self.assertRaises(ValueError):
                     get_llm_kwargs(
-                        model_id="vertex_ai/gemini-3.7-flash",
+                        model_id="vertex_ai/gemini-3.8-flash",
                         config={"sandbox": {"options": {"project": "YOUR_PROJECT_ID"}}}
                     )
 
             # 4. Placeholder in env var is ignored and falls back to config
             with patch.dict(os.environ, {"VERTEXAI_PROJECT": "YOUR_PROJECT_ID", "GOOGLE_CLOUD_PROJECT": ""}):
                 m, kwargs = get_llm_kwargs(
-                    model_id="vertex_ai/gemini-3.7-flash",
+                    model_id="vertex_ai/gemini-3.8-flash",
                     config={"project": "fallback-after-env-placeholder"}
                 )
                 self.assertEqual(kwargs.get("vertex_project"), "fallback-after-env-placeholder")
@@ -4003,15 +4003,15 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         self.assertIn("vertex_ai/claude-opus-5", RECOMMENDED_MODELS)
         self.assertNotIn("anthropic/claude-opus-5", RECOMMENDED_MODELS)
         self.assertIn("vertex_ai/zai_org/glm-5.2-maas", RECOMMENDED_MODELS)
-        self.assertEqual(DEFAULT_MODEL, "vertex_ai/gemini-3.7-flash")
+        self.assertEqual(DEFAULT_MODEL, "vertex_ai/gemini-3.8-flash")
 
     def test_model_normalization_and_routing(self):
         from core.config import normalize_model_id, get_llm_kwargs
 
         # Bare gemini model routes to vertex_ai when GCP env is set
         with patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "proj-123", "GEMINI_API_KEY": ""}):
-            normalized = normalize_model_id("gemini-3.7-flash")
-            self.assertEqual(normalized, "vertex_ai/gemini-3.7-flash")
+            normalized = normalize_model_id("gemini-3.8-flash")
+            self.assertEqual(normalized, "vertex_ai/gemini-3.8-flash")
 
         # Global model override takes precedence
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "proj-123"}):
@@ -4024,7 +4024,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # MANTIS_MODEL env var overrides node model
         with patch.dict(os.environ, {"MANTIS_MODEL": "openai/custom-vllm", "LLM_API_BASE": "http://localhost:8000/v1"}):
-            model_id, kwargs = get_llm_kwargs(model_id="vertex_ai/gemini-3.7-flash")
+            model_id, kwargs = get_llm_kwargs(model_id="vertex_ai/gemini-3.8-flash")
             self.assertEqual(model_id, "openai/custom-vllm")
             self.assertEqual(kwargs["api_base"], "http://localhost:8000/v1")
 
@@ -4047,7 +4047,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         with open(self.sample_wf_path, "w") as f:
             json.dump({
                 "name": "override_workflow",
-                "config": {"default_model": "vertex_ai/gemini-3.7-flash", "sandbox": {"type": "static-only"}},
+                "config": {"default_model": "vertex_ai/gemini-3.8-flash", "sandbox": {"type": "static-only"}},
                 "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
                 "edges": [{"from": "START", "to": "test_agent"}]
             }, f)
@@ -4079,7 +4079,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         with open(self.sample_wf_path, "w") as f:
             json.dump({
                 "name": "launch_workflow",
-                "config": {"default_model": "vertex_ai/gemini-3.7-flash", "sandbox": {"type": "static-only"}},
+                "config": {"default_model": "vertex_ai/gemini-3.8-flash", "sandbox": {"type": "static-only"}},
                 "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
                 "edges": [{"from": "START", "to": "test_agent"}]
             }, f)
@@ -4106,7 +4106,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             json.dump({
                 "name": "launch_unconf_workflow",
                 "config": {
-                    "default_model": "vertex_ai/gemini-3.7-flash",
+                    "default_model": "vertex_ai/gemini-3.8-flash",
                     "sandbox": {"type": "gce", "options": {"project": "YOUR_PROJECT_ID"}}
                 },
                 "nodes": [{"id": "test_agent", "type": "agent", "system_prompt": "prompt.md"}],
@@ -4179,7 +4179,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         # 3. Preflight probe integration (probe=True vs probe=False)
         cfg = {
-            "default_model": "vertex_ai/gemini-3.7-flash",
+            "default_model": "vertex_ai/gemini-3.8-flash",
             "sandbox": {"type": "static-only"},
         }
         with patch.dict(os.environ, {"VERTEXAI_PROJECT": "test-project"}):
@@ -4398,7 +4398,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
 
         litellm_auth_err = litellm.AuthenticationError(
             "AuthenticationError: Invalid API Key provided",
-            model="gemini-3.7-flash",
+            model="gemini-3.8-flash",
             llm_provider="vertex_ai",
         )
         self.assertTrue(is_auth_error(litellm_auth_err))
@@ -4413,7 +4413,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_auth_error(RuntimeError("connection reset")))
 
         # 3. Verify format_auth_error_message content
-        banner = format_auth_error_message(refresh_err, model="vertex_ai/gemini-3.7-flash")
+        banner = format_auth_error_message(refresh_err, model="vertex_ai/gemini-3.8-flash")
         self.assertIn("AUTHENTICATION ERROR", banner)
         self.assertIn("gcloud auth application-default login", banner)
         self.assertIn("export GOOGLE_APPLICATION_CREDENTIALS", banner)
@@ -4432,7 +4432,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(MantisAuthError) as ctx:
                 asyncio.run(
                     client.acompletion(
-                        model="vertex_ai/gemini-3.7-flash",
+                        model="vertex_ai/gemini-3.8-flash",
                         messages=[{"role": "user", "content": "test"}],
                     )
                 )
@@ -4451,19 +4451,19 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
         with patch("litellm.completion", side_effect=_mock_sync_auth_fail), patch("time.sleep") as mock_time_sleep:
             with self.assertRaises(MantisAuthError):
                 client.completion(
-                    model="vertex_ai/gemini-3.7-flash",
+                    model="vertex_ai/gemini-3.8-flash",
                     messages=[{"role": "user", "content": "test"}],
                 )
             self.assertEqual(sync_attempts, 1)
             mock_time_sleep.assert_not_called()
 
         # 5. ResilientLiteLlm.generate_content_async raises MantisAuthError immediately
-        llm = ResilientLiteLlm(model="vertex_ai/gemini-3.7-flash")
+        llm = ResilientLiteLlm(model="vertex_ai/gemini-3.8-flash")
         from google.adk.models import LlmRequest
         from google.genai import types
 
         req = types.Content(role="user", parts=[types.Part.from_text(text="audit")])
-        llm_req = LlmRequest(model="vertex_ai/gemini-3.7-flash", contents=[req])
+        llm_req = LlmRequest(model="vertex_ai/gemini-3.8-flash", contents=[req])
 
         with patch("litellm.acompletion", side_effect=_mock_auth_fail), patch("asyncio.sleep") as mock_sleep:
             async def _consume():
@@ -4603,7 +4603,7 @@ class TestMantisConfigureAndLaunch(unittest.IsolatedAsyncioTestCase):
              patch("core.config.try_refresh_auth", return_value=True) as mock_refresh:
             res = asyncio.run(
                 client.acompletion(
-                    model="vertex_ai/gemini-3.7-flash",
+                    model="vertex_ai/gemini-3.8-flash",
                     messages=[{"role": "user", "content": "test"}],
                 )
             )

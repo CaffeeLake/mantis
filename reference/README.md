@@ -53,7 +53,7 @@ You can customize the sandbox execution mechanism (`static-only`, `gvisor`,
 python3 scripts/configure.py --sandbox static-only
 
 # Or pass runtime overrides directly to launch:
-./run.sh path/to/code --sandbox static-only --model gemini-3.7-flash
+./run.sh path/to/code --sandbox static-only --model gemini-3.8-flash
 ```
 
 Once you have run it you can add the mantis-advise skill to your favorite coding

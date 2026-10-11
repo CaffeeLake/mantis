@@ -77,7 +77,7 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     (used by research_eval.py for toolset A/B runs). Names still resolve
     through tools.TOOLS, so an override cannot inject an unregistered tool.
     """
-    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.7-flash')
+    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
     
     _, llm_kwargs = get_llm_kwargs(model_id=model_id, reasoning_effort=reasoning_effort)

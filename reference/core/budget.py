@@ -130,6 +130,12 @@ class BudgetConfig:
     max_node_visits: int = 50                     # Per-node runaway loop ceiling
     max_llm_calls: int = 2000                     # Global LLM call ceiling (2,000 default)
     max_node_tool_calls: int = 200                # Per-node visit runaway tool loop ceiling (200 default)
+    # Weight of a cached input token against max_tokens. 0.1 matches the
+    # discount providers give for a cache hit; 1.0 counts every token at
+    # full price, which is what a run that must bound its worst-case bill
+    # wants: a ceiling on effective tokens bounds raw tokens only when the
+    # two are the same number.
+    cache_discount: float = 0.1
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> BudgetConfig:
@@ -147,6 +153,7 @@ class BudgetConfig:
         raw_node_tool_calls = d.get("max_node_tool_calls")
         if raw_node_tool_calls is None:
             raw_node_tool_calls = d.get("max_tool_calls")
+        raw_discount = d.get("cache_discount")
 
         return cls(
             max_wall_clock_seconds=parse_duration_seconds(raw_seconds) if raw_seconds is not None else 12.0 * 3600.0,
@@ -155,7 +162,19 @@ class BudgetConfig:
             max_node_visits=int(raw_node_visits) if raw_node_visits is not None else 50,
             max_llm_calls=int(raw_llm_calls) if raw_llm_calls is not None else 2000,
             max_node_tool_calls=int(raw_node_tool_calls) if raw_node_tool_calls is not None else 200,
+            cache_discount=clamp_cache_discount(raw_discount) if raw_discount is not None else 0.1,
         )
+
+
+def clamp_cache_discount(val: Any) -> float:
+    """A cache discount is a weight in [0, 1]; anything else is a configuration error."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid cache_discount: {val!r}. Expected a number between 0 and 1.") from None
+    if not (0.0 <= f <= 1.0):
+        raise ValueError(f"Invalid cache_discount: {val!r}. Expected a number between 0 and 1.")
+    return f
 
 
 class BudgetExceededError(Exception):
@@ -235,6 +254,32 @@ class BudgetController:
         self.node_visit_counts: Dict[str, int] = {}
         self.node_tool_counts: Dict[str, int] = {}
         self.is_paused = False
+        # Which ceiling paused the run, if one did ("token_budget",
+        # "llm_calls_limit", "wall_clock", ...). Set by check_budget() for the
+        # ceilings it owns and by the scan loop for the ones ADK raises.
+        self.pause_trigger = ""
+
+    def spend_snapshot(self) -> Dict[str, Any]:
+        """The run's spend so far, in the terms the ceilings use.
+
+        `tokens` is what max_tokens was checked against (cached input weighted
+        by cache_discount); `fresh_tokens + cached_tokens` is the raw count a
+        provider bills before any discount. A caller that must bound the bill
+        wants the raw sum, or runs with cache_discount=1.0 so the two agree.
+        """
+        return {
+            "run_id": self.run_id,
+            "tokens": int(self.accumulated_tokens),
+            "fresh_tokens": int(self.fresh_tokens),
+            "cached_tokens": int(self.cached_tokens),
+            "cache_discount": float(self.config.cache_discount),
+            "llm_calls": int(self.llm_calls),
+            "graph_steps": int(self.graph_steps),
+            "elapsed_seconds": round(self.elapsed_seconds, 1),
+            "max_tokens": int(self.config.max_tokens),
+            "max_llm_calls": int(self.config.max_llm_calls),
+            "pause_trigger": self.pause_trigger,
+        }
 
     def begin_campaign(self) -> None:
         """Resets the per-campaign runaway-loop counters at a campaign boundary.
@@ -272,7 +317,11 @@ class BudgetController:
             return f"{hours}h {minutes:02d}m {secs:02d}s"
         return f"{minutes}m {secs:02d}s"
 
-    def record_tokens(self, count: int, cached_count: int = 0, cache_discount: float = 0.1) -> None:
+    def record_tokens(self, count: int, cached_count: int = 0,
+                      cache_discount: Optional[float] = None) -> None:
+        """Records token consumption from an LLM call or stage. Cached input
+        tokens are weighted by `cache_discount` (the config's when omitted:
+        0.1 by default, a 90% discount, matching a provider's cache-hit price)."""
         self.llm_calls += 1
         # Per-campaign twin of the observer above, reset by begin_campaign().
         # Enforcement of max_llm_calls stays with the ADK RunConfig, which is
@@ -280,9 +329,10 @@ class BudgetController:
         # already per-campaign scoped; this counter exists so the controller
         # can report how deep into ITS campaign allowance a campaign got.
         self.campaign_llm_calls += 1
-        """Records token consumption from an LLM call or stage with cache discounting (0.1x / 90% discount)."""
         if count <= 0:
             return
+        if cache_discount is None:
+            cache_discount = self.config.cache_discount
         if cached_count > 0:
             uncached = max(0, count - cached_count)
             effective = int(uncached + cached_count * cache_discount)
@@ -538,7 +588,8 @@ class CampaignBudgetScope(BudgetController):
         super().__init__(config=parent.config, run_id=parent.run_id)
         self._parent = parent
 
-    def record_tokens(self, count: int, cached_count: int = 0, cache_discount: float = 0.1) -> None:
+    def record_tokens(self, count: int, cached_count: int = 0,
+                      cache_discount: Optional[float] = None) -> None:
         """Records tokens against this campaign AND the shared run ledger.
 
         Deliberately does not call parent.record_tokens(): that would also
@@ -549,6 +600,8 @@ class CampaignBudgetScope(BudgetController):
         self.llm_calls += 1
         self.campaign_llm_calls += 1
         self._parent.llm_calls += 1
+        if cache_discount is None:
+            cache_discount = self.config.cache_discount
         if count > 0:
             if cached_count > 0:
                 uncached = max(0, count - cached_count)

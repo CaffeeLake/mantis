@@ -1141,7 +1141,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     # 2. Select Model
     print("\nStep 2: Select AI Model")
     model_choices = [
-        ("vertex_ai/gemini-3.7-flash", "Gemini 3.7 Flash via Vertex AI (Recommended)"),
+        ("vertex_ai/gemini-3.8-flash", "Gemini 3.8 Flash via Vertex AI (Recommended)"),
         ("vertex_ai/gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite via Vertex AI (Fast & Low Cost)"),
         ("vertex_ai/claude-opus-5", "Claude Opus 5 via Vertex AI Model Garden"),
         ("vertex_ai/zai_org/glm-5.2-maas", "GLM 5.2 via Vertex AI Model Garden"),
@@ -1267,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         "-m",
         type=str,
-        help="Default LLM model (e.g. gemini-3.7-flash, vertex_ai/claude-opus-5, openai/my-model)",
+        help="Default LLM model (e.g. gemini-3.8-flash, vertex_ai/claude-opus-5, openai/my-model)",
     )
     parser.add_argument("--api-base", type=str, help="Custom LLM API Base URL")
     parser.add_argument(

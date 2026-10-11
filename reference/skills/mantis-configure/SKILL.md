@@ -35,7 +35,7 @@ inside audited target repositories.
 - **CLI Options:**
   - `--sandbox` / `-s`: Sandbox mechanism (`static-only`, `gvisor`,
     `microsandbox`, `gce`).
-  - `--model` / `-m`: Default LLM model (e.g. `gemini-3.7-flash`,
+  - `--model` / `-m`: Default LLM model (e.g. `gemini-3.8-flash`,
     `vertex_ai/claude-opus-5`, `vertex_ai/zai_org/glm-5.2-maas`,
     `openai/{MODEL_ID}`).
   - `--api-base`: Custom endpoint URL for OpenAI-compatible LLM servers (e.g.
@@ -79,8 +79,8 @@ inside audited target repositories.
 ## Supported Model Providers
 
 1. **Gemini Models (Google / Vertex AI)**:
-   - `gemini-3.7-flash`, `gemini-3.5-flash-lite`
-   - `vertex_ai/gemini-3.7-flash`, `vertex_ai/gemini-3.5-flash-lite`
+   - `gemini-3.8-flash`, `gemini-3.5-flash-lite`
+   - `vertex_ai/gemini-3.8-flash`, `vertex_ai/gemini-3.5-flash-lite`
 2. **Claude Models (Vertex AI Model Garden)**:
    - `vertex_ai/claude-opus-5`
 3. **MaaS & Open Source Models (Vertex Model Garden)**:

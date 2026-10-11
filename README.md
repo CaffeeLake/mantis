@@ -44,8 +44,9 @@ python3 scripts/configure.py --test --probe
 # 4b. (Optional) Leave vendored or generated code out of the scan
 ./run.sh path/to/code --exclude vendor,testdata --exclude 'third_party/*'
 
-# 5. (Optional) Remove spend limits for long unattended runs
-./run.sh path/to/code --no-budget --parallel 32
+# 5. (Optional) Set or remove the spend ceiling for a run
+./run.sh path/to/code --max-tokens 2M --cache-discount 1   # hard cap, every token at full price
+./run.sh path/to/code --no-budget --parallel 32            # no ceiling, for long unattended runs
 #    Parallel campaigns share one SQLite database; a writer waits up to
 #    15s x --parallel (min 60s) for the lock. Raise it on slow disks:
 ./run.sh path/to/code --parallel 32 --db-timeout 600   # or MANTIS_DB_TIMEOUT=600

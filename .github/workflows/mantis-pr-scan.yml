@@ -1,0 +1,68 @@
+# Scans the files a pull request changes with Mantis and annotates the diff.
+# Advisory: the verdict never fails this job. This workflow is also the
+# reference other repositories copy; see reference/docs/github-action.md.
+name: Mantis PR scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      base-sha:
+        description: Base commit to diff the checked-out ref against.
+        required: true
+
+# No GitHub token use anywhere in the job: annotations go through workflow
+# commands. id-token lets the auth step mint the OIDC token it exchanges for
+# a short-lived cloud credential; it grants nothing on GitHub.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mantis-pr-scan-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    # Same-repository pull requests only. Fork PRs have no secrets, so the
+    # scan could not run; and the pinned-action guarantee below does not
+    # hold for a local `uses: ./action` once the PR can edit action/.
+    # Drafts wait until they are marked ready (ready_for_review above), and
+    # bot-authored pull requests (dependency bumps) are not scanned: both
+    # are spend without a reader. Every run that does start is bounded by
+    # the action's token budget; this only cuts the number of runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft &&
+       github.event.pull_request.user.type != 'Bot')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # The job runs the action from this checkout, so a same-repository PR
+    # can change what runs with the credential. Protect this environment
+    # with required reviewers in the repository settings so a human
+    # approves each run.
+    environment: mantis-pr-scan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Workload identity: the provider name, service account, and project
+      # are environment secrets. None is a credential; the token the step
+      # obtains is scoped to one service account that can call the model
+      # and read the project's usage meter, on one project, and expires
+      # with the job.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: ./action
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT }}
+        with:
+          model: vertex_ai/gemini-3.8-flash
+          base-sha: ${{ github.event.pull_request.base.sha || inputs.base-sha }}
