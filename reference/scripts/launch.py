@@ -133,6 +133,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--db-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds a knowledge-database write waits for the lock before "
+            "failing with 'database is locked' (default: 60, or 15 x "
+            "--parallel when that is larger; also MANTIS_DB_TIMEOUT)"
+        ),
+    )
+    parser.add_argument(
         "--focus",
         type=str,
         default="",
@@ -253,6 +263,7 @@ def run_launch(
     no_budget: bool = False,
     no_replan: bool = False,
     parallel: int = 1,
+    db_timeout: Optional[float] = None,
     focus: str = "",
     seed_report: str = "",
     max_steps: Optional[int] = None,
@@ -563,6 +574,7 @@ def run_launch(
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
                 enable_replan=False if no_replan else None,
                 parallel=parallel,
+                db_timeout=db_timeout,
                 focus=focus,
                 seed_report_path=seed_report,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
@@ -600,6 +612,7 @@ def main() -> int:
         no_budget=args.no_budget,
         no_replan=args.no_replan,
         parallel=args.parallel,
+        db_timeout=args.db_timeout,
         focus=args.focus,
         seed_report=args.seed_report,
         max_steps=args.max_steps,

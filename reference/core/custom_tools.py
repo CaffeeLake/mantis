@@ -63,6 +63,15 @@ import re
 import shlex
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
 logger = logging.getLogger(__name__)
 
 LANE_DECLARATIVE = "declarative"
@@ -195,7 +204,7 @@ def _build_declarative(name: str, cfg: Dict[str, Any]) -> Callable[..., str]:
         if ctx is None:
             return "Error: No active execution context."
         try:
-            conn = sqlite3.connect(ctx.db_path)
+            conn = _connect(ctx.db_path)
             try:
                 cur = conn.execute(query, tuple(params))
                 rows = cur.fetchmany(limit)

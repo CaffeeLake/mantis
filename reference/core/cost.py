@@ -64,6 +64,15 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
 # Characters per token. Matches core.config._CHARS_PER_TOKEN and the estimate at
 # main.py's token fallback, deliberately: a second, different constant for the same
 # quantity would make two parts of the system disagree about what a token costs.
@@ -201,7 +210,7 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
     try:
         if not os.path.exists(db_path):
             return all_files
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             try:
                 rows = conn.execute(
@@ -260,7 +269,7 @@ def record_spend(
         # closing(), not a bare `with`: sqlite3's connection context manager is a
         # TRANSACTION manager that commits or rolls back and leaves the handle open.
         # One leaked descriptor per campaign is 462,079 of them on a chromium sweep.
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = _connect(db_path)
         with conn:
             _ensure_table(conn)
             conn.execute(
@@ -309,7 +318,7 @@ def observed_campaign_cost(
     rows: list[Any] = []
     conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = _connect(db_path)
         with conn:
             _ensure_table(conn)
             cur = conn.cursor()

@@ -29,6 +29,15 @@ from core.llm_gateway import (
 )
 
 
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
+
 def find_default_db(custom_path: str = "") -> Optional[str]:
     """Auto-discovers knowledge.db across standard workspace and repository locations."""
     from core.paths import resolve_db_path
@@ -231,7 +240,7 @@ except (ImportError, ModuleNotFoundError):
 def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -> Dict[str, Any]:
     """Queries knowledge.db directly using standard sqlite3 to generate an advisory dossier."""
     norm_fp = canonical_filepath(filepath, target_file=filepath)
-    conn = sqlite3.connect(resolve_db_path(db_path))
+    conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -515,7 +524,7 @@ def query_guidance_standalone(db_path: str, filepath: str, full: bool = False) -
 def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str = "", filepath: str = "") -> List[Dict[str, Any]]:
     """Queries lineage history directly from knowledge.db."""
     norm_fp = canonical_filepath(filepath, target_file=filepath) if filepath else ""
-    conn = sqlite3.connect(resolve_db_path(db_path))
+    conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -548,7 +557,7 @@ def query_lineage_standalone(db_path: str, lineage_id: str = "", signature: str 
 
 def query_remediation_standalone(db_path: str, finding_id_or_target: str, full: bool = False) -> Dict[str, Any]:
     """Generates a structured Architectural Remediation Dossier for a specific finding or target."""
-    conn = sqlite3.connect(resolve_db_path(db_path))
+    conn = _connect(resolve_db_path(db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 

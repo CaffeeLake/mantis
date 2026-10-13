@@ -1014,8 +1014,22 @@ async def pipeline(
     seed_report_path: str = "",
     path_root: str = "",
     save_config: bool = False,
+    db_timeout: Optional[float] = None,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
+    # SQLite serializes writers, and every parallel campaign writes findings
+    # and spend rows to the same file. The busy timeout is what separates a
+    # queued write from a dead campaign ("database is locked"), so it scales
+    # with the number of writers unless the operator pins it. Set in the
+    # environment because every connection in every module reads it there,
+    # including ones opened before this function returns.
+    from core.database import DB_TIMEOUT_ENV, DEFAULT_DB_TIMEOUT
+
+    if db_timeout is not None:
+        os.environ[DB_TIMEOUT_ENV] = str(max(0.0, float(db_timeout)))
+    elif not os.environ.get(DB_TIMEOUT_ENV):
+        os.environ[DB_TIMEOUT_ENV] = str(max(DEFAULT_DB_TIMEOUT, 15.0 * max(1, int(parallel or 1))))
+
     if not workflow_path:
         pipeline_dir = os.path.realpath(os.path.dirname(__file__))
         workflow_path = os.path.join(pipeline_dir, "workflow.json")
@@ -2310,6 +2324,16 @@ def parse_cli_args():
             "be an ancestor of the target"
         ),
     )
+    parser.add_argument(
+        "--db-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds a knowledge-database write waits for the lock before "
+            "failing with 'database is locked' (default: 60, or 15 x "
+            "--parallel when that is larger; also MANTIS_DB_TIMEOUT)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2345,6 +2369,7 @@ if __name__ == "__main__":
                 seed_report_path=args.seed_report,
                 path_root=args.path_root,
                 save_config=args.save_config,
+                db_timeout=args.db_timeout,
             )
         )
         sys.exit(exit_code)

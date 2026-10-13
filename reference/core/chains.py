@@ -45,6 +45,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+
+def _shared_connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
 # SECURITY (INV-4): database paths are anchored and symlink-refused before they
 # are opened. If the resolver cannot be imported, this module fails CLOSED --
 # every function becomes a no-op -- rather than opening an unanchored path.
@@ -126,7 +135,7 @@ def _connect(db_path: str, must_exist: bool = False) -> Optional[sqlite3.Connect
     resolved = _resolve_db_path(db_path)  # raises to the caller's catch-all
     if must_exist and not os.path.exists(resolved):
         return None
-    return sqlite3.connect(resolved, timeout=30.0)
+    return _shared_connect(resolved)
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:

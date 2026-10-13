@@ -93,8 +93,8 @@ SCENARIOS = {
          "    db_path = resolve_db_path(db_path)",
          "    pass  # NEUTERED"),
         ("scripts/advise.py",
-         "    conn = sqlite3.connect(resolve_db_path(db_path))",
-         "    conn = sqlite3.connect(db_path)  # NEUTERED"),
+         "    conn = _connect(resolve_db_path(db_path))",
+         "    conn = _connect(db_path)  # NEUTERED"),
     ],
     "r3_revert_okf_export_sanitizer": [
         ("core/database.py",

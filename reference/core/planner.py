@@ -98,6 +98,15 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
 logger = logging.getLogger(__name__)
 
 # Ordering bands, best-first. The value is the sort rank; the key is what the operator
@@ -626,7 +635,7 @@ def _load_spend_summary(db_path: str) -> Dict[str, Any]:
         return unavailable
     conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = _connect(db_path)
         cur = conn.cursor()
         # Per-target: how often walked and at what average cost. Bounded and newest
         # first, because a plan is about the recent past, not the archive.

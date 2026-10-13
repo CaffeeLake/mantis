@@ -26,6 +26,63 @@ class _NoAnchorLoader(yaml.SafeLoader):
 
 CURRENT_SCHEMA_VERSION = 3
 
+# How long a connection waits for the write lock before giving up. SQLite
+# serializes writers; under --parallel N, N campaigns record findings and
+# spend rows against one file, and a wait longer than this surfaces as
+# "database is locked" and kills the campaign. Python's default is 5s, which
+# a dozen concurrent writers exceed routinely (reported from the field at
+# --parallel 20). The pipeline raises this with parallelism; the operator
+# can set it outright with --db-timeout or MANTIS_DB_TIMEOUT (seconds).
+DEFAULT_DB_TIMEOUT = 60.0
+DB_TIMEOUT_ENV = "MANTIS_DB_TIMEOUT"
+
+_journal_mode_set: set = set()
+
+
+def db_timeout() -> float:
+    """The busy timeout in effect, in seconds."""
+    raw = os.environ.get(DB_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+        logger.warning("Ignoring invalid %s=%r; using %.0fs", DB_TIMEOUT_ENV, raw, DEFAULT_DB_TIMEOUT)
+    return DEFAULT_DB_TIMEOUT
+
+
+def connect(db_path: str, timeout: Optional[float] = None) -> sqlite3.Connection:
+    """The one way to open the knowledge database for reading or writing.
+
+    Sets the busy timeout (see db_timeout) and, once per path per process,
+    switches the file to write-ahead logging so readers never block the
+    writer and the writer never blocks readers; only writers still serialize,
+    and they wait rather than fail. WAL is a property of the file, so every
+    later connection from any process inherits it. If the filesystem refuses
+    (some network mounts), the default journal stays and only the timeout
+    applies. Callers that need a path outside the knowledge database (the
+    structural catalog, scratch copies) keep their own connections.
+    """
+    conn = sqlite3.connect(db_path, timeout=db_timeout() if timeout is None else timeout)
+    if db_path != ":memory:":
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(row[0]).lower() if row else ""
+            if mode != "wal" and db_path not in _journal_mode_set:
+                row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                mode = str(row[0]).lower() if row else mode
+                if mode == "wal":
+                    _journal_mode_set.add(db_path)
+            if mode == "wal":
+                # Per connection, not per file: durable across process crashes,
+                # and the WAL makes FULL unnecessary.
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass  # read-only media or a filesystem without shared-memory support
+    return conn
+
 ACTIVE_STATUSES = (
     "reported",
     "static_confirmed",
@@ -69,7 +126,7 @@ def _db(db_path: str, check_version: bool = True):
     # is where the path is anchored to the installation and refused if it is (or traverses)
     # a symlink. See core.paths.resolve_db_path.
     db_path = resolve_db_path(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if check_version:

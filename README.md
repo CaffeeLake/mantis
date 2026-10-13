@@ -43,6 +43,9 @@ python3 scripts/configure.py --test --probe
 
 # 5. (Optional) Remove spend limits for long unattended runs
 ./run.sh path/to/code --no-budget --parallel 32
+#    Parallel campaigns share one SQLite database; a writer waits up to
+#    15s x --parallel (min 60s) for the lock. Raise it on slow disks:
+./run.sh path/to/code --parallel 32 --db-timeout 600   # or MANTIS_DB_TIMEOUT=600
 
 # 6. (Optional) Research Graph Synthesis: designs a new agent-graph topology for your objective
 ./run.sh path/to/code --objective "Audit for Server-Side Request Forgery and SSRF in webhook handlers"
