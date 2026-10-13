@@ -8,7 +8,7 @@ budget-capped scoped scan that runs the full Mantis pipeline over a change
 set in the background. The intended loop: edit, call mantis_check_change on
 the diff, fix or verify what it raises, and let mantis_scan_change audit
 the touched files in parallel; the next check_change sees whatever the scan
-found, because both read the same per-repo .mantis/knowledge.db.
+found, because both read the same per-repository knowledge database.
 
 Design rules, in force everywhere in this file:
 
@@ -19,7 +19,8 @@ Design rules, in force everywhere in this file:
   scan has ever covered yields REVIEW with instructions -- never PASS. PASS
   means "every check ran and nothing known intersects this change", not
   "secure".
-- Nothing writes outside the repo's .mantis/ directory, and read-only
+- Nothing writes into the repository, ever: state lives in a per-repository
+  directory outside it (see MantisState), and read-only
   tools write nothing at all: sqlite3.connect() creates files, so every
   read path checks existence before opening.
 """
@@ -71,6 +72,18 @@ MAX_WAIT_SECONDS = 60.0
 # Line proximity window around a diff hunk for findings outside any function.
 DIFF_LINE_PROXIMITY = 3
 
+# Where per-repository state lives when --state-dir is not given: a directory
+# under this path, keyed by the repository. Defaults to <workspace>/mcp.
+MCP_STATE_DIR_ENV = "MANTIS_MCP_STATE_DIR"
+
+# Ceilings on what one mantis_scan_change call may start. The caller is the
+# operator's own agent, but an agent under prompt injection can call a tool
+# in a loop; without these, N calls were N concurrent pipelines each allowed
+# any --max-llm-calls the caller named.
+MAX_SCAN_LLM_CALLS = 500
+MAX_SCAN_FILES = 50
+MAX_CONCURRENT_SCANS = 2
+
 VERDICT_PASS = "PASS"
 VERDICT_REVIEW = "REVIEW"
 VERDICT_BLOCK = "BLOCK"
@@ -79,23 +92,77 @@ _VERDICT_RANK = {VERDICT_PASS: 0, VERDICT_REVIEW: 1, VERDICT_BLOCK: 2}
 
 
 class MantisState:
-    """Per-repo paths and live scan registry for one server process."""
+    """Per-repo paths and live scan registry for one server process.
 
-    def __init__(self, repo_root: str):
+    State -- the knowledge database, the structural catalog, scan logs, the
+    resolutions audit log -- lives OUTSIDE the repository it describes, in a
+    per-repository directory under the Mantis workspace (or under
+    MANTIS_MCP_STATE_DIR / --state-dir). The repository is the code under
+    audit, and in the general case it is somebody else's: a committed symlink
+    at a predictable path under `<repo>/.mantis/` turned every state write
+    into a write to any file the server's user could reach, and a committed
+    database or catalog was trusted as the server's own memory and could
+    hand the change gate a PASS. Keeping state out of the tree closes both.
+    """
+
+    def __init__(self, repo_root: str, home: Optional[str] = None):
         self.repo = Path(repo_root).resolve()
-        self.home = self.repo / ".mantis"
+        self.home = self._default_home(self.repo, home)
         self.db_path = str(self.home / "knowledge.db")
         self.scans: Dict[str, Dict[str, Any]] = {}
         self._scan_events: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _default_home(repo: Path, explicit: Optional[str]) -> Path:
+        import hashlib
+
+        from core.paths import workspace_dir
+
+        if explicit:
+            return Path(explicit).expanduser().resolve()
+        base = os.environ.get(MCP_STATE_DIR_ENV, "").strip()
+        root = Path(base).expanduser().resolve() if base else workspace_dir() / "mcp"
+        # One directory per repository path, so two checkouts never share a
+        # catalog; keyed by hash so the directory name is always a safe one.
+        return root / hashlib.sha256(str(repo).encode("utf-8")).hexdigest()[:16]
+
+    def check_home(self) -> str:
+        """Why the state directory is unusable, or "" when it is fine.
+
+        Refused: a state directory inside the repository (the repository's
+        author could then plant it), or one that is or traverses a symlink.
+        """
+        try:
+            resolved = self.home.resolve()
+        except OSError as exc:
+            return f"state directory '{self.home}' cannot be resolved: {exc}"
+        if resolved == self.repo or self.repo in resolved.parents:
+            return (f"state directory '{self.home}' is inside the repository; state must "
+                    f"live outside the code under audit (set --state-dir or "
+                    f"{MCP_STATE_DIR_ENV}).")
+        from core.paths import validate_data_path
+
+        ok, why = validate_data_path(self.home)
+        return "" if ok is not None else why
+
     def ensure_home(self) -> None:
-        """Creates .mantis/ and the knowledge database. Write paths only."""
+        """Creates the state directory and the knowledge database. Write paths only."""
+        problem = self.check_home()
+        if problem:
+            raise PermissionError(problem)
         self.home.mkdir(parents=True, exist_ok=True)
         if not os.path.exists(self.db_path):
             from core.database import init_db
 
             init_db(self.db_path)
+
+    def open_log(self, name: str):
+        """Append handle on a log under the state directory that must be a
+        regular file: a symlink there is refused rather than followed."""
+        path = self.home / name
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        return os.fdopen(os.open(str(path), flags, 0o600), "a", encoding="utf-8")
 
     def db_exists(self) -> bool:
         return os.path.exists(self.db_path)
@@ -302,7 +369,7 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
     update_finding_status_by_id(state.db_path, fid, str(row.get("run_id") or ""), res)
     new_status = str((row_for(fid) or {}).get("status") or "")
     applied = new_status.lower() == res
-    with open(state.home / "resolutions.log", "a", encoding="utf-8") as fh:
+    with state.open_log("resolutions.log") as fh:
         fh.write(json.dumps({
             "at": time.time(),
             "finding_id": fid,
@@ -587,7 +654,7 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         if uncovered is None:
             raise_to(VERDICT_REVIEW,
                      "Coverage ledger unreadable: scan history unknown.",
-                     "Check .mantis/knowledge.db, then run mantis_scan_change.")
+                     "Check the knowledge database in the state directory, then run mantis_scan_change.")
         else:
             for rel_fp in uncovered:
                 raise_to(VERDICT_REVIEW,
@@ -642,7 +709,24 @@ def scan_change(state: MantisState, files: List[str],
     if not rels:
         return {"error": "No scannable files inside the repository. "
                          "Pass repo-relative paths."}
-    state.ensure_home()
+    if len(rels) > MAX_SCAN_FILES:
+        return {"error": f"{len(rels)} files requested; a scan takes at most "
+                         f"{MAX_SCAN_FILES}. Split the change set."}
+    try:
+        max_llm_calls = int(max_llm_calls or 0)
+    except (TypeError, ValueError):
+        max_llm_calls = 0
+    # 0 or less would drop the --max-llm-calls flag and with it the cap.
+    max_llm_calls = min(max(max_llm_calls, 1), MAX_SCAN_LLM_CALLS)
+    with state._lock:
+        running = sum(1 for s in state.scans.values() if s.get("status") == "running")
+    if running >= MAX_CONCURRENT_SCANS:
+        return {"error": f"{running} scan(s) already running (limit {MAX_CONCURRENT_SCANS}); "
+                         "poll mantis_scan_status and retry when one finishes."}
+    try:
+        state.ensure_home()
+    except PermissionError as exc:
+        return {"error": str(exc)}
     scans_dir = state.home / "scans"
     scans_dir.mkdir(exist_ok=True)
     scan_id = uuid.uuid4().hex[:12]
@@ -663,7 +747,8 @@ def scan_change(state: MantisState, files: List[str],
     def _run() -> None:
         index_restored = False
         try:
-            with open(log_path, "ab") as log:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(str(log_path), flags, 0o600), "ab") as log:
                 for rel_fp in rels:
                     cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
                     log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
@@ -777,7 +862,7 @@ def build_server(state: MantisState):
     def mantis_scan_change(files: List[str], max_llm_calls: int = 150, model: str = "") -> dict:
         """Launches the full Mantis audit pipeline over the given files in the
         background (budget-capped). Findings accumulate in the repo's
-        .mantis/knowledge.db, where mantis_check_change reads them."""
+        the per-repository knowledge database, where mantis_check_change reads them."""
         return scan_change(state, files, max_llm_calls=max_llm_calls, model=model)
 
     @srv.tool()
@@ -828,7 +913,7 @@ def build_server(state: MantisState):
     def mantis_resolve_finding(finding_id: int, resolution: str, reason: str) -> dict:
         """Closes a finding with an operator verdict: 'mitigated' (the defect
         was fixed) or 'false_positive' (the report is wrong). Requires a
-        reason, which is appended to .mantis/resolutions.log as the audit
+        reason, which is appended to resolutions.log in the state directory as the audit
         trail. Machine statuses (patch_verified, dynamic_confirmed) remain
         reserved for the verification pipeline, and a dismissal never
         overwrites machine-verified evidence."""
@@ -847,10 +932,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "JSON, exit 0=PASS 1=REVIEW 2=BLOCK.")
     parser.add_argument("--files", nargs="*", default=None,
                         help="Changed files for --check when no diff is piped.")
+    parser.add_argument("--state-dir", default="",
+                        help="Directory for this repository's knowledge database, catalog "
+                             f"and logs; must be outside the repository (default: "
+                             f"${MCP_STATE_DIR_ENV} or <workspace>/mcp, per repository)")
     args = parser.parse_args(argv)
-    state = MantisState(args.repo)
+    state = MantisState(args.repo, home=args.state_dir or None)
     if not state.repo.is_dir():
         print(f"error: --repo '{args.repo}' is not a directory", file=sys.stderr)
+        return 3
+    problem = state.check_home()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
         return 3
     if args.check:
         diff = "" if sys.stdin.isatty() else sys.stdin.read()

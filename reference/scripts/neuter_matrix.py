@@ -658,8 +658,8 @@ SCENARIOS = {
     ],
     'tools_revert_argument_quoting': [
         ('core/custom_tools.py',
-         '        rendered = command.replace("{filepath}", shlex.quote(str(filepath or "")))',
-         '        rendered = command.replace("{filepath}", str(filepath or ""))  # NEUTERED: model-chosen path interpolated verbatim into a shell command'),
+         '        rendered = command.replace("{filepath}", shlex.quote(fp))',
+         '        rendered = command.replace("{filepath}", fp)  # NEUTERED: model-chosen path interpolated verbatim into a shell command'),
     ],
     'tools_revert_registry_wiring': [
         ('core/graph_loader.py',

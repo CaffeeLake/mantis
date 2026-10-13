@@ -11,6 +11,7 @@ proven staging filters:
 from __future__ import annotations
 
 import os
+import stat
 import shutil
 import tarfile
 from pathlib import Path
@@ -81,6 +82,11 @@ def get_vetted_staging_files(target_path: Union[str, Path]) -> List[Tuple[Path, 
                 # on the same device. realpath() containment cannot detect this because
                 # a hard link has no distinct target path. Refuse multiply-linked files.
                 if st.st_nlink > 1:
+                    continue
+                # Regular files only. A FIFO, socket or device node in the checkout
+                # (mkfifo needs no privilege; a tarball can carry one) blocks every
+                # consumer that opens it -- the index build, the surveyor -- forever.
+                if not stat.S_ISREG(st.st_mode):
                     continue
 
                 try:

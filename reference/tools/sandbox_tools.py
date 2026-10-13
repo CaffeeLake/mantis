@@ -18,6 +18,55 @@ _SANITIZER_SIGNALS = [
     re.compile(r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+([a-zA-Z0-9_:]+)", re.IGNORECASE),
 ]
 
+# A sanitizer's own report header: the one crash signal that cannot be
+# produced by printing text, short of the program being instrumented.
+_SANITIZER_HEADER = _SANITIZER_SIGNALS[0]
+
+# Where a sink symbol must appear to count: inside a backtrace frame. Plain
+# substring matching accepted `echo 'SIGSEGV parse_header'` and a `cat` of the
+# vulnerable source next to any crash-like line.
+_FRAME_SYMBOL_RES = [
+    re.compile(r"#\d+\s+0x[0-9a-fA-F]+\s+in\s+([A-Za-z_][\w:.$<>]*)"),        # ASan / gdb / lldb
+    re.compile(r"^\s*File\s+\"[^\"]+\",\s+line\s+\d+,\s+in\s+([A-Za-z_]\w*)", re.M),  # Python
+    re.compile(r"^\s*at\s+([A-Za-z_][\w.$]*)\s*\(", re.M),                       # JVM / Node
+]
+
+
+def _frame_symbols(output: str) -> set:
+    found: set = set()
+    for pat in _FRAME_SYMBOL_RES:
+        found.update(m.group(1) for m in pat.finditer(output or ""))
+    return found
+
+
+def _frame_names_sink(frames: set, sink_symbol: str) -> bool:
+    sink = (sink_symbol or "").strip()
+    if not sink:
+        return False
+    for sym in frames:
+        if sym == sink or sym.endswith("::" + sink) or sym.endswith("." + sink):
+            return True
+    return False
+
+
+def _crash_corroborated(output: str, exit_code: int) -> bool:
+    """Whether crash-like text is backed by the process actually crashing.
+
+    Text alone is not a crash: a changelog that says "fixed Segmentation
+    fault", `cat` over a fixture, or `echo` all print the same words at exit
+    0. Corroboration is a sanitizer report header, a signal exit (128+N), or
+    a non-zero exit together with a backtrace frame.
+    """
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        code = 0
+    if _SANITIZER_HEADER.search(output or ""):
+        return True
+    if code >= 128 or code < 0:
+        return True
+    return code != 0 and bool(_frame_symbols(output))
+
 
 def check_reached_sink_evidence(
     output: str,
@@ -44,13 +93,18 @@ def check_reached_sink_evidence(
     if MANTIS_SENTINEL_TOKEN in output:
         return True, "EVIDENCE_PRESENT: in-path sentinel marker emitted in execution trace"
 
-    # Channel B: Target-produced Sanitizer / Crash backtrace naming sink
+    # Channel B: Target-produced Sanitizer / Crash backtrace naming sink.
+    # The crash must be real (see _crash_corroborated), and a sink symbol
+    # must be named by a backtrace frame, not merely present in the output.
     has_sanitizer_or_crash = any(pat.search(output) for pat in _SANITIZER_SIGNALS)
     if has_sanitizer_or_crash:
+        if not _crash_corroborated(output, exit_code):
+            return False, ("EVIDENCE_ABSENT: crash-like text in output, but the process exited "
+                           f"{exit_code} with no sanitizer report; text alone is not a crash")
         if sink_symbol:
-            if sink_symbol in output:
+            if _frame_names_sink(_frame_symbols(output), sink_symbol):
                 return True, f"EVIDENCE_PRESENT: crash backtrace explicitly confirms sink '{sink_symbol}'"
-            return False, f"EVIDENCE_ABSENT: crash occurred but did not reach target sink '{sink_symbol}'"
+            return False, f"EVIDENCE_ABSENT: crash occurred but no backtrace frame names target sink '{sink_symbol}'"
         return True, "EVIDENCE_PRESENT: sanitizer/crash frame detected in execution output"
 
     return False, "EVIDENCE_ABSENT: no sentinel token or target-produced crash backtrace observed"

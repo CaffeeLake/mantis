@@ -14,7 +14,7 @@ workflow is a loop that runs alongside ordinary development:
    full multi-agent audit pipeline reviews the touched files in parallel,
    budget-capped, in the background.
 4. The next `mantis_check_change` sees whatever that scan found, because both
-   read the same per-repository `.mantis/knowledge.db`.
+   read the same per-repository knowledge database (see State).
 
 The server itself **never calls an LLM**. Tier-1 tools are deterministic reads
 over the structural catalog and the findings database; the Tier-2 scan spawns
@@ -109,8 +109,8 @@ Two properties are deliberate and load-bearing:
    the gate is what guarantees its results are never ignored.
 2. **Read paths write nothing.** `sqlite3.connect()` creates files, so every
    read-only tool checks existence before opening. Only `mantis_reindex` and
-   `mantis_scan_change` create `.mantis/`; nothing the server does writes
-   outside it.
+   `mantis_scan_change` create the state directory; nothing the server does
+   writes into the repository, ever (see State).
 
 The blast radius is computed from the diff's changed lines: each line maps to
 its enclosing function in the structural index, and each function to its direct
@@ -145,9 +145,9 @@ git diff origin/main...HEAD | .venv/bin/python scripts/mcp_server.py --repo . --
   reports `applied: false` with the reason.
 
 Both require a non-empty `reason`, and every attempt is appended to
-`.mantis/resolutions.log` for audit. Machine statuses (`static_confirmed`,
-`dynamic_confirmed`, `patch_verified`) are reserved for the pipeline — the
-server never lets an operator claim them.
+`resolutions.log` in the state directory for audit. Machine statuses
+(`static_confirmed`, `dynamic_confirmed`, `patch_verified`) are reserved for the
+pipeline — the server never lets an operator claim them.
 
 ## Scan lifecycle
 
@@ -166,12 +166,26 @@ files could cross-match).
 
 ## State
 
-Everything lives in `.mantis/` at the repository root: `knowledge.db` (the same
-schema every `main.py` run and `scripts/advise.py` query uses),
-`structural_index/` (the catalog), and `scans/*.log` (pipeline output per
-background scan). Scan registries are in-memory — a `scan_id` does not survive a
-server restart, but every finding a scan wrote does, which is the part that
-matters: the gate reads the database, not the registry.
+Everything lives in a per-repository directory **outside the repository**:
+`<workspace>/mcp/<hash of the repository path>/` by default, or a directory
+under `MANTIS_MCP_STATE_DIR`, or exactly `--state-dir`. It holds `knowledge.db`
+(the same schema every `main.py` run and `scripts/advise.py` query uses),
+`knowledge.structural_index/` (the catalog), `scans/*.log` (pipeline output per
+background scan) and `resolutions.log` (the audit trail of
+`mantis_resolve_finding`). Scan registries are in-memory — a `scan_id` does not
+survive a server restart, but every finding a scan wrote does, which is the part
+that matters: the gate reads the database, not the registry.
 
-Add `.mantis/` to the repository's `.gitignore`; the knowledge base is
-per-deployment state, not source.
+The state used to live in `.mantis/` at the repository root. It moved because
+the repository is the code under audit, and in general it is somebody else's: a
+committed symlink at a predictable path under `.mantis/` turned every state
+write into a write to any file the server's user could reach, and a committed
+`knowledge.db` or catalog was trusted as the server's own memory — enough to
+hand `--check` a PASS on a never-scanned file. A state directory inside the
+repository is refused outright. An old `.mantis/` in a checkout is simply
+ignored; delete it.
+
+This also means a fresh checkout — a CI runner, a new clone — starts with no
+state, so `--check` there fails closed with REVIEW until a scan has run in that
+environment. That is the intended answer: the gate reports what *this*
+installation has audited, and a pull request cannot supply the audit.

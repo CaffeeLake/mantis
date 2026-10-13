@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import sqlite3
 import time
 from pathlib import Path
@@ -232,19 +233,42 @@ _AMBIENT_RECEIVERS = frozenset({
 })
 
 
+_MAX_SPINE_HOPS = 64
+
+
 def _rightmost_name_leaf(node) -> str:
-    """The called name inside a callee expression: a.b.c() calls 'c'."""
-    best = ""
-    stack = [node]
-    while stack:
-        cur = stack.pop(0)
+    """The called name inside a callee expression: a.b.c() calls 'c'.
+
+    Walks the right spine of the callee: at each level, the rightmost
+    direct name leaf wins (`c` in `(a.b).c`, `f` in `f<int>`), otherwise
+    descend into the last named child. Constant work per call site.
+
+    The previous breadth-first walk over the whole callee subtree was
+    quadratic on chained calls (`a.b().b()...`: every callee contains every
+    inner call), which let one file under the size cap stall the build for
+    hours, and it returned the LAST leaf visited -- the deepest, which in a
+    chain is the leftmost receiver, so `a.b.c()` resolved to `b`.
+    """
+    cur = node
+    hops = 0
+    while cur is not None and hops < _MAX_SPINE_HOPS:
         if cur.type in _NAME_LEAF_TYPES:
             try:
-                best = cur.text.decode("utf-8", errors="replace")
+                return cur.text.decode("utf-8", errors="replace")
             except Exception:
-                pass
-        stack.extend(cur.named_children)
-    return best
+                return ""
+        kids = cur.named_children
+        if not kids:
+            return ""
+        for kid in reversed(kids):
+            if kid.type in _NAME_LEAF_TYPES:
+                try:
+                    return kid.text.decode("utf-8", errors="replace")
+                except Exception:
+                    return ""
+        cur = kids[-1]
+        hops += 1
+    return ""
 
 
 def _target_qualifier(target) -> str:
@@ -293,8 +317,20 @@ def _callee_name(call_node) -> str:
 
 
 def _signature_of(node, source: bytes) -> str:
-    first_line = source[node.start_byte:node.end_byte].split(b"\n", 1)[0]
+    # Bounded slice: a definition on a single multi-megabyte line would
+    # otherwise be copied in full for every nested definition inside it.
+    end = min(node.end_byte, node.start_byte + _MAX_SIGNATURE_SCAN_BYTES)
+    first_line = source[node.start_byte:end].split(b"\n", 1)[0]
     return first_line.decode("utf-8", errors="replace").strip()[:200]
+
+
+_MAX_SIGNATURE_SCAN_BYTES = 4096
+
+# Nesting deeper than this stops extending the qualified-name prefix. Real
+# code nests a handful of levels; `function a(){` repeated 30k times is a
+# 450 KB file whose qualified names total a gigabyte (quadratic in depth).
+MAX_NEST_DEPTH = 64
+_MAX_QUALIFIED_CHARS = 512
 
 
 def _symbol_id(language: str, rel_path: str, qualified: str, start_line: int, signature: str) -> str:
@@ -345,7 +381,11 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
         if kind is not None:
             name = _node_name(node)
             if name:
-                qualified = ".".join([n for n, _ in enclosing] + [name])
+                # Bounded: the prefix stops growing past MAX_NEST_DEPTH and
+                # the joined name is capped, so a pathological nesting depth
+                # costs linear memory, not quadratic.
+                prefix = [n for n, _ in enclosing[-MAX_NEST_DEPTH:]]
+                qualified = ".".join(prefix + [name])[-_MAX_QUALIFIED_CHARS:]
                 signature = _signature_of(node, source)
                 sid = _symbol_id(language, rel_path, qualified, node.start_point[0] + 1, signature)
                 symbols.append({
@@ -359,7 +399,12 @@ def extract_unit(rel_path: str, source: bytes, language: str, parser) -> Dict[st
                     "kind": kind,
                     "signature": signature,
                 })
-                enclosing = enclosing + [(name, sid)]
+                if len(enclosing) < MAX_NEST_DEPTH:
+                    enclosing = enclosing + [(name, sid)]
+                else:
+                    # Past the cap the innermost definition still owns the
+                    # calls beneath it; only the prefix stops growing.
+                    enclosing = enclosing[:-1] + [(name, sid)]
         elif node.type in _CALL_TYPES:
             qualifier, callee = _callee_parts(node)
             if callee:
@@ -583,6 +628,22 @@ def _build(code_root: str, state: Path, snapshot_id: str, t0: float) -> Dict[str
 
     for abs_path, rel_path in sources:
         language = _language_for(rel_path)
+        # Size and type are checked on the inode BEFORE reading: read_bytes()
+        # on a multi-gigabyte sparse file pulled the whole thing into memory
+        # before the cap was consulted, and on a FIFO it never returned.
+        try:
+            st = os.stat(abs_path)
+        except OSError:
+            failed += 1
+            coverage_rows.append((rel_path, 0, "", "failed"))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            failed += 1
+            coverage_rows.append((rel_path, 0, "", "failed"))
+            continue
+        if st.st_size > MAX_FILE_BYTES:
+            coverage_rows.append((rel_path, 0, "", "skipped_too_large"))
+            continue
         try:
             raw = Path(abs_path).read_bytes()
         except Exception:

@@ -60,17 +60,19 @@ from __future__ import annotations
 
 import logging
 import re
+import os
+import posixpath
 import shlex
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
+def _connect(db_path: str, readonly: bool = False) -> sqlite3.Connection:
     """Knowledge-database connection with the shared busy timeout and journal
     settings (core.database.connect); imported lazily to keep module import
     order free of cycles."""
     from core.database import connect
 
-    return connect(db_path)
+    return connect(db_path, readonly=readonly)
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +206,16 @@ def _build_declarative(name: str, cfg: Dict[str, Any]) -> Callable[..., str]:
         if ctx is None:
             return "Error: No active execution context."
         try:
-            conn = _connect(ctx.db_path)
+            # Same anchor as every core.database access (INV-4): relative paths
+            # resolve against the install, symlinks are refused. Opened
+            # read-only so a missing database can never be created -- least
+            # of all at a path the scanned repository chose.
+            from core.paths import resolve_db_path
+
+            db = resolve_db_path(ctx.db_path)
+            if not os.path.exists(db):
+                return "ERROR: query failed: knowledge database not found"
+            conn = _connect(db, readonly=True)
             try:
                 cur = conn.execute(query, tuple(params))
                 rows = cur.fetchmany(limit)
@@ -275,7 +286,19 @@ def _build_executable(name: str, cfg: Dict[str, Any]) -> Callable[..., Any]:
         # The model chose this path after reading the target's source, so it is treated
         # as hostile input and quoted as a single argument. Without this, a filename
         # containing shell metacharacters is command injection into the guest.
-        rendered = command.replace("{filepath}", shlex.quote(str(filepath or "")))
+        fp = str(filepath or "").strip()
+        # Quoting stops shell metacharacters; it does not stop a value that
+        # IS an option. `--output=/workspace/x` or `-c<cfg>` arrives at the
+        # operator's binary as a flag. Only a plain relative path inside the
+        # guest's target mount is a file to analyze.
+        norm = posixpath.normpath(fp.replace("\\", "/")) if fp else ""
+        if (not fp or fp.startswith("-") or norm.startswith(("/", "../")) or norm == ".."
+                or "\x00" in fp):
+            return (f"ERROR: {name}: filepath must be a relative path inside the target "
+                    f"(got {fp[:80]!r}).")
+        # Validated, not rewritten: the value reaches the guest exactly as
+        # given, as one argument. Normalization is only for the checks above.
+        rendered = command.replace("{filepath}", shlex.quote(fp))
         try:
             result = await sandbox.execute(rendered)
         except Exception as exc:

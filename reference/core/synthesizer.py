@@ -32,7 +32,14 @@ from core.config import (
     is_auth_error,
     format_auth_error_message,
 )
-from core.graph_loader import ClassifierNode, EdgeSpec, GlobalConfig, SandboxConfig, WorkflowSpec
+from core.graph_loader import (
+    NODE_STAMP_STATUSES,
+    ClassifierNode,
+    EdgeSpec,
+    GlobalConfig,
+    SandboxConfig,
+    WorkflowSpec,
+)
 from tools import TOOLS
 
 logger = logging.getLogger(__name__)
@@ -915,7 +922,7 @@ class ResearchGraphSynthesizer:
                     output_key = output_key or "verdict"
 
                 on_enter_status = n.get("on_enter_status")
-                if on_enter_status and on_enter_status not in VALID_STATUSES:
+                if on_enter_status and on_enter_status not in NODE_STAMP_STATUSES:
                     on_enter_status = None
                 if ("repro" in clean_id or (skill and "reproduce" in skill)) and not on_enter_status:
                     on_enter_status = "static_confirmed"

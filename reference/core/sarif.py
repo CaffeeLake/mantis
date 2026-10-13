@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -185,12 +186,24 @@ def _rule_id(finding: Dict[str, Any]) -> str:
 
 
 def _message_text(finding: Dict[str, Any]) -> str:
-    title = str(finding.get("title") or "Unnamed finding").strip()
-    description = str(finding.get("description") or "").strip()
+    # Title and description are model-written from target content: the one
+    # egress path that skipped the sanitizer every other export applies.
+    # sanitize_egress_text strips terminal control sequences and scrubs
+    # credentials the model quoted; the bracket rewrite keeps a description
+    # from forging the verification note that follows it.
+    from core.llm_gateway import sanitize_egress_text
+
+    title = sanitize_egress_text(str(finding.get("title") or "Unnamed finding")).strip()
+    description = sanitize_egress_text(str(finding.get("description") or "")).strip()
+    title = _MANTIS_NOTE_LOOKALIKE.sub("(", title)
+    description = _MANTIS_NOTE_LOOKALIKE.sub("(", description)
 
     status = str(finding.get("status") or "").strip()
     patch_status = str(finding.get("patch_status") or "").strip().upper()
 
+    # patch_status is trusted here because write_findings keeps
+    # VERIFIED_SECURE only when the harness itself recorded reached-sink
+    # evidence for the run (verified_evidence); the export adds no gate.
     note = _VERIFICATION_NOTE.get(patch_status)
     if note is None:
         # No patch verification ran. Say so rather than staying silent: silence
@@ -202,6 +215,9 @@ def _message_text(finding: Dict[str, Any]) -> str:
         parts.append(description)
     parts.append(f"[Mantis {note}. Triage status: {status or 'unknown'}.]")
     return "\n\n".join(parts)
+
+
+_MANTIS_NOTE_LOOKALIKE = re.compile(r"\[(?=Mantis\b)")
 
 
 def _fingerprint(finding: Dict[str, Any]) -> Optional[Dict[str, str]]:

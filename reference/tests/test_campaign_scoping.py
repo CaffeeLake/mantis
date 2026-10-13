@@ -204,7 +204,10 @@ class GetFindingsCampaignScopeTest(_DbTest):
         import json
         if raw.startswith("NO_DATA") or raw.startswith("Error") or raw.startswith("ERROR"):
             return raw
-        return {f["title"] for f in json.loads(raw)}
+        # get_findings fences its JSON as untrusted data (CP-4); the payload
+        # is the bracketed body between the fence lines.
+        body = raw[raw.index("["):raw.rindex("]") + 1]
+        return {f["title"] for f in json.loads(body)}
 
     def test_triage_stages_see_only_their_campaign(self):
         from tools.research_tools import get_findings

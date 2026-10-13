@@ -1564,9 +1564,25 @@ async def pipeline(
     if resume_run_id:
         existing_findings = read_findings(db_path, run_id=run_id)
         if existing_findings and (not scan_target or scan_target == "."):
-            stored_target = existing_findings[0].get("target_file") or existing_findings[0].get("filepath")
-            if stored_target and os.path.exists(stored_target):
-                target_path = Path(stored_target).resolve()
+            # A convenience for `main.py . --resume`: narrow to the file the
+            # run was working on. The stored path is a model-written finding
+            # filepath from a database that may have been written by an
+            # earlier, worse run, so it is re-validated and accepted only
+            # INSIDE the target validated above -- it may narrow the scan,
+            # never widen it (the planner's containment root, the sandbox
+            # staging set and the coverage ledger all follow target_path).
+            stored_target = str(existing_findings[0].get("filepath") or "")
+            cand, _ = validate_scan_target(stored_target) if stored_target else (None, "")
+            if cand is not None:
+                try:
+                    cand.relative_to(target_path)
+                    target_path = cand
+                except ValueError:
+                    print(
+                        f"[RESUME] Ignoring stored target '{stored_target}': outside the "
+                        f"validated scan target {target_path}.",
+                        file=sys.stderr,
+                    )
         print(f"\n🔄 Resuming Run ID: {run_id} ({len(existing_findings)} existing finding(s) checkpointed)")
 
     print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")

@@ -22,6 +22,15 @@ LiteLlm = ResilientLiteLlm
 from core.environments import ENVIRONMENTS, get_shared_proxy_environment
 from core.sandbox import SANDBOXES
 from core.llm_gateway import UNTRUSTED_CODE_AUDIT_GUARD
+
+# What a node may stamp on the findings in its scope when it completes. A
+# strict subset of the status vocabulary: `patch_verified` is the harness's
+# highest-assurance word, earned only through the re-attack flow, and the
+# MCP change gate treats it as closed -- a workflow that stamped it would
+# silence every finding in the campaign; `reported` would reopen dismissals.
+# Enforced here, where the stamp callback is attached, so a hand-written
+# workflow, a synthesized graph, and a persisted recipe all meet the same gate.
+NODE_STAMP_STATUSES = frozenset({"static_confirmed", "dynamic_confirmed"})
 from tools import TOOLS
 
 DEFAULT_SEED_PROMPT = "Initial Task Input: Evaluate {filepath}"
@@ -1327,7 +1336,21 @@ def load_workflow_from_json(
             else:
                 agent_kwargs["include_contents"] = "none"
 
-            if node_cfg.on_enter_status:
+            stamp_status = str(node_cfg.on_enter_status or "").strip().lower()
+            if stamp_status and stamp_status not in NODE_STAMP_STATUSES:
+                # A workflow file -- hand-written, synthesized, or recipe
+                # persisted by an earlier run -- may only stamp the two
+                # coverage statuses. patch_verified is earned through the
+                # re-attack flow and closes findings at the MCP gate;
+                # reported would reopen dismissals. Refuse rather than trust.
+                print(
+                    f"[graph_loader] node '{node_id}': on_enter_status "
+                    f"'{node_cfg.on_enter_status}' is not a status a node may stamp "
+                    f"(allowed: {sorted(NODE_STAMP_STATUSES)}); ignoring it.",
+                    file=sys.stderr,
+                )
+                stamp_status = ""
+            if stamp_status:
                 # P4: coverage stamps fire on successful node COMPLETION, not
                 # entry. main.py used to stamp the moment a node's name first
                 # appeared in the event stream -- i.e. before the node did any
@@ -1342,7 +1365,7 @@ def load_workflow_from_json(
                 # on_enter_status map exported to main.py is emptied below so
                 # the old entry-time stamp cannot double-fire.
                 agent_kwargs["after_agent_callback"] = _make_completion_stamp_callback(
-                    node_id, node_cfg.on_enter_status
+                    node_id, stamp_status
                 )
 
             if node_id in _PREFIX_REUSE_ARTIFACTS and not node_cfg.on_enter_status:
