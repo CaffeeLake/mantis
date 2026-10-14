@@ -211,6 +211,13 @@ async def execute_sub_task(
                         ctx.active_node = node_name
                     if budget_controller:
                         budget_controller.record_step(node_name)
+                    # Which nodes this process reached, in order, for the spend
+                    # report: a driver can tell "the researcher finished and the
+                    # run paused in review" from "the run paused before anyone
+                    # looked", which a bare exit code cannot.
+                    nodes = _SPEND_REPORT.setdefault("nodes", [])
+                    if node_name not in nodes:
+                        nodes.append(node_name)
 
                 if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
                     stamped_nodes.add(node_name)
@@ -354,6 +361,11 @@ async def execute_sub_task(
     print("\n" + "-" * 60)
     return bool(errored)
 
+# The directory a repository keeps Mantis's own state in (a committed
+# knowledge export lives at .mantis/knowledge). Never a scan target.
+TOOL_STATE_DIR = ".mantis"
+
+
 def is_binary_file(path: Path, block_size: int = 1024) -> bool:
     """Returns True if the file contains null bytes in its initial block."""
     try:
@@ -390,6 +402,10 @@ def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list
             str(p) for p in sorted(target.rglob("*"))
             if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
         ]
+    # Tool state is never source. git's view includes a committed
+    # .mantis/knowledge; the dot-prefix rule above already drops it on the
+    # other path.
+    found = [f for f in found if TOOL_STATE_DIR not in Path(os.path.relpath(f, str(target))).parts]
     if exclude:
         from core.exclusions import is_excluded
 
@@ -525,6 +541,7 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
                   "elapsed_seconds": 0.0, "max_tokens": None, "max_llm_calls": None,
                   "pause_trigger": ""}
     report["exit_code"] = exit_code
+    report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
     try:
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1087,6 +1104,7 @@ async def pipeline(
     max_tokens_override: Optional[int] = None,
     cache_discount_override: Optional[float] = None,
     exclude_override: Optional[list] = None,
+    import_knowledge_dir: str = "",
     precomputed_astm: Optional[dict] = None,
     scan_mode_override: Optional[str] = None,
     assume_yes: bool = False,
@@ -1234,6 +1252,21 @@ async def pipeline(
             return 1
         print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
+    # Memory from the repository: a checked-in knowledge export, read into
+    # this database before anything chooses what to scan (coverage feeds auto
+    # mode) and under this run id (so the threat model and architecture are
+    # found by the tools that look for them). Explicit, never automatic: the
+    # files sit in the checkout, and an operator decides to trust them.
+    if import_knowledge_dir:
+        from core.knowledge import KnowledgeImportError, describe, import_knowledge
+
+        try:
+            imported = import_knowledge(db_path, import_knowledge_dir, run_id=run_id,
+                                        repo_root=str(path_root or target_path), target=str(target_path))
+        except KnowledgeImportError as exc:
+            print(f"Error: --import-knowledge: {exc}", file=sys.stderr)
+            return 1
+        print(f"Imported knowledge from {import_knowledge_dir}: {describe(imported)}.", file=sys.stderr)
     # Resolve budget configuration: explicit caller override > workflow.json budget > default BudgetConfig()
     resolved_budget = budget_config
     if resolved_budget is None:

@@ -110,7 +110,16 @@ ALL_STATUSES = ACTIVE_STATUSES + FALSE_POSITIVE_STATUSES
 # Statuses meaning "looked at and set aside". One definition, because the cost of
 # these drifting apart is silent: a finding counted as live in one place and dead in
 # another.
-SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported")
+SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported", "archived")
+
+# A finding whose lines the code moved out from under it, and which a rescan
+# of that file, with the finding in front of it, did not report again. Not a
+# verdict: the finding is shelved with its history, it does not gate, it is
+# surfaced as a notice whenever its file is touched, and any later report of
+# the same lineage reopens it. The name is the hint: something was found here
+# once, and the place has changed since. Deliberately NOT a monotonic
+# terminal status, so a re-report can always move it.
+ARCHIVED_STATUS = "archived"
 
 # Statuses a re-reported finding can never be moved off by write_findings:
 # machine proof (dynamic_confirmed, patch_verified) and recorded closures
@@ -879,7 +888,11 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # Check if updating an existing record by explicit ID or exact composite key
             target_id = None
             if finding.get("id") and isinstance(finding.get("id"), int):
-                cursor.execute("SELECT id FROM findings WHERE id = ? LIMIT 1", (finding["id"],))
+                # Scoped to this run: an id is a small integer a model can
+                # guess, and rows of other runs -- imported knowledge above
+                # all -- are not this run's to rewrite.
+                cursor.execute("SELECT id FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
+                               (finding["id"], run_id))
                 id_row = cursor.fetchone()
                 if id_row:
                     target_id = id_row[0]
@@ -1055,6 +1068,31 @@ def _campaign_scope_clause(norm_path: str) -> "tuple[str, List[str]]":
         '%"' + escaped + ':%',
     ]
     return clause, params
+
+
+def archive_finding(db_path: str, lineage_id: str, note: str = "") -> int:
+    """Shelves every still-open row of a lineage as `archived` (see
+    ARCHIVED_STATUS). Rows already at a monotonic terminal status, or already
+    archived, are left alone. `note` is appended to triage_reasoning so the
+    export says why. Returns the number of rows changed. Never raises (INV-6)."""
+    lineage_id = str(lineage_id or "").strip()
+    if not lineage_id:
+        return 0
+    terminal = ",".join("?" * len(MONOTONIC_TERMINAL_STATUSES))
+    params = [ARCHIVED_STATUS, (note or "")[:2000], lineage_id, ARCHIVED_STATUS, *sorted(MONOTONIC_TERMINAL_STATUSES)]
+    try:
+        with _db(db_path) as conn:
+            cur = conn.execute(f"""
+                UPDATE findings
+                SET status = ?,
+                    triage_reasoning = TRIM(COALESCE(triage_reasoning, '') || CHAR(10) || ?)
+                WHERE lineage_id = ?
+                  AND LOWER(COALESCE(status, '')) != ?
+                  AND LOWER(COALESCE(status, '')) NOT IN ({terminal})
+            """, params)
+            return int(cur.rowcount or 0)
+    except Exception:
+        return 0
 
 
 def update_status(db_path: str, filepath: str, run_id: str, status: str):
@@ -1774,9 +1812,29 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
 
 def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[str]:
     """Retrieve an artifact's content from the database by filepath or artifact_type strictly scoped to run_id when provided."""
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+    return rec["content"] if rec else None
+
+
+def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> bool:
+    """Whether the artifact a read would return came from a knowledge import
+    rather than from this run's own tools. Imported text is a repository's
+    file: it is read as untrusted content, fenced, not as the run's memory."""
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+    if not rec:
+        return False
+    try:
+        meta = json.loads(rec.get("metadata_json") or "{}")
+    except ValueError:
+        return False
+    return isinstance(meta, dict) and bool(meta.get("imported"))
+
+
+def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[dict]:
+    """The latest matching artifact row as {content, metadata_json}, or None."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
-        query = "SELECT content FROM campaign_artifacts WHERE 1=1"
+        query = "SELECT content, metadata_json FROM campaign_artifacts WHERE 1=1"
         params = []
         if filepath:
             query += " AND filepath = ?"
@@ -1791,7 +1849,7 @@ def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run
         cursor.execute(query, params)
         row = cursor.fetchone()
         if row:
-            return row["content"]
+            return {"content": row["content"], "metadata_json": row["metadata_json"]}
         return None
 
 def record_learning(db_path: str, run_id: str, category: str, learning: str, tags: Optional[list] = None):

@@ -720,6 +720,23 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                          f"caller radius: {f_fp}.",
                          "Review the listed findings against this change.")
 
+        # Archived findings on a touched file: found here once, shelved when
+        # the code changed and a rescan did not report them again. Listed as
+        # hits with their own relationship so the caller can show them as
+        # notices; never a verdict, because an archived finding is a hint to
+        # look again, not a claim about the current code.
+        from core.database import ARCHIVED_STATUS
+
+        for f in read_findings(state.db_path):
+            if str(f.get("status") or "").lower() != ARCHIVED_STATUS:
+                continue
+            f_fp = str(f.get("filepath") or "")
+            if not any(_finding_matches(state, f_fp, c) for c in changed):
+                continue
+            view = _finding_view(f)
+            view["relationship"] = "archived"
+            hits.append(view)
+
         # Coverage: a changed file no scan ever recorded is unknown ground.
         uncovered = _uncovered(state, list(changed))
         if uncovered is None:

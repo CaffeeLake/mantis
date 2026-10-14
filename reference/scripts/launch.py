@@ -219,6 +219,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable ADK context caching",
     )
     parser.add_argument(
+        "--import-knowledge",
+        type=str,
+        default="",
+        metavar="DIR",
+        help=(
+            "Read a knowledge export (scripts/knowledge.py export; by convention "
+            ".mantis/knowledge in the repository) into the database before the run: prior "
+            "findings and their status, learnings, coverage, and the threat model and "
+            "architecture the run's tools then see. The files are treated as data."
+        ),
+    )
+    parser.add_argument(
         "--focus",
         type=str,
         default="",
@@ -365,6 +377,7 @@ def run_launch(
     no_compaction: bool = False,
     no_context_cache: bool = False,
     cache_discount: Optional[float] = None,
+    import_knowledge: str = "",
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -676,6 +689,7 @@ def run_launch(
                 enable_compaction=False if no_compaction else None,
                 enable_context_cache=False if no_context_cache else None,
                 cache_discount_override=cache_discount,
+                import_knowledge_dir=import_knowledge,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -758,6 +772,7 @@ def main() -> int:
             no_compaction=args.no_compaction,
             no_context_cache=args.no_context_cache,
             cache_discount=cache_discount,
+            import_knowledge=args.import_knowledge,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

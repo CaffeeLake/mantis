@@ -94,18 +94,25 @@ if "--spend-report" in argv and not {no_report!r}:
                "cached_tokens": cached, "cache_discount": 1.0, "llm_calls": 3,
                "graph_steps": 4, "elapsed_seconds": 0.5, "max_tokens": granted,
                "max_llm_calls": 1, "pause_trigger": {pause_trigger!r},
-               "exit_code": {code}}}, open(path, "w"))
+               "nodes": {nodes!r}, "exit_code": {code}}}, open(path, "w"))
 sys.exit({code})
 """
 
+# The graph a finished single-file run walks; a run that stops early reports a prefix.
+FULL_GRAPH = ["history", "structural_index", "architect", "threat_modeler", "planner",
+              "researcher", "findings_gate", "reporter"]
+
 
 def fake_scan(finding=None, code=0, tokens=None, cached=0, pause_trigger="",
-              no_report=False):
+              no_report=False, nodes=None):
+    if nodes is None:
+        nodes = FULL_GRAPH if code == 0 else FULL_GRAPH[:FULL_GRAPH.index("researcher") + 1]
+
     def _cmd(state, target, max_llm_calls, model):
         return [sys.executable, "-c", _FAKE_SCAN.format(
             ref_root=str(pr_scan._REF_ROOT), db=state.db_path, target=target,
             finding=finding, code=code, tokens=tokens, cached=cached,
-            pause_trigger=pause_trigger, no_report=no_report)]
+            pause_trigger=pause_trigger, no_report=no_report, nodes=list(nodes))]
     return _cmd
 
 
@@ -862,7 +869,13 @@ class TestSpendArithmetic(unittest.TestCase):
                                  "llm_calls": 2.0, "pause_trigger": None}), encoding="utf-8")
         acct = pr_scan.read_spend_report(p)
         self.assertEqual(acct, {"tokens": 0, "fresh_tokens": 0, "cached_tokens": 0,
-                                "llm_calls": 2, "pause_trigger": ""})
+                                "llm_calls": 2, "pause_trigger": "", "nodes": []})
+        p.write_text(json.dumps({"tokens": 1, "nodes": ["researcher", 3, "reviewer"]}), encoding="utf-8")
+        self.assertEqual(pr_scan.read_spend_report(p)["nodes"], ["researcher", "reviewer"])
+        self.assertTrue(pr_scan.researcher_finished(["planner", "researcher", "findings_gate"]))
+        self.assertFalse(pr_scan.researcher_finished(["planner", "researcher"]))
+        self.assertFalse(pr_scan.researcher_finished(["planner"]))
+        self.assertFalse(pr_scan.researcher_finished([]))
 
     def test_scan_command_carries_the_grant_at_full_price(self):
         tmp = tempfile.mkdtemp()
@@ -1113,6 +1126,268 @@ class TestDailyMeter(unittest.TestCase):
         self.assertEqual(f(4_000_000, 100_000_000, 100_000_000), 0)
         self.assertEqual(f(4_000_000, 100_000_000, 250_000_000), 0)        # never negative
         self.assertEqual(f(0, 100_000_000, 40_000_000), 60_000_000)        # daily alone bounds
+
+
+def _knowledge_files(status="confirmed", severity="HIGH", line=2):
+    """A minimal valid knowledge export: one finding on app.py and a threat model."""
+    finding = {"lineage_id": "lin-app-1", "signature": "sig-app-1", "filepath": "app.py",
+               "line_numbers": [line], "title": "Known issue in helper", "severity": severity,
+               "status": status, "description": "Recorded by an earlier full scan.", "cwe": "CWE-20",
+               "code_paths": ["app.py:2"], "run_id": "full-scan-1"}
+    return {
+        ".mantis/knowledge/manifest.json": json.dumps({"schema_version": 1, "generator": "mantis"}),
+        ".mantis/knowledge/findings.jsonl": json.dumps(finding) + "\n",
+        ".mantis/knowledge/threat_model.md": "# Threat model\n\n- helper() takes caller input\n",
+        ".mantis/knowledge/threat_model.json": json.dumps({"threats": [{"title": "caller input in helper"}]}),
+        ".mantis/knowledge/coverage.json": json.dumps({"schema_version": 1, "runs": [
+            {"run_id": "full-scan-1", "snapshot_id": "s1", "examined": ["app.py"]}],
+            "scanned": [{"path": "app.py", "scan_mode": "file-by-file", "last_run_id": "full-scan-1"}]}),
+    }
+
+
+class KnowledgeCase(DriverCase):
+    """The fixture's BASE commit carries a knowledge export; HEAD is the usual
+    PR on top (app.py edited at line 2, new.py added)."""
+
+    def setUp(self):
+        super().setUp()
+        # Rewrite history: knowledge in the base, then the same PR on top.
+        files = _knowledge_files()
+        _git(self.repo, "checkout", "-q", self.base)
+        for rel, body in files.items():
+            p = self.repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base with knowledge")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "app.py").write_text(HEAD_APP, encoding="utf-8")
+        (self.repo / "new.py").write_text("def fresh():\n    return 1\n", encoding="utf-8")
+        (self.repo / "README.md").write_text("# docs\n", encoding="utf-8")
+        (self.repo / "gone.py").unlink()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "head")
+        _git(self.repo, "checkout", "-q", "-B", "main")
+
+
+class TestKnowledgeInTheRun(KnowledgeCase):
+    def test_base_knowledge_feeds_the_gate_and_the_scans(self):
+        probe = Path(self.tmp) / "child.json"
+        dumping = lambda *a, **k: [sys.executable, "-c",
+                                   f"import json,sys; json.dump(sys.argv, open({str(probe)!r},'w'))"]
+        rc, out = self.run_main("--fail-on", "block", scan=dumping)
+        rep = self.report()
+        # INV-3 at the gate: the known HIGH finding sits on the changed line.
+        self.assertEqual(rep["verdict"], "BLOCK", rep["reasons"])
+        self.assertTrue(any("Known issue in helper" in r for r in rep["reasons"]), rep["reasons"])
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        kn = rep["knowledge"]
+        self.assertTrue(kn["source"].startswith("base commit"))
+        self.assertEqual(kn["imported"]["findings"], 1)
+        self.assertTrue(kn["imported"]["threat_model"])
+        self.assertEqual(kn["changed"], [])
+        self.assertEqual(kn["error"], "")
+        # app.py was covered by the full scan: no "never been scanned" for it.
+        self.assertFalse(any("'app.py' has never been scanned" in r for r in rep["reasons"]), rep["reasons"])
+        # Children import the same extracted copy, which lives in the state dir, not the checkout.
+        argv = json.loads(probe.read_text())
+        kdir = argv[argv.index("--import-knowledge") + 1]
+        self.assertTrue(kdir.startswith(str(self.state_root)), kdir)
+        self.assertFalse(kdir.startswith(str(self.repo)))
+        self.assertTrue((Path(kdir) / "findings.jsonl").exists())
+        self.assertIn("### Knowledge", self.summary.read_text())
+        self.assertIn("1 known finding(s)", self.summary.read_text())
+
+    def test_the_pull_requests_edits_to_knowledge_are_not_trusted_and_are_flagged(self):
+        # The PR marks the finding a false positive and deletes the threat
+        # model. The gate still blocks on the base's version; the edits are a
+        # REVIEW reason and annotations, and the files are never scanned.
+        probe = Path(self.tmp) / "launched.txt"
+
+        def counting(state, target, max_llm_calls, model):
+            with open(probe, "a") as fh:
+                fh.write(target + "\n")
+            return fake_scan()(state, target, max_llm_calls, model)
+
+        files = _knowledge_files(status="false_positive")
+        self.commit_pr({".mantis/knowledge/findings.jsonl": files[".mantis/knowledge/findings.jsonl"]})
+        (self.repo / ".mantis/knowledge/threat_model.md").unlink()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "tamper")
+        rc, out = self.run_main("--ignore", "", scan=counting)  # even with nothing ignored
+        rep = self.report()
+        self.assertEqual(rep["verdict"], "BLOCK", rep["reasons"])
+        self.assertEqual(sorted(rep["knowledge"]["changed"]),
+                         ["D .mantis/knowledge/threat_model.md", "M .mantis/knowledge/findings.jsonl"])
+        self.assertTrue(any("changes Mantis's knowledge" in r for r in rep["reasons"]), rep["reasons"])
+        self.assertIn("::warning file=.mantis/knowledge/findings.jsonl,title=Mantis%3A knowledge changed::", out)
+        self.assertIn("::warning title=Mantis%3A knowledge changed::This pull request changes Mantis's "
+                      "knowledge (D .mantis/knowledge/threat_model.md)", out)
+        launched = probe.read_text()
+        self.assertNotIn(".mantis", launched, "knowledge files are never scanned")
+        self.assertIn("Changed by this pull request", self.summary.read_text())
+
+    def test_a_knowledge_only_pull_request_is_review_not_pass(self):
+        self.commit_pr({".mantis/knowledge/learnings.jsonl": json.dumps({"category": "x", "learning": "y"}) + "\n"})
+        # Make it knowledge-only: revert the code and README changes.
+        _git(self.repo, "checkout", "-q", self.base, "--", "app.py")
+        for extra in ("new.py", "README.md"):
+            (self.repo / extra).unlink()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "knowledge only")
+        rc, out = self.run_main("--fail-on", "review", scan=fake_scan())
+        rep = self.report()
+        self.assertEqual(rep["verdict"], "REVIEW", rep["reasons"])
+        self.assertTrue(any("changes Mantis's knowledge" in r for r in rep["reasons"]))
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+
+    def test_knowledge_added_by_the_pull_request_is_not_imported(self):
+        # Base without knowledge, PR adds it: nothing is read, the addition is flagged.
+        _git(self.repo, "checkout", "-q", "main~2")  # the original knowledge-free base
+        base = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "-B", "pr")
+        for rel, body in _knowledge_files().items():
+            p = self.repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+        (self.repo / "app.py").write_text(HEAD_APP, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "pr adds knowledge")
+        self.base = base
+        rc, _ = self.run_main(scan=fake_scan())
+        rep = self.report()
+        self.assertIsNone(rep["knowledge"]["source"])
+        self.assertIsNone(rep["knowledge"]["imported"])
+        self.assertTrue(all(c.startswith("A ") for c in rep["knowledge"]["changed"]), rep["knowledge"])
+        self.assertNotEqual(rep["verdict"], "BLOCK")
+        self.assertIn("in the base commit; the scan started from nothing", self.summary.read_text())
+
+    def test_unreadable_base_knowledge_is_review_not_a_setup_failure(self):
+        _git(self.repo, "checkout", "-q", self.base)
+        (self.repo / ".mantis/knowledge/manifest.json").write_text(json.dumps({"schema_version": 99}))
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "broken manifest")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "app.py").write_text(HEAD_APP, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "head")
+        _git(self.repo, "checkout", "-q", "-B", "main")
+        rc, _ = self.run_main(scan=fake_scan())
+        rep = self.report()
+        self.assertIn("schema_version", rep["knowledge"]["error"])
+        self.assertTrue(any("could not be read" in r for r in rep["reasons"]), rep["reasons"])
+        self.assertEqual(rep["verdict"], "REVIEW")
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+
+
+class TestKnowledgeRefresh(KnowledgeCase):
+    """--export-knowledge: the trusted post-merge refresh. The base knows a
+    HIGH finding at app.py:2; the PR rewrites line 2."""
+
+    def refresh(self, *extra, scan):
+        out_dir = Path(self.tmp) / "export"
+        rc, out = self.run_main("--export-knowledge", str(out_dir), *extra, scan=scan)
+        return rc, out, out_dir
+
+    def test_rewritten_and_not_refound_is_archived_and_exported(self):
+        # The rescan of app.py completes and reports nothing: the known finding's
+        # line was rewritten, so it is archived, not left open and not dropped.
+        rc, out, out_dir = self.refresh(scan=fake_scan())
+        rep = self.report()
+        archived = rep["knowledge"]["archived"]
+        self.assertEqual([a["lineage_id"] for a in archived], ["lin-app-1"])
+        self.assertNotEqual(rep["verdict"], "BLOCK", rep["reasons"])
+        # Still surfaced: as an archived notice on the touched file, not a verdict.
+        rels = {f["lineage_id"]: f["relationship"] for f in rep["findings"] if f.get("lineage_id")}
+        self.assertEqual(rels.get("lin-app-1"), "archived")
+        self.assertIn("::notice file=app.py,line=2,title=Mantis%3A HIGH::Known issue in helper [HIGH, archived] "
+                      "archived: found here before", out)
+        self.assertIn("Archived by this refresh (1)", self.summary.read_text())
+        # The export carries the archived row with the reason, and the head.
+        recs = [json.loads(l) for l in (out_dir / "findings.jsonl").read_text().splitlines()]
+        row = next(r for r in recs if r["lineage_id"] == "lin-app-1")
+        self.assertEqual(row["status"], "archived")
+        self.assertIn("archived by knowledge refresh", row["triage_reasoning"])
+        self.assertIn("check again", row["triage_reasoning"])
+        manifest = json.loads((out_dir / "manifest.json").read_text())
+        self.assertEqual(manifest["head"], _git(self.repo, "rev-parse", "HEAD"))
+        self.assertIn("Knowledge written to", self.summary.read_text())
+        # Coverage advanced to the files this refresh scanned.
+        cov = json.loads((out_dir / "coverage.json").read_text())
+        self.assertIn("app.py", [s["path"] for s in cov["scanned"]])
+
+    def test_refound_lineage_stays_open(self):
+        refound = {"title": "Known issue in helper", "severity": "HIGH", "status": "confirmed",
+                   "description": "Still here.", "line_numbers": [2], "filepath": "app.py",
+                   "lineage_id": "lin-app-1", "signature": "sig-app-1", "cwe": "CWE-20"}
+        rc, out, out_dir = self.refresh("--fail-on", "block", scan=fake_scan(finding=refound))
+        rep = self.report()
+        self.assertEqual(rep["knowledge"]["archived"], [])
+        self.assertEqual(rep["verdict"], "BLOCK")
+        recs = [json.loads(l) for l in (out_dir / "findings.jsonl").read_text().splitlines()]
+        self.assertEqual([r["status"] for r in recs if r["lineage_id"] == "lin-app-1"], ["confirmed"])
+
+    def test_untouched_lines_failed_scans_and_dismissals_are_left_alone(self):
+        # Finding at line 40, nowhere near the change: open stays open.
+        far = _knowledge_files(line=40)
+        _git(self.repo, "checkout", "-q", self.base)
+        (self.repo / ".mantis/knowledge/findings.jsonl").write_text(far[".mantis/knowledge/findings.jsonl"])
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base far")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "app.py").write_text(HEAD_APP, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "head")
+        _git(self.repo, "checkout", "-q", "-B", "main")
+        rc, out, out_dir = self.refresh(scan=fake_scan())
+        self.assertEqual(self.report()["knowledge"]["archived"], [])
+
+    def test_archiving_needs_the_researcher_to_have_finished_not_the_run(self):
+        # Paused in review, after the researcher reported: the file was examined.
+        paused_late = fake_scan(code=2, pause_trigger="llm_calls_limit",
+                                nodes=FULL_GRAPH[:FULL_GRAPH.index("findings_gate") + 1] + ["deduplicator", "reviewer"])
+        rc, out, out_dir = self.refresh(scan=paused_late)
+        self.assertEqual([a["lineage_id"] for a in self.report()["knowledge"]["archived"]], ["lin-app-1"])
+        # Paused or failed inside the researcher: nobody finished looking; nothing archived.
+        for early in (fake_scan(code=2, pause_trigger="token_budget", nodes=FULL_GRAPH[:6]),
+                      fake_scan(code=1, nodes=FULL_GRAPH[:6]),
+                      fake_scan(code=2, pause_trigger="llm_calls_limit", no_report=True)):
+            rc, out, out_dir = self.refresh(scan=early)
+            self.assertEqual(self.report()["knowledge"]["archived"], [], self.report()["scan"]["results"])
+        # A finished run from a pipeline that reports no nodes still counts.
+        rc, out, out_dir = self.refresh(scan=fake_scan(nodes=[]))
+        self.assertEqual([a["lineage_id"] for a in self.report()["knowledge"]["archived"]], ["lin-app-1"])
+
+    def test_a_pull_request_scan_never_archives(self):
+        # Same change, no --export-knowledge: the imported finding stays open
+        # on the rewritten line and the gate blocks. Fail closed at PR time.
+        rc, out = self.run_main("--fail-on", "block", scan=fake_scan())
+        rep = self.report()
+        self.assertNotIn("archived", rep["knowledge"])
+        self.assertEqual(rep["verdict"], "BLOCK", rep["reasons"])
+
+    def test_radius_adds_caller_files_after_the_change(self):
+        # helper() is called by handler() in the same file; add a caller in
+        # another file so the radius has somewhere to go.
+        (self.repo / "caller.py").write_text("from app import helper\n\ndef use():\n    return helper(1)\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "add caller")
+        # The PR touches app.py only.
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "app.py").write_text(HEAD_APP.replace("x + 0", "x + 1"), encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "touch helper")
+        probe = Path(self.tmp) / "launched.txt"
+
+        def counting(state, target, max_llm_calls, model):
+            with open(probe, "a") as fh:
+                fh.write(os.path.relpath(target, self.repo) + "\n")
+            return fake_scan()(state, target, max_llm_calls, model)
+
+        self.run_main("--radius", "1", scan=counting)
+        launched = probe.read_text().split()
+        self.assertEqual(launched[0], "app.py")
+        self.assertIn("caller.py", launched, f"index should name caller.py as a caller: {launched}")
 
 
 class TestDailyBudgetInTheRun(DriverCase):

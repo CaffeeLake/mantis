@@ -246,6 +246,63 @@ scanned function that calls into an excluded directory can still be followed
 there, and a caller in an excluded test directory is still a caller. The run
 states what it excluded and how many files remain in scope.
 
+### Keeping what Mantis learned in the repository
+
+Everything a run learns about a codebase — its findings and their status, the
+threat model and architecture it drew, what it has covered, and what it noticed
+about the code's habits — lives in the knowledge database, scoped to runs. That
+is the right shape for a run and the wrong shape for a repository: nobody opens
+the database, nothing survives a fresh checkout, and a reviewer cannot see a
+claim change.
+
+`scripts/knowledge.py export` writes the same knowledge as text under
+`.mantis/knowledge/`, one record per line, sorted, so it can be committed and a
+re-export after the next run diffs to exactly what changed:
+
+```bash
+./run.sh /path/to/repo
+python3 scripts/knowledge.py export --db knowledge.db --repo /path/to/repo
+git -C /path/to/repo add .mantis/knowledge && git -C /path/to/repo commit -m "Mantis: refresh knowledge"
+```
+
+The next run reads it back before it decides what to scan:
+
+```bash
+./run.sh /path/to/repo --import-knowledge /path/to/repo/.mantis/knowledge
+```
+
+Imported findings keep their lineage ids and statuses, so a re-scan matches what
+it already knows rather than reporting it again and a suppressed finding stays
+suppressed; coverage feeds `auto` mode, which sweeps only what has never been
+covered; and the threat model and architecture are found by the run's own tools,
+so the architect and threat modeler refine rather than rebuild. `.mantis/`
+itself is never a scan target.
+
+Export is a deliberate step after a scan rather than something the scan does:
+the pipeline never writes into the target it audits. Import is explicit for the
+same reason in reverse: the files sit in the checkout, and whether to trust them
+is the operator's call, not the tool's. Everything imported is treated as data —
+scrubbed, bounded, and validated — and a file the importer cannot read costs the
+run that part of its memory, never the run.
+
+Checked in, the knowledge is versioned, diffable, and reviewed like any other
+claim about the system: "Mantis thinks `/admin/export` sits behind the auth
+boundary; it does not" is a review comment on `threat_model.md`, and a pull
+request that marks a finding suppressed is a change a person approves. A
+scheduled full scan that opens a pull request with the refreshed export is the
+loop that keeps it current; `docs/github-action.md` describes the incremental
+version, which scans only what landed and sweeps uncovered files within a
+budget.
+
+One status exists for this loop: **archived**. A refresh that rescans a file
+whose change rewrote the lines a known finding cited, and does not find the
+lineage again, archives the finding rather than closing it or leaving it open.
+Archived findings do not gate, are shown as notices when their file is touched,
+are recalled first by the next run on that area ("found here before; the code
+changed since"), and reopen on any later report of the same lineage. The name is
+the hint: to a person or an agent reading the knowledge, an archived entry is
+the place most worth a second look.
+
 ## Evidence Sources
 
 Every fact carries the tier of the source it came from, and a tier states what a

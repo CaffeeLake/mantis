@@ -2,7 +2,9 @@ name: Mantis PR Scan
 description: >-
   Audits the files a pull request changes with the Mantis vulnerability
   pipeline and reports the verdict as annotations on the diff and a step
-  summary. Advisory by default; set fail-on to gate merges.
+  summary. Advisory by default; set fail-on to gate merges. Not yet run
+  end-to-end against a live project: see the status note at the top of
+  reference/docs/github-action.md before relying on it.
 author: Google
 branding:
   icon: shield
@@ -31,9 +33,12 @@ inputs:
     required: false
     default: ""
   max-llm-calls:
-    description: LLM call ceiling per changed file.
+    description: >-
+      LLM call ceiling per changed file: a loop guard, not the spend control
+      (that is max-tokens). A scan that reaches it pauses with what it found
+      so far stored and the file is reported as partially covered.
     required: false
-    default: "150"
+    default: "400"
   max-tokens:
     description: >-
       Token budget for the whole run, e.g. 10M or 500k. The hard limit on

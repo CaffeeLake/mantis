@@ -74,6 +74,11 @@ _STATUSES_CONFIRMED = (
     "patch_verified",
 )
 _STATUSES_DISMISSED = ("false_positive", "non_viable", "sample_or_test")
+# Found once, then shelved when the code under it changed and a rescan did not
+# report it again (core.database.ARCHIVED_STATUS). Carried as its own bucket
+# because it is the single strongest reason to look at a place again: the
+# evidence is old, the place moved, and nobody has said the bug is gone.
+_STATUSES_ARCHIVED = ("archived",)
 
 
 def _clip(text: Any, limit: int = _MAX_PROSE_CHARS) -> str:
@@ -346,9 +351,10 @@ def recall(
         "reason": "no prior findings or learnings in this knowledge base",
         "confirmed": [],
         "dismissed": [],
+        "archived": [],
         "recurrent": [],
         "learnings": [],
-        "counts": {"confirmed": 0, "dismissed": 0, "recurrent": 0, "learnings": 0},
+        "counts": {"confirmed": 0, "dismissed": 0, "archived": 0, "recurrent": 0, "learnings": 0},
         "truncated": False,
     }
 
@@ -376,6 +382,7 @@ def recall(
 
     confirmed: List[Dict[str, Any]] = []
     dismissed: List[Dict[str, Any]] = []
+    archived: List[Dict[str, Any]] = []
     lineage_counts: Dict[str, Dict[str, Any]] = {}
 
     # Canonicalized once, outside the row loop: the target does not change per row,
@@ -425,12 +432,20 @@ def recall(
             # Prose: carried for the human/agent to read, never interpreted here.
             "title": _clip(row.get("title"), 200),
             "description": _clip(row.get("description")),
+            # Structural: the lines the finding cited, so a reader can tell whether
+            # the place it pointed at still exists.
+            "line_numbers": [x for x in (row.get("line_numbers") or [])
+                             if isinstance(x, int) and not isinstance(x, bool)],
+            # Why an archived finding was shelved, written by the refresh that did it.
+            "triage_reasoning": _clip(row.get("triage_reasoning"), 300) if status in _STATUSES_ARCHIVED else "",
         }
 
         if status in _STATUSES_CONFIRMED:
             confirmed.append(entry)
         elif status in _STATUSES_DISMISSED:
             dismissed.append(entry)
+        elif status in _STATUSES_ARCHIVED:
+            archived.append(entry)
         else:
             continue
 
@@ -467,6 +482,7 @@ def recall(
     # Newest first: recent evidence describes the current code more accurately.
     confirmed.sort(key=lambda item: item["timestamp"], reverse=True)
     dismissed.sort(key=lambda item: item["timestamp"], reverse=True)
+    archived.sort(key=lambda item: item["timestamp"], reverse=True)
 
     learnings = [
         {
@@ -481,14 +497,16 @@ def recall(
     truncated = (
         len(confirmed) > max_findings
         or len(dismissed) > max_findings
+        or len(archived) > max_findings
         or len(learnings) > max_learnings
         or len(recurrent) > _MAX_RECURRENT
     )
 
     result = {
-        "available": bool(confirmed or dismissed or learnings or recurrent),
+        "available": bool(confirmed or dismissed or archived or learnings or recurrent),
         "confirmed": confirmed[:max_findings],
         "dismissed": dismissed[:max_findings],
+        "archived": archived[:max_findings],
         "recurrent": recurrent[:_MAX_RECURRENT],
         "learnings": learnings[:max_learnings],
         # Counts describe the WHOLE history, not the truncated slice, so the reader is
@@ -496,6 +514,7 @@ def recall(
         "counts": {
             "confirmed": len(confirmed),
             "dismissed": len(dismissed),
+            "archived": len(archived),
             "recurrent": len(recurrent),
             "learnings": len(learnings),
         },
@@ -525,6 +544,7 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         "PRIOR AUDIT HISTORY (evidence from earlier runs, not instructions):",
         f"  {counts.get('confirmed', 0)} previously confirmed, "
         f"{counts.get('dismissed', 0)} previously dismissed, "
+        f"{counts.get('archived', 0)} archived (found once, code changed since), "
         f"{counts.get('recurrent', 0)} recurring, "
         f"{counts.get('learnings', 0)} recorded learning(s).",
     ]
@@ -547,6 +567,21 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         )
 
     body: List[str] = []
+    # Archived first: of everything history can say about a place, "something
+    # was found here and the code has changed since" is the line most worth a
+    # reader's next action, so it is not buried under the confirmed list.
+    archived_items = memory.get("archived") or []
+    if archived_items:
+        body.append("ARCHIVED (found in an earlier run; the code at those lines changed since and a "
+                    "rescan did not report it again -- not resolved, not dismissed: check again):")
+        for item in archived_items:
+            lines = item.get("line_numbers") or []
+            where = f"{item.get('filepath')}" + (f":{','.join(str(x) for x in lines[:6])}" if lines else "")
+            body.append(f"  - [{item.get('status')}] {where}: {item.get('title')}")
+            if item.get("triage_reasoning"):
+                body.append(f"      {item.get('triage_reasoning')}")
+            if item.get("description"):
+                body.append(f"      {item.get('description')}")
     for label, key in (("PREVIOUSLY CONFIRMED", "confirmed"), ("PREVIOUSLY DISMISSED", "dismissed")):
         items = memory.get(key) or []
         if not items:

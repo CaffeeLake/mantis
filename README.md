@@ -14,6 +14,15 @@
 > it is a false positive, nor does a successful reproducer guarantee the bug is
 > exploitable in all contexts. Use Mantis responsibly.
 
+> [!WARNING] **The pull request scan is untested.** The GitHub Action in
+> `action/`, the `mantis-pr-scan` and `mantis-knowledge-refresh` workflows under
+> `.github/workflows/`, and `reference/scripts/setup_github_action.sh` have been
+> reviewed and exercised against stubs, but have not yet been run end-to-end
+> against a live project. Do not use the action to gate merges. The status note
+> at the top of
+> [reference/docs/github-action.md](reference/docs/github-action.md) lists what
+> execution has not verified and will be removed when it has.
+
 Mantis is a set of skills along with an ADK reference harness for building
 secure software in the new AI era of software development.
 
@@ -43,6 +52,10 @@ python3 scripts/configure.py --test --probe
 
 # 4b. (Optional) Leave vendored or generated code out of the scan
 ./run.sh path/to/code --exclude vendor,testdata --exclude 'third_party/*'
+
+# 4c. (Optional) Keep what Mantis learned in the repository, and read it back next time
+python3 scripts/knowledge.py export --db knowledge.db --repo path/to/code   # writes .mantis/knowledge/
+./run.sh path/to/code --import-knowledge path/to/code/.mantis/knowledge
 
 # 5. (Optional) Set or remove the spend ceiling for a run
 ./run.sh path/to/code --max-tokens 2M --cache-discount 1   # hard cap, every token at full price

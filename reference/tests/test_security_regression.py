@@ -6418,7 +6418,7 @@ class TestWhatEarlierRunsFoundReachesTheNextRun(unittest.TestCase):
         self.assertEqual(
             set(memory),
             {
-                "available", "confirmed", "dismissed", "recurrent", "learnings",
+                "available", "confirmed", "dismissed", "archived", "recurrent", "learnings",
                 "counts", "truncated",
             },
         )
@@ -6427,11 +6427,19 @@ class TestWhatEarlierRunsFoundReachesTheNextRun(unittest.TestCase):
                 set(entry),
                 {
                     "filepath", "status", "severity", "cwe", "run_id", "timestamp",
-                    "code_paths", "title", "description",
+                    "code_paths", "title", "description", "line_numbers", "triage_reasoning",
                 },
                 "the recall payload grew a field; anything capability-shaped here "
                 "would be attacker-influenced text in an actionable position.",
             )
+            # `line_numbers` is structural: integers, used to say where a finding
+            # pointed. `triage_reasoning` is prose and is carried ONLY for archived
+            # entries (the refresh's note on why it was shelved); for every other
+            # status it is empty, so a confirmed finding cannot smuggle a second
+            # prose channel. Both render inside the untrusted fence like
+            # `description`.
+            self.assertTrue(all(isinstance(x, int) for x in entry["line_numbers"]))
+            self.assertEqual(entry["triage_reasoning"], "")
             # `code_paths` was added deliberately for cross-area hypotheses. It is
             # permitted because it is consumed MECHANICALLY -- symbols are extracted by
             # regex and matched as strings, never read for meaning -- and because it

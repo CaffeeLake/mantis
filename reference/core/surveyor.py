@@ -951,6 +951,8 @@ def survey(
         raise ValueError(f"Surveyor refused target: {err}")
 
     vetted = get_vetted_staging_files(resolved)
+    # Tool state (a committed .mantis/knowledge) is never a subsystem.
+    vetted = [(abs_p, rel) for abs_p, rel in vetted if not rel.startswith(".mantis/")]
     if exclude:
         from core.exclusions import is_excluded
 

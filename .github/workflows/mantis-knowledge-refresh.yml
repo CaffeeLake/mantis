@@ -1,0 +1,197 @@
+# Keeps .mantis/knowledge current: nightly, scans what landed on main since the
+# knowledge was last refreshed; weekly, sweeps files no scan has covered yet,
+# within a budget. If the export changed, opens a pull request with it.
+#
+# This workflow scans main only, never pull-request code, which is why it
+# may hold a token that writes: the scanning steps get none (GitHub's tokens
+# are stripped from the pipeline's environment, and the auth step's
+# credential file is moved out of the tree), and only the final step, which
+# pushes a branch and opens the pull request, sees it.
+#
+# Two things make "main only" true rather than hoped. The job declares the
+# `mantis-knowledge` environment, which must carry a deployment-branch rule
+# of `main` only (setup_github_action.sh --environment mantis-knowledge
+# --refresh creates it that way) -- GitHub runs a dispatched workflow from
+# whichever branch was chosen, with that branch's copy of this file. And the
+# first step refuses to continue on any other ref.
+name: Mantis knowledge refresh
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # nightly: the delta since the last refresh
+    - cron: "47 4 * * 0"   # weekly: a budgeted sweep of never-covered files
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: delta (what landed since the last refresh) or sweep (uncovered files)
+        required: false
+        default: delta
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mantis-knowledge-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    environment: mantis-knowledge
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Refuse to run from anything but main
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::This workflow runs from main only (got $REF)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # The auth step writes its credential configuration into the checkout,
+      # and the sweep scans the checkout. Move it out first.
+      - name: Move the credential out of the checkout
+        shell: bash
+        run: |
+          if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+            case "$GOOGLE_APPLICATION_CREDENTIALS" in
+              "$GITHUB_WORKSPACE"/*)
+                dest="$RUNNER_TEMP/mantis-credentials.json"
+                install -m 0600 "$GOOGLE_APPLICATION_CREDENTIALS" "$dest"
+                rm -f -- "$GOOGLE_APPLICATION_CREDENTIALS"
+                {
+                  echo "GOOGLE_APPLICATION_CREDENTIALS=$dest"
+                  echo "GOOGLE_GHA_CREDS_PATH=$dest"
+                  echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=$dest"
+                } >> "$GITHUB_ENV"
+                ;;
+            esac
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install Mantis
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+        run: python -P -m pip install --quiet --require-hashes -r requirements.txt
+
+      - name: Decide what to scan
+        id: plan
+        shell: bash
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          mode="${MODE_INPUT:-delta}"
+          [ "$SCHEDULE" = "47 4 * * 0" ] && mode=sweep
+          base=""
+          if [ -f .mantis/knowledge/manifest.json ]; then
+            base=$(python -c 'import json; print(json.load(open(".mantis/knowledge/manifest.json")).get("head", ""))')
+          fi
+          # The manifest is committed content; its head goes into a step
+          # output and from there into a command line. Only a commit id does.
+          case "$base" in
+            *[!0-9a-f]*|"") base="" ;;
+          esac
+          if [ -n "$base" ] && { [ "${#base}" -lt 7 ] || [ "${#base}" -gt 64 ]; }; then base=""; fi
+          if [ "$mode" = delta ] && [ -z "$base" ]; then
+            echo "No committed knowledge yet: a delta has no base. Running a sweep instead."
+            mode=sweep
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Mode: $mode; base: ${base:-none}"
+
+      - name: Delta scan of what landed since the last refresh
+        if: steps.plan.outputs.mode == 'delta'
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+          LITELLM_MODE: PRODUCTION
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT }}
+          BASE: ${{ steps.plan.outputs.base }}
+        run: |
+          set +e
+          python scripts/pr_scan.py --repo "$GITHUB_WORKSPACE" \
+            --base "$BASE" --head HEAD --model vertex_ai/gemini-3.8-flash \
+            --radius 1 --max-llm-calls 400 --max-tokens 20M --export-knowledge "$GITHUB_WORKSPACE/.mantis/knowledge" \
+            --state-dir "$RUNNER_TEMP" --output-json "$RUNNER_TEMP/refresh.json" --no-annotations \
+            --fail-closed
+          rc=$?
+          # 0 and 1 are verdicts (the export is the product here); 3 is a setup
+          # failure and must be seen.
+          [ "$rc" -eq 3 ] && exit 3
+          exit 0
+
+      - name: Sweep files no scan has covered
+        if: steps.plan.outputs.mode == 'sweep'
+        shell: bash
+        working-directory: reference
+        env:
+          PYTHONSAFEPATH: "1"
+          LITELLM_MODE: PRODUCTION
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT }}
+          MANTIS_MAX_INPUT_TOKENS: "262144"
+        run: |
+          import_flag=()
+          [ -f "$GITHUB_WORKSPACE/.mantis/knowledge/manifest.json" ] && \
+            import_flag=(--import-knowledge "$GITHUB_WORKSPACE/.mantis/knowledge")
+          set +e
+          # The pipeline runs without GitHub's runtime tokens, as it does
+          # under the driver: scripts/pr_scan.py's subprocess_env is the one
+          # list of what is stripped.
+          env $(python -c 'import sys; sys.path.insert(0, "."); from scripts.pr_scan import _STRIPPED_ENV; print(" ".join("-u " + k for k in sorted(_STRIPPED_ENV)))') \
+            python main.py "$GITHUB_WORKSPACE" --scan-mode auto --yes --sandbox static-only \
+            --model vertex_ai/gemini-3.8-flash --max-tokens 20M --cache-discount 1 \
+            --exclude tests --db "$RUNNER_TEMP/knowledge.db" "${import_flag[@]}"
+          rc=$?
+          # 2 is a pause at the budget, which is the plan; 4 is rejected credentials.
+          [ "$rc" -eq 4 ] && exit 4
+          set -e
+          python scripts/knowledge.py export --db "$RUNNER_TEMP/knowledge.db" \
+            --repo "$GITHUB_WORKSPACE"
+
+      - name: Open a pull request if the knowledge changed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A .mantis/knowledge
+          if git diff --cached --quiet; then
+            echo "Knowledge unchanged."; exit 0
+          fi
+          branch="mantis/knowledge-$(date -u +%Y%m%d)"
+          stat=$(git diff --cached --stat | tail -1 | sed 's/^ *//')
+          git config user.name "mantis-knowledge[bot]"
+          git config user.email "mantis-knowledge[bot]@users.noreply.github.com"
+          git checkout -q -B "$branch"
+          git commit -q -m "Mantis: refresh knowledge ($stat)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=$auth" push -q -f origin "HEAD:refs/heads/$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Mantis: refresh knowledge" \
+            --body "Automated refresh of \`.mantis/knowledge\` from the scan on main. Review archived and new findings as you would code." \
+            || gh pr edit "$branch" --title "Mantis: refresh knowledge" >/dev/null

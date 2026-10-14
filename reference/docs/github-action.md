@@ -11,6 +11,20 @@ scanner -- a model outage, a setup mistake, a crash -- never stops a merge. Two
 inputs change that independently once you trust it on your code: `fail-on` makes
 findings fail the job; `fail-closed` makes "Mantis could not look" fail it too.
 
+> **Status: not yet run end-to-end.** Everything below has been tested against
+> stubs and read by two security audits, but the action has not yet run against
+> a live project: no workflow run, no environment, no credential. Not verified
+> by execution: the custom role's permission list against real model calls; the
+> hash-pinned install on GitHub's runner image; the daily meter's metric, and
+> whether models other than Gemini count in it; metering of the context
+> compaction path; how the step summary renders; the knowledge-refresh workflow
+> in its entirety; wall time against the 90-minute job timeout on a real diff.
+> Until the scan has run cleanly several times, leave `fail-on` and
+> `fail-closed` unset, do not set up the refresh workflow (`--refresh`), and on
+> the first runs read the scan log for permission denials, the meter line, the
+> spend report and the run time. The commit that records those runs should
+> remove this note.
+
 ## Setup
 
 The scan runs Gemini on the Gemini Enterprise Agent Platform (the service
@@ -304,8 +318,8 @@ only its owner can make.
 
 ### Sizing
 
-Measured with a Gemini model at the default `max-llm-calls` of 150, every token
-at full price:
+Measured with a Gemini model, calls uncapped in practice, every token at full
+price:
 
 | File        | Tokens | Calls | Minutes |
 | ----------- | ------ | ----- | ------- |
@@ -335,6 +349,33 @@ too small shows up as REVIEW with files named, never as a silent pass. Minutes
 per file set the other limit: the job's `timeout-minutes` ends a run that is
 still scanning, and the files it did not reach are REVIEW too.
 
+#### In money
+
+The budgets are in tokens because tokens are what the action can count. What
+they cost is your model's price on the day, which this document does not quote:
+multiply the rows below by the per-token price of the model you configure, with
+output taken as about an eighth of the tokens and no prompt caching. The
+defaults were sized for the default model.
+
+| Budget                                | Tokens |
+| ------------------------------------- | ------ |
+| One ordinary file                     | 500k   |
+| One pull request, 4 files             | 2M     |
+| `max-tokens: 10M`, worst case per run | 10M    |
+| `daily-token-budget: 100M`, per day   | 100M   |
+| … for a month nobody looked           | 3,000M |
+
+The last row is the one to size for. Decide what a month of unnoticed abuse may
+cost you, divide by your model's blended price per token to get the month in
+tokens, divide by thirty for `daily-token-budget`, and set the billing stop
+(Setup) just above that month. A model that costs several times more per token
+than the default needs budgets several times smaller for the same ceiling -- on
+the order of `max-tokens: 3M` and `daily-token-budget: 30M` at a tenfold price
+difference. The defaults are chosen so that ordinary pull requests finish whole
+and a day of abuse is bounded, not so that nothing can ever be wasted: a run
+that pauses short of finishing has spent the tokens and produced less, which is
+the more expensive failure.
+
 ## Inputs
 
 | Input                | Default            | Meaning                                                                                                                                                                                                         |
@@ -342,13 +383,13 @@ still scanning, and the files it did not reach are REVIEW too.
 | `base-sha`           | the PR's base SHA  | Commit the diff is taken against.                                                                                                                                                                               |
 | `model`              | `gemini-3.8-flash` | Model id; a bare `gemini-*` id routes to the Gemini API when `GEMINI_API_KEY` is set, otherwise to the Agent Platform when a project is.                                                                        |
 | `api-base`           | empty              | Custom OpenAI-compatible endpoint. Skips the credential check.                                                                                                                                                  |
-| `max-llm-calls`      | `150`              | LLM call ceiling **per changed file**; a loop guard, not the spend control.                                                                                                                                     |
+| `max-llm-calls`      | `400`              | LLM call ceiling **per changed file**; a loop guard, not the spend control.                                                                                                                                     |
 | `max-tokens`         | `10M`              | Token budget **per run**, every token at full price, shared equally over the files left to scan; files it cannot reach are reported unscanned (REVIEW). `0` removes it.                                         |
-| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left. Unreadable when set: exit 3. `0` disables.                                |
+| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left, and re-read before every file. Unreadable: not run. `0` disables.                     |
 | `max-input-tokens`   | `262144`           | Input tokens one model request may carry; larger requests are refused before dispatch, for any model. `0` leaves only the model's window.                                                                       |
 | `max-files`          | `25`               | Files scanned per run; the rest are reported unscanned (REVIEW).                                                                                                                                                |
 | `per-file-timeout`   | `1800`             | Seconds before one file's scan is abandoned.                                                                                                                                                                    |
-| `ignore`             | `default`          | Comma-separated fnmatch patterns left out of the scan and the gate. `default` is the built-in list (docs, images, lockfiles, fonts); an empty string ignores nothing.                                           |
+| `ignore`             | `default`          | Comma-separated fnmatch patterns left out of the scan and the gate. `default` is the built-in list (prose and images; not manifests or lockfiles); an empty string ignores nothing.                             |
 | `fail-on`            | `none`             | What the findings do to the job. `none`: advisory. `block`: fail on BLOCK. `review`: fail on REVIEW or BLOCK.                                                                                                   |
 | `fail-closed`        | `false`            | Whether Mantis being unable to look fails the job (setup failure, model outage, a changed file not scanned, a crash). `false`: never; the summary says what was not audited. `true`: green means fully audited. |
 | `python-version`     | `3.13`             | Interpreter for the pipeline (3.12 or newer).                                                                                                                                                                   |
@@ -356,6 +397,86 @@ still scanning, and the files it did not reach are REVIEW too.
 Outputs: `verdict` (`PASS`, `REVIEW`, or `BLOCK`) and `report` (path of the JSON
 report with findings, blast radius, per-file scan results, and `usage`: tokens
 and calls for the run against its budget).
+
+## What the repository already knows
+
+A repository that has had a full scan can commit what Mantis learned as text
+under `.mantis/knowledge/` (`scripts/knowledge.py export`; see the reference
+README). The action reads that directory **from the base commit**, imports it
+into the run's fresh database, and hands it to every scan:
+
+- Known findings feed the gate directly. An open HIGH or CRITICAL finding that
+  the full scan recorded on lines a pull request touches is a BLOCK before any
+  model is called; a finding the full scan marked a false positive stays quiet.
+- Coverage counts. A file the full scan covered no longer draws "has never been
+  scanned by Mantis".
+- The threat model and architecture are in front of the model from its first
+  call, instead of being rebuilt per file.
+
+The pull request's own copy of `.mantis/knowledge/` is never read: a pull
+request must not get to edit the memory of the scan that grades it. Any change
+it makes there (a finding marked false positive, a trust boundary redrawn, a
+file of findings deleted) is reported as a REVIEW reason with an annotation on
+the file, even when the pull request changes nothing else, because it is a
+security decision for a person. The files themselves are never scanned or gated,
+whatever the `ignore` input says.
+
+No `.mantis/knowledge/` in the base commit is the ordinary state of a repository
+that has never exported; the scan runs as it would without one and the summary
+says so. One the action cannot read (a schema it does not know) is a REVIEW
+reason, not a failed check: the scan runs without it and names the problem.
+
+### Keeping it current without rescanning everything
+
+A full scan is the expensive way to build knowledge and the only way to build it
+all at once. The cheap way is to let it accumulate: scan what lands, and sweep
+what has never been covered a little at a time. This repository's
+`.github/workflows/mantis-knowledge-refresh.yml` does both and is the file to
+copy:
+
+- **Nightly, the delta.** The committed export records the commit it reflects
+  (`head` in `manifest.json`). The refresh runs the same driver as the action
+  from that commit to `main`, with the committed knowledge imported, one hop of
+  callers added (`--radius 1`), and `--export-knowledge` pointed back at
+  `.mantis/knowledge/`. The run's database is the base's knowledge plus what it
+  just found, so the export is the merged result; coverage advances to `main`.
+- **Weekly, a sweep.** `auto` mode over the repository with the knowledge
+  imported scans only files no recorded campaign has covered, under
+  `--max-tokens`; files it does not reach wait for next week. A repository can
+  start from an empty `.mantis/knowledge/` and fill in over a month without ever
+  paying for a full scan.
+- **If anything changed, a pull request.** The export is committed on a branch
+  and a pull request opened, by the one step in the job that holds a token. The
+  scanning steps get none: GitHub's tokens are stripped from the pipeline's
+  environment in both the delta and the sweep, and the auth step's credential
+  file is moved out of the tree before either runs.
+- **Main only, enforced twice.** The job declares its own environment,
+  `mantis-knowledge`, and GitHub runs a dispatched workflow from whichever
+  branch was chosen, with that branch's copy of the file. So that environment
+  must carry a deployment-branch rule of `main` only, and its provider
+  condition must pin the ref:
+  `setup_github_action.sh --project <project> --repo org/repo --environment mantis-knowledge --provider mantis-refresh --refresh --github`
+  creates both (a second provider in the same pool, admitting
+  `refs/heads/main` from that environment only, and the environment with the
+  branch rule and its three secrets). The workflow's first step also refuses
+  any ref but `main`. Put a CODEOWNERS entry on `.mantis/knowledge/` naming a
+  security owner: the pull request the refresh opens is not itself scanned,
+  and a merged export decides what later scans suppress. Read its markdown in
+  source view; the export encodes HTML and strips invisible characters, but
+  the reviewer is the control.
+
+What a refresh does to a known finding whose lines the change rewrote, when the
+rescan of that file finishes without reporting the lineage again: it marks it
+**archived**. Not fixed, not dismissed, not open. It no longer gates; it appears
+as a notice whenever its file is touched ("found here before, the code changed
+since"); recall shows it to the model first, as the strongest reason to look at
+a place again; and any later report of the same lineage reopens it. The export
+records why, with the commits. A pull-request scan never archives: there, an
+imported finding on rewritten lines stays open and blocks, so the change has to
+fix it or a person has to dismiss it.
+
+Cost per nightly refresh is one pull-request scan's worth for the day's changes;
+the weekly sweep is whatever `--max-tokens` allows.
 
 ## What the verdict means
 

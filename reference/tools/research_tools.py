@@ -137,7 +137,16 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
 
             if art is not None:
                 if len(art) > MAX_READ_SIZE:
-                    return art[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
+                    art = art[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
+                # An artifact that came in with a knowledge import is a file
+                # from the repository, not this run's own notes: it is read
+                # the way any repository file is, fenced as untrusted.
+                from core.database import artifact_is_imported
+                if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id) or \
+                        artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
+                        (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
+                         and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id)):
+                    return wrap_untrusted_content(art, filename=clean_path)
                 return art
 
             # Check findings virtual paths

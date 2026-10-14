@@ -107,6 +107,10 @@ DEFAULT_IGNORE = (
     "*.woff", "*.woff2", "*.ttf", "*.eot",
 )
 
+# Mantis's own state in the repository (a committed knowledge export). Never
+# scanned or gated, whatever the ignore list says; read from the base commit.
+TOOL_STATE_DIR = ".mantis"
+
 # Pipeline exit statuses, mirroring scan_change's labels, plus the one the
 # pipeline reserves for rejected credentials (core.config.EXIT_AUTH).
 SCAN_DONE = "done"
@@ -254,6 +258,87 @@ def _valid_rev(rev: str, allow_head: bool = False) -> bool:
 def _commit_present(repo: Path, rev: str) -> bool:
     return _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
                 f"{rev}^{{commit}}", check=False).returncode == 0
+
+
+# --- Knowledge from the base commit ----------------------------------------------------
+
+# The repository's committed knowledge export (core.knowledge), read from the
+# BASE commit and never from the checkout: the checkout is the pull request's,
+# and a pull request must not get to edit the memory of the scan that grades
+# it. The scan uses the base's version; the pull request's edits to it are
+# reported as a change for a person to review.
+KNOWLEDGE_FILES = ("manifest.json", "findings.jsonl", "learnings.jsonl", "threat_model.json",
+                   "threat_model.md", "architecture.md", "summary.json", "coverage.json")
+MAX_KNOWLEDGE_FILE_BYTES = 32 * 1024 * 1024
+
+
+def knowledge_from_base(repo: Path, base: str, dest: Path) -> Tuple[Optional[Path], str]:
+    """Extracts `.mantis/knowledge/*` as of `base` into `dest`.
+
+    Returns (dest, "") when the base commit carries a manifest, (None, "") when
+    it carries none (the ordinary case for a repository that has never
+    exported), and (None, reason) when it carries one that could not be read
+    whole. Only the known file names are read, each by blob from the commit,
+    none larger than the import would accept.
+    """
+    from core.knowledge import KNOWLEDGE_DIR
+
+    def blob(name: str) -> Optional[bytes]:
+        spec = f"{base}:{KNOWLEDGE_DIR}/{name}"
+        size = _git(repo, "cat-file", "-s", "--end-of-options", spec, check=False)
+        if size.returncode != 0:
+            return None
+        try:
+            if int(size.stdout.strip()) > MAX_KNOWLEDGE_FILE_BYTES:
+                raise InfraError(f"{KNOWLEDGE_DIR}/{name} in the base commit exceeds "
+                                 f"{MAX_KNOWLEDGE_FILE_BYTES} bytes")
+        except ValueError:
+            return None
+        out = _git(repo, "cat-file", "blob", "--end-of-options", spec, check=False, text=False)
+        return out.stdout if out.returncode == 0 else None
+
+    try:
+        manifest = blob("manifest.json")
+    except InfraError as exc:
+        return None, str(exc)
+    if manifest is None:
+        return None, ""
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_bytes(manifest)
+    for name in KNOWLEDGE_FILES[1:]:
+        try:
+            data = blob(name)
+        except InfraError as exc:
+            return None, str(exc)
+        if data is not None:
+            (dest / name).write_bytes(data)
+    return dest, ""
+
+
+def knowledge_edits(repo: Path, base: str, head: str) -> List[str]:
+    """What the pull request does to `.mantis/knowledge/`, as 'STATUS path'
+    entries, deletions included: a removed findings file is the edit most
+    worth a reviewer's attention."""
+    from core.knowledge import KNOWLEDGE_DIR
+
+    out = _git(repo, "diff", "--no-color", "--no-ext-diff", "--name-status", "-z",
+               "--end-of-options", base, head, "--", KNOWLEDGE_DIR, check=False, text=False)
+    if out.returncode != 0:
+        return []
+    fields = [f.decode("utf-8", "replace") for f in out.stdout.split(b"\0") if f]
+    edits: List[str] = []
+    i = 0
+    while i < len(fields):
+        status = fields[i][:1]
+        if status in ("R", "C") and i + 2 < len(fields):
+            edits.append(f"{status} {fields[i + 2]}")
+            i += 3
+        elif i + 1 < len(fields):
+            edits.append(f"{status} {fields[i + 1]}")
+            i += 2
+        else:
+            break
+    return edits
 
 
 def pr_changes(repo: Path, base: str, head: str = "HEAD") -> Tuple[Dict[str, List[int]], str, Dict[str, Any]]:
@@ -584,9 +669,63 @@ def run_budget_for_today(max_tokens: int, daily_budget: int, used_today: int) ->
 # --- The scan ----------------------------------------------------------------------
 
 
+def caller_files(state: MantisState, changed: Dict[str, List[int]], diff: str) -> List[str]:
+    """Files holding direct callers of the functions the change touched, from
+    the structural index, excluding the changed files themselves. Empty when
+    the index is unavailable: a radius the gate cannot compute is not guessed."""
+    try:
+        reindex(state)
+        pre = check_change(state, files=list(changed), diff=diff)
+    except Exception:
+        return []
+    out: List[str] = []
+    for b in pre.get("blast_radius") or []:
+        for c in b.get("callers") or []:
+            rel = state.rel(str(c.get("file") or ""))
+            if rel and rel not in changed and rel not in out:
+                out.append(rel)
+    return sorted(out)
+
+
+def archive_rewritten(db_path: str, prior: List[Dict[str, Any]], changed: Dict[str, List[int]],
+                      examined: List[str], first_new_id: int, note: str) -> List[Dict[str, Any]]:
+    """Archives known findings whose cited lines this change rewrote and whose
+    lineage a completed rescan of the file did not report again.
+
+    `prior` is the open findings as they stood before the scans; `first_new_id`
+    the first row id this run could have written; `examined` the files whose
+    researcher pass completed. A finding is archived only when all of: its
+    file is in the change set, its lines sit within DIFF_LINE_PROXIMITY of a
+    changed line (a file changed elsewhere says nothing about them), the file
+    was examined, and no row for its lineage was written by this run. Returns
+    what was archived.
+    """
+    from core.database import archive_finding, read_findings
+    from scripts.mcp_server import DIFF_LINE_PROXIMITY
+
+    seen_now = {str(r.get("lineage_id") or "") for r in read_findings(db_path)
+                if int(r.get("id") or 0) >= first_new_id and r.get("lineage_id")}
+    archived: List[Dict[str, Any]] = []
+    for f in prior:
+        lineage = str(f.get("lineage_id") or "")
+        fp = str(f.get("filepath") or "")
+        if not lineage or fp not in changed or fp not in examined or lineage in seen_now:
+            continue
+        diff_lines = changed.get(fp) or []
+        f_lines = [int(x) for x in (f.get("line_numbers") or []) if isinstance(x, int) and not isinstance(x, bool)]
+        if not diff_lines or not f_lines:
+            continue  # no line information on one side: leave it open
+        if not any(abs(fl - cl) <= DIFF_LINE_PROXIMITY for fl in f_lines for cl in diff_lines):
+            continue
+        if archive_finding(db_path, lineage, note):
+            archived.append({"lineage_id": lineage, "filepath": fp, "title": str(f.get("title") or ""),
+                             "line_numbers": f_lines})
+    return archived
+
+
 def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
                  model: str, api_base: str = "", max_tokens: int = 0,
-                 spend_report: str = "") -> List[str]:
+                 spend_report: str = "", knowledge_dir: str = "") -> List[str]:
     """scan_change's exact invocation plus the CI pins. Pure, for tests."""
     cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
     # Static analysis only: the runner never executes anything the PR
@@ -603,6 +742,11 @@ def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
         cmd += ["--max-tokens", str(max_tokens)]  # this file's share of the run budget
     if spend_report:
         cmd += ["--spend-report", spend_report]
+    if knowledge_dir:
+        # Each scan is its own run with its own id, and the threat model and
+        # architecture are read per run; so each scan imports for itself.
+        # Findings and coverage dedupe, so repeating it costs nothing.
+        cmd += ["--import-knowledge", knowledge_dir]
     return cmd
 
 
@@ -631,7 +775,23 @@ def read_spend_report(path: Path) -> Optional[Dict[str, Any]]:
         v = data.get(key)
         out[key] = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
     out["pause_trigger"] = str(data.get("pause_trigger") or "")
+    nodes = data.get("nodes")
+    out["nodes"] = [str(n) for n in nodes if isinstance(n, str)] if isinstance(nodes, list) else []
     return out
+
+
+# The node whose completion means "this file has been examined": once the
+# graph has moved from the researcher to whatever follows it, the pass over the
+# file is done and its findings are stored, whatever happens to the run after.
+RESEARCHER_NODE = "researcher"
+
+
+def researcher_finished(nodes: List[str]) -> bool:
+    """True when the graph reached a node after the researcher."""
+    try:
+        return len(nodes) > nodes.index(RESEARCHER_NODE) + 1
+    except ValueError:
+        return False
 
 
 def charge(report: Optional[Dict[str, Any]], granted: int) -> int:
@@ -681,7 +841,8 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
               env: Optional[Dict[str, str]] = None, max_tokens: int = 0,
               max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
               daily: Optional[Dict[str, Any]] = None,
-              meter: Optional[Callable[[Dict[str, str]], int]] = None) -> List[Dict[str, Any]]:
+              meter: Optional[Callable[[Dict[str, str]], int]] = None,
+              knowledge_dir: str = "") -> List[Dict[str, Any]]:
     """Runs the pipeline over each file in turn, then restores the
     repo-rooted index (the pipeline re-roots the shared catalog at the one
     file it scanned, which would blind the gate's blast radius).
@@ -746,7 +907,8 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
                 continue
             spend_path = spend_dir / f"{i}.json"
             cmd = scan_command(state, rel_fp, max_llm_calls, model, api_base,
-                               max_tokens=granted, spend_report=str(spend_path))
+                               max_tokens=granted, spend_report=str(spend_path),
+                               knowledge_dir=knowledge_dir)
             log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
             log.flush()
             started = time.time()
@@ -777,6 +939,11 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
                 "llm_calls": account["llm_calls"] if account else None,
                 "granted": granted,
                 "pause_trigger": account["pause_trigger"] if account else "",
+                # The researcher's pass over the file is complete once the graph
+                # has moved past it; a pause later (review, calibration) does
+                # not undo what it reported or did not report.
+                "examined": bool(account) and researcher_finished(account.get("nodes") or [])
+                            if code != -1 else False,
             })
             if code == EXIT_AUTH:
                 break
@@ -800,12 +967,44 @@ def _gap(report: Dict[str, Any], file: str, reason: str, action: str) -> None:
         report["next_actions"].append(action)
 
 
+def _apply_knowledge(report: Dict[str, Any], knowledge: Dict[str, Any]) -> None:
+    """The repository's knowledge, as it bears on the verdict.
+
+    A knowledge edit is a security decision made in a pull request: a
+    finding marked false positive, a boundary redrawn, a file of findings
+    removed. The scan graded the change against the base's knowledge; the
+    edit itself is for a person, so it is a REVIEW of the findings kind --
+    it fails the job under `fail-on: review` -- even when nothing else in
+    the pull request needed looking at. A knowledge export the run could
+    not read is a coverage gap: the scan ran without what it should have
+    known.
+    """
+    if knowledge.get("changed"):
+        if report["verdict"] == VERDICT_PASS:
+            report["verdict"] = VERDICT_REVIEW
+        report["reasons"].append(
+            f"This pull request changes Mantis's knowledge ({len(knowledge['changed'])} file(s) "
+            f"under {knowledge['dir']}: " + ", ".join(knowledge["changed"]) + "); the scan "
+            "used the base commit's version.")
+        action = ("Review the knowledge change as you would code: a suppressed finding or a "
+                  "redrawn trust boundary is a security decision.")
+        if action not in report["next_actions"]:
+            report["next_actions"].append(action)
+    if knowledge.get("error"):
+        _gap(report, "",
+             f"The knowledge export in the base commit could not be read ({knowledge['error']}); "
+             "the scan ran without it.",
+             "Regenerate the export with scripts/knowledge.py export.")
+    report["knowledge"] = knowledge
+
+
 def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
                  scan_results: List[Dict[str, Any]], skipped: List[str],
                  log_path: Path, fail_on: str, max_tokens: int = 0,
                  daily: Optional[Dict[str, Any]] = None,
                  moves: Optional[Dict[str, Any]] = None,
-                 fail_closed: bool = False) -> Dict[str, Any]:
+                 fail_closed: bool = False,
+                 knowledge: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """check_change over the change set, plus what this run failed to cover.
 
     The gate gets both views: the diff text for changed lines, and the
@@ -880,6 +1079,9 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
         report["reasons"].append(reason)
         if action not in report["next_actions"]:
             report["next_actions"].append(action)
+    if knowledge:
+        _apply_knowledge(report, knowledge)
+        report["findings_verdict"] = report["verdict"]
     unaudited = report["coverage"]["unaudited"]
     if unaudited:
         audited_files = {r["file"] for r in scan_results if r["status"] == SCAN_DONE}
@@ -1006,7 +1208,11 @@ def render_annotations(report: Dict[str, Any]) -> List[str]:
     for f in report.get("findings") or []:
         rel = f.get("relationship")
         sev = _severity(f)
-        if rel == "direct" and sev in BLOCKING_SEVERITIES and strict:
+        if rel == "archived":
+            # Found here once; the code moved and a rescan did not report it
+            # again. A hint to look, never a verdict: notice level, always.
+            level = "notice"
+        elif rel == "direct" and sev in BLOCKING_SEVERITIES and strict:
             level = "error"
         elif rel == "direct":
             level = "warning"
@@ -1014,7 +1220,9 @@ def render_annotations(report: Dict[str, Any]) -> List[str]:
             level = "notice"
         where = {"direct": "in the changed lines",
                  "unrelated_in_file": "in the same file, outside the changed lines",
-                 "caller_radius": "in a caller of changed code"}.get(rel, "")
+                 "caller_radius": "in a caller of changed code",
+                 "archived": "archived: found here before, the code changed since; worth a second look"
+                 }.get(rel, "")
         msg = f"{f.get('title')} [{sev}, {f.get('status')}] {where}.".strip()
         if f.get("cwe"):
             msg += f" {f['cwe']}."
@@ -1038,6 +1246,12 @@ def render_annotations(report: Dict[str, Any]) -> List[str]:
             "warning", f"{len(scan['over_budget'])} changed file(s) not scanned (token "
                        f"budget spent): " + ", ".join(scan["over_budget"]),
             title="Mantis: unscanned"))
+    for entry in (report.get("knowledge") or {}).get("changed") or []:
+        status, _, path = str(entry).partition(" ")
+        buckets["warning"].append(annotation(
+            "warning", f"This pull request changes Mantis's knowledge ({status} {path}); the scan "
+                       f"used the base commit's version. Review it as a security decision.",
+            file=path if status != "D" else "", title="Mantis: knowledge changed"))
     out: List[str] = []
     for level, lines in buckets.items():
         out.extend(lines[:MAX_ANNOTATIONS_PER_LEVEL])
@@ -1164,6 +1378,45 @@ def render_summary(report: Dict[str, Any]) -> str:
         lines.append("")
         lines.append("Ignored (not code): "
                      + ", ".join(f"`{_md(s)}`" for s in report["ignored"]))
+    knowledge = report.get("knowledge") or {}
+    if knowledge:
+        lines += ["", "### Knowledge", ""]
+        imported = knowledge.get("imported")
+        if imported:
+            lines.append(f"Read from the base commit's `{_md(knowledge['dir'])}`: "
+                         f"{int(imported.get('findings', 0)) + int(imported.get('findings_skipped', 0))} "
+                         f"known finding(s), {int(imported.get('learnings', 0))} learning(s)"
+                         + (", threat model" if imported.get("threat_model") or imported.get("threat_model_md") else "")
+                         + (", architecture" if imported.get("architecture") else "")
+                         + f", coverage for {int(imported.get('coverage_paths', 0))} path(s).")
+        elif knowledge.get("error"):
+            lines.append(f"The base commit's `{_md(knowledge['dir'])}` could not be read: "
+                         f"{_md(knowledge['error'])}.")
+        else:
+            lines.append(f"No `{_md(knowledge['dir'])}` in the base commit; the scan started from "
+                         "nothing. `scripts/knowledge.py export` after a full scan creates one.")
+        if knowledge.get("changed"):
+            lines.append("")
+            lines.append("Changed by this pull request (reviewed as a security decision; the scan "
+                         "used the base's version): "
+                         + ", ".join(f"`{_md(c)}`" for c in knowledge["changed"]))
+        if knowledge.get("archived"):
+            lines.append("")
+            lines.append(f"Archived by this refresh ({len(knowledge['archived'])}): the cited lines "
+                         "changed and the rescan did not report them again. Not resolved, not "
+                         "dismissed; the next look at these files should check:")
+            for a in knowledge["archived"]:
+                where = str(a.get("filepath") or "")
+                if a.get("line_numbers"):
+                    where += ":" + ",".join(str(x) for x in a["line_numbers"][:6])
+                lines.append(f"- `{_md(where)}` {_md(a.get('title'))}")
+        exported = knowledge.get("exported")
+        if exported:
+            lines.append("")
+            lines.append(f"Knowledge written to `{_md(exported.get('dir'))}`"
+                         + (f" as of `{_md(exported['head'][:12])}`" if exported.get("head") else "")
+                         + f": {int(exported.get('findings', 0))} finding(s), coverage for "
+                         f"{int(exported.get('coverage_paths', 0))} path(s).")
     if scan.get("log"):
         lines.append("")
         lines.append(f"Scan log: `{_md(scan['log'])}`")
@@ -1189,8 +1442,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--head", default="HEAD", help="Head revision (default: HEAD)")
     p.add_argument("--model", default="", help="Model id; empty uses the workflow default")
     p.add_argument("--api-base", default="", help="Custom LLM API base URL")
-    p.add_argument("--max-llm-calls", type=int, default=150,
-                   help="LLM call ceiling per changed file (0 = workflow default)")
+    p.add_argument("--max-llm-calls", type=int, default=400,
+                   help="LLM call ceiling per changed file: a loop guard, not the spend control "
+                        "(that is --max-tokens). A scan that reaches it pauses with its findings so far "
+                        "stored and the file is reported as partially covered. 0 = workflow default")
     p.add_argument("--max-tokens", default=str(DEFAULT_MAX_TOKENS),
                    help="Token budget for the whole run, e.g. 4M or 500k; every token "
                         "counts at full price, cached or not. Shared out equally over the "
@@ -1234,6 +1489,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Parent directory for this run's database, index, and log; a fresh "
                         "subdirectory is created per run. Must be outside the repository "
                         "(default: $RUNNER_TEMP, else the system temp directory)")
+    p.add_argument("--radius", type=int, default=0, choices=(0, 1),
+                   help="Also scan the files of direct callers of changed functions (1), "
+                        "subject to max-files. Default 0: changed files only.")
+    p.add_argument("--export-knowledge", default="",
+                   help="After the run, write the merged knowledge (the base commit's export plus "
+                        "what this run found) as text to this directory, recording --head as the "
+                        "commit it reflects, and archive known findings whose lines this change "
+                        "rewrote and the rescan did not report again. For the refresh workflow on "
+                        "trusted code; a pull-request scan must not set it.")
     return p.parse_args(argv)
 
 
@@ -1301,7 +1565,9 @@ def main(argv: Optional[List[str]] = None,
     state = MantisState(str(repo))
     state.home = state_dir
     state.db_path = str(state_dir / "knowledge.db")
-    patterns = parse_ignore(args.ignore)
+    # Mantis's own state in the repository is never scanned or gated,
+    # whatever the ignore list says; it is read below, as of the base.
+    patterns = parse_ignore(args.ignore) + [f"{TOOL_STATE_DIR}/*"]
     ignored = [f for f in changed_all if is_ignored(f, patterns)]
     changed = {f: lines for f, lines in changed_all.items() if f not in ignored}
     if ignored:
@@ -1309,6 +1575,50 @@ def main(argv: Optional[List[str]] = None,
     rels, skipped = select_scan_files(state, changed, args.max_files)
     state.ensure_home()
     log_path = state.home / "pr_scan.log"
+    # A radius of 1 adds the files of direct callers, after the changed files
+    # so the max-files cap always favours the change itself.
+    radius_files: List[str] = []
+    if args.radius > 0 and changed:
+        radius_files = caller_files(state, changed, diff)
+        extra = [r for r in radius_files if r not in rels and r not in skipped]
+        room = (args.max_files - len(rels)) if args.max_files > 0 else len(extra)
+        rels += extra[:max(0, room)]
+        skipped += extra[max(0, room):]
+
+    # The repository's memory, as of the base commit. Imported into this
+    # run's database so the gate sees known findings and coverage, and handed
+    # to every scan so the model starts from the threat model and
+    # architecture. The pull request's own edits to it are a finding.
+    from core.knowledge import KNOWLEDGE_DIR, KnowledgeImportError, import_knowledge
+
+    knowledge: Dict[str, Any] = {"dir": KNOWLEDGE_DIR, "source": None, "imported": None,
+                                 "error": "", "changed": knowledge_edits(repo, args.base, args.head)}
+    knowledge_dir = ""
+    extracted, note = knowledge_from_base(repo, args.base, state_dir / "knowledge")
+    if extracted is not None:
+        try:
+            knowledge["imported"] = import_knowledge(state.db_path, str(extracted), run_id="pr-scan",
+                                                     repo_root=str(repo))
+            knowledge["source"] = f"base commit {args.base[:12]}"
+            knowledge_dir = str(extracted)
+        except KnowledgeImportError as exc:
+            knowledge["error"] = str(exc)
+    elif note:
+        knowledge["error"] = note
+    # What the base knew before this run wrote anything: the refresh's archive
+    # rule compares the rescan against it. A pull-request scan never archives
+    # (an imported finding on rewritten lines stays open and blocks: the
+    # change has to fix it or a person has to dismiss it), so this is only
+    # read when --export-knowledge says the run is a trusted refresh.
+    prior_open: List[Dict[str, Any]] = []
+    first_new_id = 0
+    if args.export_knowledge and knowledge_dir:
+        from core.database import read_findings
+        from scripts.mcp_server import OPEN_FINDING_STATUSES
+
+        rows = read_findings(state.db_path)
+        prior_open = [r for r in rows if str(r.get("status") or "").lower() in OPEN_FINDING_STATUSES]
+        first_new_id = max([int(r.get("id") or 0) for r in rows] + [0]) + 1
     daily = {"budget": daily_budget, "used_before_run": used_today,
              "run_budget": run_budget} if daily_budget > 0 else None
     if rels and daily and run_budget < MIN_SCAN_ALLOWANCE:
@@ -1327,7 +1637,8 @@ def main(argv: Optional[List[str]] = None,
                             args.per_file_timeout, log_path, env=env_map,
                             max_tokens=run_budget,
                             max_input_tokens=args.max_input_tokens,
-                            daily=daily) if rels else []
+                            daily=daily,
+                            knowledge_dir=knowledge_dir) if rels else []
     rejected = next((r for r in results if r["status"] == SCAN_AUTH_REJECTED), None)
     if rejected:
         return _not_run(
@@ -1339,6 +1650,32 @@ def main(argv: Optional[List[str]] = None,
     if rels and all(r["status"] == SCAN_FAILED and r["returncode"] == -1 for r in results):
         return _not_run(args.summary, f"Every scan failed to launch; see the scan log: {log_path}",
                         fail_closed=args.fail_closed, github_output=args.github_output)
+
+    # Refresh only: shelve what the change rewrote and the rescan did not
+    # find again, then write the merged knowledge out for the next base.
+    if args.export_knowledge:
+        head_sha = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                        f"{args.head}^{{commit}}", check=False).stdout.strip()
+        if prior_open:
+            # A file counts as examined when its researcher pass completed,
+            # even if the run paused afterwards: the pass's report is in.
+            # A finished run counts regardless (older pipelines report no
+            # nodes).
+            examined_files = [r["file"] for r in results
+                              if r.get("examined") or r["status"] == SCAN_DONE]
+            knowledge["archived"] = archive_rewritten(
+                state.db_path, prior_open, changed, examined_files, first_new_id,
+                note=(f"archived by knowledge refresh at {head_sha[:12]}: the cited lines changed "
+                      f"between {args.base[:12]} and {head_sha[:12]} and a rescan of the file did "
+                      "not report this finding again. Not resolved, not dismissed: check again."))
+        try:
+            from core.knowledge import export_knowledge
+
+            knowledge["exported"] = export_knowledge(state.db_path, args.export_knowledge,
+                                                     repo_root=str(repo), head=head_sha)
+            knowledge["exported"]["dir"] = args.export_knowledge
+        except Exception as exc:
+            knowledge["error"] = (knowledge.get("error") or "") + f" export failed: {exc}"
 
     if changed_all and not changed:
         # Every changed file matched an ignore pattern: nothing the pipeline
@@ -1356,10 +1693,22 @@ def main(argv: Optional[List[str]] = None,
             "findings_verdict": VERDICT_PASS,
             "coverage": {"status": COVERAGE_COMPLETE, "unaudited": []},
         }
+        _apply_knowledge(report, knowledge)
+        # A knowledge edit is a finding-class REVIEW; a knowledge read error
+        # is a coverage gap. Both are decided the same way as everywhere else.
+        report["findings_verdict"] = report["verdict"]
+        if report["coverage"]["unaudited"]:
+            report["coverage"]["status"] = COVERAGE_NONE
+            if report["verdict"] == VERDICT_PASS:
+                report["verdict"] = VERDICT_REVIEW
+        report["exit_code"] = exit_code_for(report["findings_verdict"], args.fail_on,
+                                            fail_closed=args.fail_closed,
+                                            coverage=report["coverage"]["status"])
     else:
         report = build_report(state, diff, changed, results, skipped, log_path,
                               args.fail_on, max_tokens=run_budget, daily=daily,
-                              moves=moves, fail_closed=args.fail_closed)
+                              moves=moves, fail_closed=args.fail_closed,
+                              knowledge=knowledge)
         if not changed_all and not moves.get("deleted"):
             report["reasons"].insert(0, "The pull request changes no scannable files.")
     report["ignored"] = ignored
