@@ -25,6 +25,9 @@ class RunContext:
     # does. Empty means "unknown": canonicalization falls back to the
     # jail-anchored behavior that predates the field (INV-6).
     path_root: str = ""
+    # Operator exclusions (core.exclusions), relative to the target: what the
+    # run does not scan and does not list. Empty means none (INV-6).
+    exclude: tuple = ()
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

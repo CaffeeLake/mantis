@@ -932,8 +932,14 @@ def survey(
     target: Union[str, Path],
     max_slices: int = MAX_SLICES,
     include_churn: bool = True,
+    exclude: tuple = (),
 ) -> dict[str, Any]:
     """Surveys a repository and returns an ASTM (design §4.4).
+
+    `exclude` holds operator patterns (core.exclusions); files they match are
+    left out of every group, so an excluded subsystem is never ranked or
+    scanned. The snapshot id is computed over what remains, so a change in
+    exclusions is a different snapshot.
 
     Raises ValueError if the target fails CP-3 validation -- a Surveyor that silently
     surveys a path it could not validate is worse than one that refuses.
@@ -945,6 +951,10 @@ def survey(
         raise ValueError(f"Surveyor refused target: {err}")
 
     vetted = get_vetted_staging_files(resolved)
+    if exclude:
+        from core.exclusions import is_excluded
+
+        vetted = [(abs_p, rel) for abs_p, rel in vetted if not is_excluded(rel, exclude)]
     snapshot_id = _compute_snapshot_id(resolved, vetted)
     census: dict[str, list] = {}
     groups = _collect_groups(vetted, census)

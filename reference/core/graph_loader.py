@@ -110,6 +110,9 @@ class GlobalConfig(_Base):
     compaction_event_retention: int = Field(default=50, ge=0)
     enable_context_cache: bool = True
     budget: Optional[dict[str, Any]] = None
+    # Paths under the target that are not scanned: patterns relative to the
+    # target, see core.exclusions. A list, or one comma-separated string.
+    exclude: Optional[list[str] | str] = None
 
     @field_validator("seed_prompt")
     @classmethod

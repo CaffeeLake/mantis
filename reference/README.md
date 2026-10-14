@@ -216,6 +216,26 @@ more asks for confirmation on an interactive terminal; the plan is printed
 either way, so a CI log records what the run committed to. The superseded
 spellings `file-sweep` and `slices` are still accepted.
 
+### Leaving parts of the target out
+
+`--exclude` keeps matching paths out of the scan. Patterns are relative to the
+target: a bare name (`vendor`, `testdata`) matches a directory or file of that
+name at any depth, a pattern with a slash (`third_party/*`, `src/gen/*.pb.go`)
+matches the relative path, and `fnmatch` wildcards apply. The flag repeats and
+takes comma-separated lists; a workflow can carry the same list under
+`config.exclude`, and the flag adds to it.
+
+```bash
+python3 main.py /path/to/repo --exclude vendor,testdata --exclude 'third_party/*'
+```
+
+Exclusion governs what is scanned: excluded files are not swept in
+`file-by-file`, not ranked into subsystems in `cross-functional`, and not shown
+when the agent lists the tree in `whole`. They stay readable and indexed, so a
+scanned function that calls into an excluded directory can still be followed
+there, and a caller in an excluded test directory is still a caller. The run
+states what it excluded and how many files remain in scope.
+
 ## Evidence Sources
 
 Every fact carries the tier of the source it came from, and a tier states what a

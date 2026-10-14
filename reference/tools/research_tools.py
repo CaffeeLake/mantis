@@ -936,6 +936,7 @@ async def list_files(directory: str = "") -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)
+            files = _without_excluded(ctx, files)
             return _bounded_listing(sorted(files), directory)
         except PermissionError as pe:
             return f"Error: Permission denied. {pe}"
@@ -968,9 +969,23 @@ async def list_files(directory: str = "") -> str:
                 if not fn.startswith("."):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     files.append(rel)
+        files = _without_excluded(ctx, files)
         return _bounded_listing(sorted(files), directory)
     except Exception as e:
         return f"Error listing files: {e}"
+
+
+def _without_excluded(ctx, rel_paths):
+    """Listings minus the operator's exclusions (core.exclusions). Paths are
+    relative to the scan target, which is what the patterns are written
+    against. Reading an excluded file is still allowed; it is simply not
+    offered."""
+    patterns = tuple(getattr(ctx, "exclude", ()) or ())
+    if not patterns:
+        return list(rel_paths)
+    from core.exclusions import is_excluded
+
+    return [p for p in rel_paths if not is_excluded(str(p), patterns)]
 
 
 def record_plan(plan: dict) -> str:

@@ -41,6 +41,9 @@ python3 scripts/configure.py --test --probe
 # 4. (Optional) Tell the planner what to hunt for, in plain language (standard pipeline)
 ./run.sh path/to/code --focus "look for IDOR"
 
+# 4b. (Optional) Leave vendored or generated code out of the scan
+./run.sh path/to/code --exclude vendor,testdata --exclude 'third_party/*'
+
 # 5. (Optional) Remove spend limits for long unattended runs
 ./run.sh path/to/code --no-budget --parallel 32
 #    Parallel campaigns share one SQLite database; a writer waits up to

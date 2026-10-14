@@ -336,11 +336,13 @@ def is_binary_file(path: Path, block_size: int = 1024) -> bool:
     except OSError:
         return True
 
-def discover_files(target: Path, db_path: str = "") -> list[str]:
+def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list[str]:
     """Source files under `target`. Uses git's own view when available —
-    a repo already declares what isn't source. Excludes binary files."""
+    a repo already declares what isn't source. Excludes binary files, and
+    anything matching the operator's `exclude` patterns (core.exclusions)."""
     if target.is_file():
         return [str(target)] if not is_binary_file(target) else []
+    found: Optional[list[str]] = None
     try:
         from tools.research_tools import _run_safe_git_command
         out, ok = _run_safe_git_command(
@@ -351,16 +353,22 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
         if ok and out:
             paths = [target / p for p in out.split("\0") if p]
             if paths:
-                return [
+                found = [
                     str(p) for p in sorted(paths)
                     if p.is_file() and not p.is_symlink() and str(p) != db_path and not is_binary_file(p)
                 ]
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
-    return [
-        str(p) for p in sorted(target.rglob("*"))
-        if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
-    ]
+    if found is None:
+        found = [
+            str(p) for p in sorted(target.rglob("*"))
+            if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
+        ]
+    if exclude:
+        from core.exclusions import is_excluded
+
+        found = [f for f in found if not is_excluded(os.path.relpath(f, str(target)), exclude)]
+    return found
 
 
 # How many ranked slices become campaigns when slicing engages.
@@ -744,7 +752,8 @@ def resolve_scan_targets(
         astm = precomputed_astm
     else:
         try:
-            astm = survey(str(target_path), max_slices=max_slices)
+            astm = survey(str(target_path), max_slices=max_slices,
+                          exclude=tuple(config.get("exclude") or ()))
         except Exception as exc:
             # Degrade, never abort. A whole-target scan is a different question, not a
             # broken one, so falling back to it costs depth rather than the run.
@@ -1004,6 +1013,7 @@ async def pipeline(
     enable_context_cache: Optional[bool] = None,
     max_llm_calls_override: Optional[int] = None,
     max_node_tool_calls_override: Optional[int] = None,
+    exclude_override: Optional[list] = None,
     precomputed_astm: Optional[dict] = None,
     scan_mode_override: Optional[str] = None,
     assume_yes: bool = False,
@@ -1115,10 +1125,25 @@ async def pipeline(
     db_path = config.get("db_path", "knowledge.db")
     init_db(db_path)
 
-    discovered_files = discover_files(target_path, db_path)
+    # What not to scan: the workflow's `exclude` list plus any --exclude flags,
+    # as patterns relative to the target (core.exclusions). Resolved once here
+    # and carried to everything that chooses what to look at.
+    from core.exclusions import normalize_exclude_patterns
+
+    exclude = normalize_exclude_patterns(
+        list(normalize_exclude_patterns(config.get("exclude")))
+        + list(normalize_exclude_patterns(exclude_override)))
+    if exclude:
+        config = {**config, "exclude": list(exclude)}
+
+    discovered_files = discover_files(target_path, db_path, exclude=exclude)
     if not discovered_files:
-        print(f"Error: No source files found in target: {target_path}", file=sys.stderr)
+        print(f"Error: No source files found in target: {target_path}"
+              + (" after exclusions" if exclude else ""), file=sys.stderr)
         return 1
+    if exclude:
+        print(f"Excluding {', '.join(exclude)}: {len(discovered_files)} source file(s) in scope.",
+              file=sys.stderr)
 
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
     # Resolve budget configuration: explicit caller override > workflow.json budget > default BudgetConfig()
@@ -1648,6 +1673,7 @@ async def pipeline(
         budget_controller=budget_ctrl,
         scan_mode=scan_mode,
         path_root=resolved_path_root,
+        exclude=exclude,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -2258,6 +2284,20 @@ def parse_cli_args():
         default=None,
         help="Per-node visit runaway tool loop ceiling override (defaults to workflow budget)",
     )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Leave matching paths out of the scan; repeatable, or comma-separated. "
+            "Patterns are relative to the target: a bare name (vendor, testdata) matches "
+            "a directory or file of that name at any depth, a pattern with a slash "
+            "(third_party/*, src/gen/*.pb.go) matches the relative path. Excluded files "
+            "are not scanned or listed but stay readable for context. Adds to the "
+            "workflow's `exclude` list."
+        ),
+    )
     # The budget pause banner prints a copy-pasteable "--resume <run_id>" command, and
     # README documents it, but until now the flag existed only in scripts/launch.py.
     # Anyone who launched main.py directly was told to run a flag argparse would reject.
@@ -2375,6 +2415,7 @@ if __name__ == "__main__":
                 enable_context_cache=False if args.no_context_cache else None,
                 max_llm_calls_override=args.max_llm_calls,
                 max_node_tool_calls_override=args.max_node_tool_calls,
+                exclude_override=args.exclude,
                 resume_run_id=args.resume,
                 scan_mode_override=args.scan_mode,
                 assume_yes=args.yes,
