@@ -207,13 +207,13 @@ and *reach* (how much context one question spans), which vary independently.
 
 ```bash
 # Ask one researcher about every file, then dedupe downstream.
-python3 main.py /path/to/repo --scan-mode file-by-file
+./run.sh /path/to/repo --scan-mode file-by-file
 
 # Go straight at composite defects, with no per-file pass first.
-python3 main.py /path/to/repo --scan-mode cross-functional
+./run.sh /path/to/repo --scan-mode cross-functional
 
 # Skip the work-plan confirmation (CI, cron, nohup).
-python3 main.py /path/to/repo --scan-mode file-by-file --yes
+./run.sh /path/to/repo --scan-mode file-by-file --yes
 ```
 
 Running `file-by-file` first gives a later `cross-functional` pass real evidence
@@ -236,7 +236,7 @@ takes comma-separated lists; a workflow can carry the same list under
 `config.exclude`, and the flag adds to it.
 
 ```bash
-python3 main.py /path/to/repo --exclude vendor,testdata --exclude 'third_party/*'
+./run.sh /path/to/repo --exclude vendor,testdata --exclude 'third_party/*'
 ```
 
 Exclusion governs what is scanned: excluded files are not swept in
