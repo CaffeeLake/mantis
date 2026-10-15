@@ -35,6 +35,55 @@ long-lived key. Four things to create: a Google Cloud project that can only run
 the model, a spending stop on that project, a GitHub environment that holds the
 project's names and gates the job, and the workflow.
 
+### One command
+
+With a project created and billing attached, `scripts/setup_github_action.sh`
+does the Google Cloud part, and with `--github` the GitHub part too:
+
+```bash
+reference/scripts/setup_github_action.sh --project <project> --repo org/repo \
+    --budget-usd <amount> --github --reviewer-team <security-team>
+```
+
+It enables the APIs; creates a custom role that can call the model, manage its
+context caches and read the project's token meter and nothing else (pass
+`--role roles/aiplatform.user` to use the predefined role instead, knowing it
+can also create training jobs and endpoints the meter never sees); the service
+account with that role; the workload identity pool and a provider whose
+condition pins the repository by its numeric id and owner id as well as by name
+(read with `gh`, or passed as `--repo-id`/`--owner-id`), from the environment
+`mantis-pr-scan` only; and a binding from exactly that subject to the service
+account. With `--budget-usd`, a Pub/Sub topic and a billing budget at 50%, 90%
+and 100% (`--no-budget` says explicitly that you want none). With `--github`,
+the environment -- created **with the required reviewers you name**, self-review
+prevented -- and its three secrets. It ends by printing the three values and the
+workflow to commit.
+
+Run it again after a failure or a rename and it creates nothing twice: each step
+checks first, the provider condition and the role's permissions are updated to
+the current ones, and an environment that already exists is never replaced
+(replacing it would remove the reviewers a person added), only its secrets set;
+its protection is reported, loudly if it has no reviewers. `--dry-run` prints
+every command instead. `--environment`, `--service-account`, `--pool` and
+`--provider` rename the pieces.
+
+One project can serve several repositories: run the script once per repository
+with its own `--provider` and `--service-account`. The pool, the role and the
+budget are shared -- the budget caps the project, not a repository, so the
+second run finds it and needs neither budget flag. So is the daily token meter
+(see Spend). No repository gets a grant on the project itself; each one's
+identity can act only as its own service account.
+
+For the knowledge-refresh workflow, run it a second time with `--refresh`: a
+second provider admitting `refs/heads/main` from the `mantis-knowledge`
+environment only, and that environment created with a deployment-branch rule of
+`main`.
+
+Two things it leaves to you, and says so: the function that detaches billing
+when the budget is spent (The spending stop, below), and the reading the
+reviewers do before approving a run. The sections that follow are what the
+script does, for doing it by hand or for checking its work.
+
 ### Google Cloud
 
 One project reserved for this, with billing attached. Replace `org/repo` with
@@ -50,27 +99,35 @@ NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 gcloud services enable aiplatform.googleapis.com monitoring.googleapis.com \
     iamcredentials.googleapis.com iam.googleapis.com sts.googleapis.com
 
-# A service account that can call the model and read the project's meter.
+# A role that can call the model, manage its context caches, and read the
+# project's meter -- and nothing else. roles/aiplatform.user would also let
+# the token create training jobs and endpoints the meter never sees.
+gcloud iam roles create mantisPrScan --project="$PROJECT" --title="Mantis PR scan" \
+    --permissions=aiplatform.endpoints.predict,aiplatform.cachedContents.create,aiplatform.cachedContents.get,aiplatform.cachedContents.list,aiplatform.cachedContents.update,aiplatform.cachedContents.delete,monitoring.timeSeries.list
+
+# A service account with that role.
 gcloud iam service-accounts create mantis-pr-scan --display-name="Mantis PR scan"
 SA="mantis-pr-scan@$PROJECT.iam.gserviceaccount.com"
 gcloud projects add-iam-policy-binding "$PROJECT" \
-    --member="serviceAccount:$SA" --role="roles/aiplatform.user"
-gcloud projects add-iam-policy-binding "$PROJECT" \
-    --member="serviceAccount:$SA" --role="roles/monitoring.viewer"
+    --member="serviceAccount:$SA" --role="projects/$PROJECT/roles/mantisPrScan"
 
-# A pool with a GitHub OIDC provider, admitting one repository and one environment.
+# A pool with a GitHub OIDC provider, admitting one repository -- by its
+# numeric ids, which a renamed or re-created repository cannot reuse, and by
+# name -- from one environment. gh api repos/org/repo --jq '.id, .owner.id'
+# gives the ids.
 gcloud iam workload-identity-pools create github --location=global \
-    --display-name="GitHub Actions"
+    --display-name="GitHub Actions (Mantis)"
 gcloud iam workload-identity-pools providers create-oidc mantis \
     --location=global --workload-identity-pool=github \
     --issuer-uri="https://token.actions.githubusercontent.com" \
     --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
-    --attribute-condition="assertion.repository == 'org/repo' && assertion.environment == 'mantis-pr-scan'"
+    --attribute-condition="assertion.repository_id == '<repo-id>' && assertion.repository_owner_id == '<owner-id>' && assertion.repository == 'org/repo' && assertion.environment == 'mantis-pr-scan'"
 
-# Let that repository's jobs impersonate the service account.
+# Let exactly that repository's jobs in that environment impersonate the
+# service account: one subject, not every token the pool maps for the repo.
 gcloud iam service-accounts add-iam-policy-binding "$SA" \
     --role="roles/iam.workloadIdentityUser" \
-    --member="principalSet://iam.googleapis.com/projects/$NUMBER/locations/global/workloadIdentityPools/github/attribute.repository/org/repo"
+    --member="principal://iam.googleapis.com/projects/$NUMBER/locations/global/workloadIdentityPools/github/subject/repo:org/repo:environment:mantis-pr-scan"
 
 # The three values GitHub needs.
 gcloud iam workload-identity-pools providers describe mantis \
@@ -98,15 +155,24 @@ gcloud billing budgets create --billing-account="${BILLING#billingAccounts/}" \
     --notifications-rule-pubsub-topic="projects/$PROJECT/topics/mantis-pr-scan-budget"
 ```
 
-Then subscribe a function to the topic that detaches billing from the project
-when the message's `costAmount` reaches `budgetAmount`. Google publishes the
-function and the IAM it needs under "Automated cost control responses" in the
-Cloud Billing documentation; deploy it as written. Detaching billing stops every
-API in the project, which is the point, and is safe only because the project
-runs nothing else. Pick `<amount>` as the most you are prepared to lose to a bug
-in a month, not as a forecast. Budget data lags by hours; the stop is for a
-runaway that lasts a day, and the action's own limits are for the one that lasts
-a run.
+Then, if you want the stop to be automatic, subscribe a function to the topic
+that detaches billing from the project when the message's `costAmount` reaches
+`budgetAmount`. Google publishes the function and the IAM it needs:
+[Disable billing with notifications](https://docs.cloud.google.com/billing/docs/how-to/disable-billing-with-notifications);
+deploy it as written.
+
+> **Warning.** Detaching billing shuts down every billable service in the
+> project, and Google's own page warns that resources in it can be stopped and
+> their data lost. That is the point here, and it is safe only in a project that
+> holds nothing you would miss: this service account, this pool, this budget,
+> and nothing else. Never attach this stop to a project with persistent
+> resources, data, or anything another system depends on. Re-attaching billing
+> afterwards is a manual step, and until someone does it every scan fails with a
+> setup error, which is the behaviour you want from a stop.
+
+Pick `<amount>` as the most you are prepared to lose to a bug in a month, not as
+a forecast. Budget data lags by hours; the stop is for a runaway that lasts a
+day, and the action's own limits are for the one that lasts a run.
 
 ### GitHub
 
@@ -385,7 +451,7 @@ the more expensive failure.
 | `api-base`           | empty              | Custom OpenAI-compatible endpoint. Skips the credential check.                                                                                                                                                  |
 | `max-llm-calls`      | `400`              | LLM call ceiling **per changed file**; a loop guard, not the spend control.                                                                                                                                     |
 | `max-tokens`         | `10M`              | Token budget **per run**, every token at full price, shared equally over the files left to scan; files it cannot reach are reported unscanned (REVIEW). `0` removes it.                                         |
-| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left, and re-read before every file. Unreadable: not run. `0` disables.                     |
+| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left, and re-read before every file. Unreadable: not run. `0` disables.         |
 | `max-input-tokens`   | `262144`           | Input tokens one model request may carry; larger requests are refused before dispatch, for any model. `0` leaves only the model's window.                                                                       |
 | `max-files`          | `25`               | Files scanned per run; the rest are reported unscanned (REVIEW).                                                                                                                                                |
 | `per-file-timeout`   | `1800`             | Seconds before one file's scan is abandoned.                                                                                                                                                                    |
@@ -453,17 +519,16 @@ copy:
 - **Main only, enforced twice.** The job declares its own environment,
   `mantis-knowledge`, and GitHub runs a dispatched workflow from whichever
   branch was chosen, with that branch's copy of the file. So that environment
-  must carry a deployment-branch rule of `main` only, and its provider
-  condition must pin the ref:
+  must carry a deployment-branch rule of `main` only, and its provider condition
+  must pin the ref:
   `setup_github_action.sh --project <project> --repo org/repo --environment mantis-knowledge --provider mantis-refresh --refresh --github`
-  creates both (a second provider in the same pool, admitting
-  `refs/heads/main` from that environment only, and the environment with the
-  branch rule and its three secrets). The workflow's first step also refuses
-  any ref but `main`. Put a CODEOWNERS entry on `.mantis/knowledge/` naming a
-  security owner: the pull request the refresh opens is not itself scanned,
-  and a merged export decides what later scans suppress. Read its markdown in
-  source view; the export encodes HTML and strips invisible characters, but
-  the reviewer is the control.
+  creates both (a second provider in the same pool, admitting `refs/heads/main`
+  from that environment only, and the environment with the branch rule and its
+  three secrets). The workflow's first step also refuses any ref but `main`. Put
+  a CODEOWNERS entry on `.mantis/knowledge/` naming a security owner: the pull
+  request the refresh opens is not itself scanned, and a merged export decides
+  what later scans suppress. Read its markdown in source view; the export
+  encodes HTML and strips invisible characters, but the reviewer is the control.
 
 What a refresh does to a known finding whose lines the change rewrote, when the
 rescan of that file finishes without reporting the lineage again: it marks it
