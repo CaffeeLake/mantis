@@ -160,15 +160,9 @@ class TestDiscovery(unittest.TestCase):
 
 class TestCli(unittest.TestCase):
     def test_exclude_flag_is_repeatable_and_comma_separated(self):
-        import main as main_mod
+        from scripts.launch import build_parser
 
-        with contextlib.redirect_stderr(io.StringIO()):
-            saved = sys.argv
-            try:
-                sys.argv = ["main.py", "x", "--exclude", "vendor,testdata", "--exclude", "docs/*"]
-                args = main_mod.parse_cli_args()
-            finally:
-                sys.argv = saved
+        args = build_parser().parse_args(["x", "--exclude", "vendor,testdata", "--exclude", "docs/*"])
         self.assertEqual(args.exclude, ["vendor,testdata", "docs/*"])
         self.assertEqual(normalize_exclude_patterns(args.exclude), ("vendor", "testdata", "docs/*"))
 

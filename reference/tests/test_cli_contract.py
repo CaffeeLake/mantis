@@ -91,6 +91,12 @@ class PathRootHardFailTest(unittest.TestCase):
         self.elsewhere.mkdir()
 
     def _invoke(self, path_root: str):
+        # A dummy OpenAI-compatible endpoint: the launcher's preflight wants a
+        # configured model before it hands over to the pipeline, and this test
+        # must not depend on credentials being present. Nothing is called;
+        # --path-root is rejected before the first LLM turn.
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env["OPENAI_API_KEY"] = "dummy"
         return subprocess.run(
             [
                 sys.executable,
@@ -98,12 +104,16 @@ class PathRootHardFailTest(unittest.TestCase):
                 str(self.target),
                 "--path-root", path_root,
                 "--db", str(self.tmp / "kb.db"),
+                "--model", "openai/nonexistent",
+                "--api-base", "http://127.0.0.1:9",
+                "--sandbox", "static-only",
                 "--no-auto-configure",
             ],
             cwd=str(self.tmp),
             capture_output=True,
             text=True,
             timeout=300,
+            env=env,
         )
 
     def test_non_ancestor_dir_fails_closed(self):
@@ -142,7 +152,7 @@ class LauncherUsageExitTest(unittest.TestCase):
 
 
 class SaveConfigFlagTest(unittest.TestCase):
-    """Both entry points expose --save-config, defaulting to off."""
+    """--save-config exists, defaulting to off."""
 
     def test_launcher_flag_defaults_off(self):
         from scripts.launch import build_parser
@@ -151,14 +161,42 @@ class SaveConfigFlagTest(unittest.TestCase):
         args = build_parser().parse_args(["target", "--save-config"])
         self.assertTrue(args.save_config)
 
-    def test_main_flag_defaults_off(self):
+
+class OneParserTest(unittest.TestCase):
+    """main.py and run.sh (scripts/launch.py) are the same command line.
+
+    Two parsers drifted twice: --scan-mode and --exclude existed only on
+    main.py, --token-budget and --max-time only on the launcher, and the
+    pause banner printed a resume command one of them rejected.
+    """
+
+    @staticmethod
+    def _flags(help_text: str) -> set:
+        import re
+        return set(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", help_text))
+
+    def _help(self, script: str) -> str:
+        res = subprocess.run([sys.executable, str(Path(_REF_ROOT) / script), "--help"],
+                             capture_output=True, text=True, timeout=120, cwd=_REF_ROOT)
+        self.assertEqual(res.returncode, 0, res.stderr[-2000:])
+        return res.stdout
+
+    def test_main_has_no_parser_of_its_own(self):
         import main as mantis_main
-        with patch.object(sys, "argv", ["main.py", "target"]):
-            args = mantis_main.parse_cli_args()
-        self.assertFalse(args.save_config)
-        with patch.object(sys, "argv", ["main.py", "target", "--save-config"]):
-            args = mantis_main.parse_cli_args()
-        self.assertTrue(args.save_config)
+        self.assertFalse(hasattr(mantis_main, "parse_cli_args"))
+
+    def test_both_entry_points_accept_the_same_flags(self):
+        main_flags = self._flags(self._help("main.py"))
+        launcher_flags = self._flags(self._help("scripts/launch.py"))
+        self.assertEqual(main_flags, launcher_flags)
+        for flag in ("--scan-mode", "--yes", "--exclude", "--path-root", "--resume",
+                     "--token-budget", "--max-time", "--objective", "--no-context-cache"):
+            self.assertIn(flag, main_flags, flag)
+
+    def test_main_usage_errors_exit_64_too(self):
+        res = subprocess.run([sys.executable, str(Path(_REF_ROOT) / "main.py"), "t", "--definitely-not-a-flag"],
+                             capture_output=True, text=True, timeout=120, cwd=_REF_ROOT)
+        self.assertEqual(res.returncode, 64, res.stderr[-500:])
 
 
 if __name__ == "__main__":

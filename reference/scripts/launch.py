@@ -25,7 +25,7 @@ if _REF_ROOT not in sys.path:
 from core.budget import BudgetConfig, parse_duration_seconds, parse_token_budget
 from core.config import MantisAuthError
 from core.synthesizer import ResearchGraphSynthesizer, WorkflowSynthesizer
-from main import pipeline
+from main import _SCAN_MODES, pipeline
 from scripts.configure import (
     detect_capabilities,
     ensure_configured,
@@ -39,9 +39,10 @@ from scripts.configure import (
 class _LauncherArgumentParser(argparse.ArgumentParser):
     """Exits 64 (EX_USAGE) on CLI usage errors instead of argparse's default 2.
 
-    Exit code 2 is documented by Mantis as "paused at budget" (and main.py
-    uses it that way), so a CI wrapper could not distinguish a typo'd flag
-    from a resumable pause on the launch.py path.
+    Exit code 2 is documented by Mantis as "paused at budget", so a CI
+    wrapper could not otherwise distinguish a typo'd flag from a resumable
+    pause. This is the only command-line parser: run.sh, scripts/launch.py
+    and main.py all go through it.
     """
 
     def error(self, message):
@@ -141,6 +142,57 @@ def build_parser() -> argparse.ArgumentParser:
             "failing with 'database is locked' (default: 60, or 15 x "
             "--parallel when that is larger; also MANTIS_DB_TIMEOUT)"
         ),
+    )
+    parser.add_argument(
+        "--scan-mode",
+        type=str,
+        default=None,
+        choices=list(_SCAN_MODES),
+        help=(
+            "Scan mode. file-by-file asks one question of every file; "
+            "cross-functional hunts defects that span files. Defaults to the "
+            "workflow config, or auto."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the work-plan confirmation prompt (for non-interactive use)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Leave matching paths out of the scan; repeatable, or comma-separated. "
+            "Patterns are relative to the target: a bare name (vendor, testdata) matches "
+            "a directory or file of that name at any depth, a pattern with a slash "
+            "(third_party/*, src/gen/*.pb.go) matches the relative path. Excluded files "
+            "are not scanned or listed but stay readable for context. Adds to the "
+            "workflow's `exclude` list."
+        ),
+    )
+    parser.add_argument(
+        "--path-root",
+        type=str,
+        default="",
+        help=(
+            "Directory to store finding filepaths relative to (e.g. the "
+            "repository root when scanning a single file inside it); must "
+            "be an ancestor of the target"
+        ),
+    )
+    parser.add_argument(
+        "--no-compaction",
+        action="store_true",
+        help="Disable ADK event compaction",
+    )
+    parser.add_argument(
+        "--no-context-cache",
+        action="store_true",
+        help="Disable ADK context caching",
     )
     parser.add_argument(
         "--focus",
@@ -282,6 +334,12 @@ def run_launch(
     inspect: bool = False,
     synthesize_llm: bool = True,
     save_config: bool = False,
+    scan_mode: Optional[str] = None,
+    assume_yes: bool = False,
+    exclude: Optional[list] = None,
+    path_root: str = "",
+    no_compaction: bool = False,
+    no_context_cache: bool = False,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -585,6 +643,12 @@ def run_launch(
                 db_timeout=db_timeout,
                 focus=focus,
                 seed_report_path=seed_report,
+                scan_mode_override=scan_mode,
+                assume_yes=assume_yes,
+                exclude_override=exclude,
+                path_root=path_root,
+                enable_compaction=False if no_compaction else None,
+                enable_context_cache=False if no_context_cache else None,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -631,6 +695,12 @@ def main() -> int:
         inspect=args.inspect,
         synthesize_llm=args.synthesize_llm,
         save_config=args.save_config,
+        scan_mode=args.scan_mode,
+        assume_yes=args.yes,
+        exclude=args.exclude,
+        path_root=args.path_root,
+        no_compaction=args.no_compaction,
+        no_context_cache=args.no_context_cache,
     )
 
 

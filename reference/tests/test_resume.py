@@ -117,29 +117,16 @@ class LedgerTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def parse(self, *argv):
-        import main as main_mod
+        from scripts.launch import build_parser
 
-        saved = sys.argv
-        try:
-            sys.argv = ["main.py", *argv]
-            with contextlib.redirect_stderr(io.StringIO()):
-                return main_mod.parse_cli_args()
-        finally:
-            sys.argv = saved
+        with contextlib.redirect_stderr(io.StringIO()):
+            return build_parser().parse_args(list(argv))
 
     def test_resume_takes_an_optional_run_id(self):
         self.assertEqual(self.parse("x").resume, "")
         self.assertEqual(self.parse("x", "--resume", "abc").resume, "abc")
         self.assertEqual(self.parse("x", "--resume").resume, "latest")
         self.assertEqual(self.parse("--resume", "abc", "x").resume, "abc")
-
-    def test_the_launcher_agrees(self):
-        from scripts.launch import build_parser
-
-        parser = build_parser()
-        self.assertEqual(parser.parse_args(["x"]).resume, "")
-        self.assertEqual(parser.parse_args(["x", "--resume", "abc"]).resume, "abc")
-        self.assertEqual(parser.parse_args(["x", "--resume"]).resume, "latest")
 
 
 class ResumeRunTest(unittest.TestCase):
