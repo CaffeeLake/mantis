@@ -279,6 +279,10 @@ def is_retryable_llm_error(e: Exception) -> bool:
         return False
     if is_rate_limit_error(e):
         return True
+    # An empty STOP turn is retried like a 429: same backoff, same patience.
+    # Its cost is metered where it is raised (see MantisEmptyResponseError).
+    if isinstance(e, MantisEmptyResponseError):
+        return True
     if isinstance(e, json.decoder.JSONDecodeError):
         return True
     try:
@@ -414,6 +418,58 @@ class MantisStreamInterruptedError(RuntimeError):
         super().__init__(message)
         self.chunks_yielded = chunks_yielded
         self.original_exception = original_exception
+
+
+class MantisEmptyResponseError(RuntimeError):
+    """A non-streaming turn finished with STOP and no parts: no text, no tool
+    call, no error code. The model billed the prompt and said nothing.
+
+    Left alone, ADK reports the turn as MODEL_RETURNED_NO_CONTENT, the node
+    moves on with nothing, and the whole campaign is marked failed over one
+    empty sample. Raised inside the model layer instead, so the turn goes
+    back through the same backoff loop as a 429. The difference from a 429
+    is that each attempt was a billed prompt, so the response's usage is
+    metered against the run budget before this is raised: the token ceiling
+    bounds the worst case, as it bounds everything else. Past the patience
+    window the empty response is passed on unchanged, and the pipeline sees
+    exactly what it saw before.
+    """
+
+    def __init__(self, message: str, response: Any = None):
+        super().__init__(message)
+        self.response = response
+
+
+def is_empty_stop_response(response: Any) -> bool:
+    """The condition ADK flags as MODEL_RETURNED_NO_CONTENT, checked on the
+    response before ADK sees it. Streaming is the caller's business: a
+    terminal finish-only chunk legitimately follows streamed content."""
+    if getattr(response, "partial", False) or getattr(response, "error_code", None):
+        return False
+    from google.genai import types as genai_types
+
+    if getattr(response, "finish_reason", None) not in (genai_types.FinishReason.STOP, "STOP"):
+        return False
+    content = getattr(response, "content", None)
+    return not content or not getattr(content, "parts", None)
+
+
+def meter_response_usage(response: Any) -> None:
+    """Charges a response's usage to the run budget from inside the model
+    layer. The pipeline meters from events, and a response the model layer
+    swallows never becomes one; without this a retried empty turn would be
+    free as far as the budget could tell. A budget ceiling crossed here
+    raises BudgetExceededError, which is the point."""
+    from core.context import current_run_context
+
+    ctx = current_run_context.get()
+    controller = getattr(ctx, "budget_controller", None) if ctx else None
+    usage = getattr(response, "usage_metadata", None)
+    total = int(getattr(usage, "total_token_count", 0) or 0) if usage else 0
+    if controller is None or total <= 0:
+        return
+    cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
+    controller.record_tokens(total, cached_count=cached, cache_discount=0.1)
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -1728,6 +1784,15 @@ class ResilientLiteLlm(LiteLlm):
                         and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
                     ):
                         raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
+                    if not current_stream and is_empty_stop_response(response):
+                        # Billed, so charged, before the turn is thrown away.
+                        # A budget ceiling crossed here raises past the
+                        # retry loop below, which does not retry that.
+                        meter_response_usage(response)
+                        raise MantisEmptyResponseError(
+                            "The model returned no content (finish_reason=STOP with empty parts)",
+                            response=response,
+                        )
                     yield self._sanitize_structured_response(response, schema_cls)
                 return
             except (json.decoder.JSONDecodeError, ValueError, MantisStreamingTruncationError) as e:
@@ -1794,6 +1859,21 @@ class ResilientLiteLlm(LiteLlm):
                     ) from None
 
                 elapsed = time.time() - start_time
+                if isinstance(e, MantisEmptyResponseError) and elapsed >= max_patience:
+                    # Out of patience: hand the empty turn on as it was, so ADK
+                    # reports MODEL_RETURNED_NO_CONTENT and the campaign fails
+                    # the way it did before this retry existed. --resume picks
+                    # that up; an exception here would turn one known failure
+                    # mode into another.
+                    model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
+                    print(
+                        f"\n[LLM RETRY] '{model_name}' still returned no content after "
+                        f"{elapsed:.0f}s of retries; passing the empty turn on.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    yield self._sanitize_structured_response(e.response, schema_cls)
+                    return
                 if not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
 
