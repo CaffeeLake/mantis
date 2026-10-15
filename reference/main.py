@@ -1145,6 +1145,21 @@ async def pipeline(
         print(f"Excluding {', '.join(exclude)}: {len(discovered_files)} source file(s) in scope.",
               file=sys.stderr)
 
+    if resume_run_id == "latest":
+        # --resume with no id: the most recent run this database recorded for
+        # this target. Looked up, never guessed: no run means nothing to
+        # resume, and the operator is told rather than handed a fresh one.
+        from core.cost import latest_run_id
+
+        resume_run_id = latest_run_id(db_path, str(target_path))
+        if not resume_run_id:
+            print(
+                f"Error: --resume: no earlier run recorded in {db_path} for {target_path}. "
+                "Start a run without --resume.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
     # Resolve budget configuration: explicit caller override > workflow.json budget > default BudgetConfig()
     resolved_budget = budget_config
@@ -1204,6 +1219,18 @@ async def pipeline(
     # for one run must not rewrite the operator's file.
     if scan_mode_override:
         config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
+    elif resume_run_id:
+        # A resumed run keeps its scan mode. Without this, a file-by-file
+        # sweep picked up without the flag is re-resolved as `auto`, which
+        # plans one whole-target campaign for a small directory and reruns
+        # the wrong thing. The ledger rows carry the mode; an explicit flag
+        # still wins, and a run with no rows has nothing to inherit.
+        from core.cost import run_scan_mode
+
+        recorded_mode = run_scan_mode(db_path, run_id)
+        if recorded_mode:
+            config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
+            print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
         config,
@@ -1368,6 +1395,46 @@ async def pipeline(
                 f"ranked targets.",
                 file=sys.stderr,
             )
+
+    # A resumed run scans what it has not finished. The ledger says which
+    # campaigns completed; those are skipped, and the rest -- campaigns that
+    # failed and campaigns the run never reached -- are scanned under the same
+    # run id so findings, dedup and coverage carry on. Applied after the
+    # planner so a grouped plan is narrowed the same way. An unreadable
+    # ledger narrows nothing: rescanning is the safe direction.
+    if resume_run_id:
+        from core.cost import run_ledger
+
+        ledger = run_ledger(db_path, run_id)
+        if ledger is None:
+            print("[RESUME] Ledger unreadable; scanning the full plan.", file=sys.stderr)
+        else:
+            def _key(p: str) -> str:
+                return os.path.realpath(str(p)).rstrip("/")
+
+            completed = {_key(t) for t, row in ledger.items() if not row.get("failed")}
+            failed = {_key(t) for t, row in ledger.items() if row.get("failed")} - completed
+            planned = list(targets_to_scan)
+            remaining = [t for t in planned if _key(t) not in completed]
+            n_failed = sum(1 for t in remaining if _key(t) in failed)
+            n_new = len(remaining) - n_failed
+            print(
+                f"\n🔄 Resuming run {run_id}: {len(planned) - len(remaining)} of {len(planned)} "
+                f"campaign(s) completed; {n_failed} failed and {n_new} never started: "
+                f"{len(remaining)} to scan.",
+                file=sys.stderr,
+            )
+            if not remaining:
+                print("Nothing left to scan for this run. To scan again, start a new run.")
+                return 0
+            targets_to_scan = remaining
+            if plan_groups:
+                kept = set(_key(t) for t in remaining)
+                plan_groups = [
+                    {**g, "targets": [m for m in g["targets"] if _key(m) in kept]}
+                    for g in plan_groups
+                ]
+                plan_groups = [g for g in plan_groups if g["targets"]]
 
     # Price the plan we ended up with. Never fatal: an estimate is an aid to the
     # operator's decision, and failing to produce one must not stop the scan.
@@ -1588,26 +1655,6 @@ async def pipeline(
 
     if resume_run_id:
         existing_findings = read_findings(db_path, run_id=run_id)
-        if existing_findings and (not scan_target or scan_target == "."):
-            # A convenience for `main.py . --resume`: narrow to the file the
-            # run was working on. The stored path is a model-written finding
-            # filepath from a database that may have been written by an
-            # earlier, worse run, so it is re-validated and accepted only
-            # INSIDE the target validated above -- it may narrow the scan,
-            # never widen it (the planner's containment root, the sandbox
-            # staging set and the coverage ledger all follow target_path).
-            stored_target = str(existing_findings[0].get("filepath") or "")
-            cand, _ = validate_scan_target(stored_target) if stored_target else (None, "")
-            if cand is not None:
-                try:
-                    cand.relative_to(target_path)
-                    target_path = cand
-                except ValueError:
-                    print(
-                        f"[RESUME] Ignoring stored target '{stored_target}': outside the "
-                        f"validated scan target {target_path}.",
-                        file=sys.stderr,
-                    )
         print(f"\n🔄 Resuming Run ID: {run_id} ({len(existing_findings)} existing finding(s) checkpointed)")
 
     print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")
@@ -2306,8 +2353,16 @@ def parse_cli_args():
     parser.add_argument(
         "--resume",
         type=str,
+        nargs="?",
+        const="latest",
         default="",
-        help="Run ID to resume execution from where it paused",
+        metavar="RUN_ID",
+        help=(
+            "Resume a run: scan only the campaigns it has not completed (failed ones "
+            "and ones it never reached), under the same run id, with a fresh budget. "
+            "With no RUN_ID, the most recent run recorded for this target. To rescan "
+            "everything, start a new run instead."
+        ),
     )
     parser.add_argument(
         "--scan-mode",

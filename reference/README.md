@@ -137,10 +137,20 @@ Mantis enforces multi-dimensional ceilings across every campaign:
 - **Wall-Clock Time**: `--max-time 2h` (ISO duration / time format).
 - **Token Budget**: `--token-budget 10M` (raw integer or human-readable format).
 - **Graph Steps & Node Visits**: `--max-steps 500 --max-node-visits 50`.
-- **State Resumption**: `--resume <run_id>` seamlessly resumes paused campaigns
-  from SQLite checkpoints with monotonic status preservation.
+- **State Resumption**: `--resume <run_id>` picks a run back up where it
+  stopped, with monotonic status preservation.
 
 #### Budgets and resumption
+
+**A resumed run scans what it has not finished.** The per-campaign spend ledger
+records which campaigns completed and which failed (a model that returned no
+content, a crashed sandbox). `--resume <run_id>` skips the completed ones and
+scans the rest — the failed campaigns and the ones the run never reached — under
+the same run ID, so findings, dedup and coverage carry on. The run keeps the
+scan mode it was recorded under, so `--scan-mode` need not be repeated.
+`--resume` with no ID resumes the most recent run recorded for the target. A run
+that has nothing left exits immediately; to scan everything again, start a new
+run (or delete the database).
 
 **A resumed run starts from a fresh budget.** `--resume` does not carry forward
 the tokens, steps or elapsed time already spent: the run keeps its findings,

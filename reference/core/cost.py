@@ -185,6 +185,14 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _row_failed(metadata_json: Any) -> bool:
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("failed"))
+
+
 def uncovered_files(db_path: str, files) -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
 
@@ -195,6 +203,12 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
     seen": a codebase whose `lib/` was scanned last month still has every
     file outside `lib/` uncovered, and skipping those silently is exactly
     the hole the caller uses this to close.
+
+    A campaign that FAILED does not cover anything. Its row stays in the
+    ledger (it ran the graph and cost real tokens, which the cost estimate
+    wants to know), but a crashed scan looked at nothing a later run should
+    trust; counting it would make `auto` skip the file forever and would let
+    a change gate treat it as audited.
 
     Returns None when there is no ledger to consult or it cannot be read.
     The distinction is deliberate and load-bearing: a MISSING ledger (no
@@ -214,7 +228,7 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         try:
             try:
                 rows = conn.execute(
-                    "SELECT DISTINCT target FROM campaign_spend WHERE target IS NOT NULL"
+                    "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such table" in str(exc).lower():
@@ -223,9 +237,9 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         finally:
             conn.close()
         targets = set()
-        for (target,) in rows:
+        for target, metadata_json in rows:
             t = str(target or "").rstrip("/")
-            if t:
+            if t and not _row_failed(metadata_json):
                 targets.add(t)
         out = []
         for path in all_files:
@@ -244,6 +258,117 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         return out
     except Exception:
         return None
+
+
+def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
+    """What one run's campaigns did, as `{target: {"failed": bool}}`, the
+    latest row per target winning (a retried campaign supersedes its failure).
+
+    Returns None when the ledger cannot be read, `{}` when the run has no
+    rows: a run that paused inside its first campaign recorded nothing, and
+    resuming it means scanning everything, which is what an empty answer
+    tells the caller. Never raises.
+    """
+    if not db_path or not run_id:
+        return None
+    try:
+        if not os.path.exists(db_path):
+            return {}
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return {}
+                raise
+        finally:
+            conn.close()
+        out: dict = {}
+        for target, metadata_json in rows:
+            t = str(target or "").rstrip("/")
+            if t:
+                out[t] = {"failed": _row_failed(metadata_json)}
+        return out
+    except Exception:
+        return None
+
+
+def run_scan_mode(db_path: str, run_id: str) -> str:
+    """The scan mode a run's campaigns were recorded under, '' if unknown.
+
+    The mode is not stored with the run, but every ledger row carries it,
+    and a resumed run must plan the way the original did: a file-by-file
+    sweep picked up without the flag would otherwise be re-resolved as
+    `auto`, which plans one whole-target campaign for a small directory
+    and so reruns the wrong thing. Latest row wins. Never raises.
+    """
+    if not db_path or not run_id:
+        return ""
+    try:
+        if not os.path.exists(db_path):
+            return ""
+        conn = _connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT scan_mode FROM campaign_spend WHERE run_id = ? "
+                "AND scan_mode IS NOT NULL AND scan_mode != '' ORDER BY id DESC LIMIT 1",
+                (str(run_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row[0]) if row else ""
+    except Exception:
+        return ""
+
+
+def latest_run_id(db_path: str, target: str = "") -> str:
+    """The most recent run recorded in this database, preferring runs whose
+    ledger rows fall under `target` so `--resume` in one repository does not
+    pick up a run over another. Falls back to the findings table for a run
+    that never completed a campaign. '' when there is nothing to resume.
+    Never raises.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return ""
+    root = os.path.realpath(target) if target else ""
+    try:
+        conn = _connect(db_path)
+        try:
+            candidates: list = []
+            for sql in (
+                "SELECT run_id, target, MAX(timestamp) AS ts FROM campaign_spend "
+                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
+                "SELECT run_id, '' AS target, MAX(timestamp) AS ts FROM findings "
+                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
+            ):
+                try:
+                    candidates += [tuple(r) for r in conn.execute(sql).fetchall()]
+                except sqlite3.OperationalError:
+                    continue
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    if not candidates:
+        return ""
+
+    def under_root(t: str) -> bool:
+        if not root or not t:
+            return not root
+        try:
+            rt = os.path.realpath(t)
+            return rt == root or os.path.commonpath([rt, root]) == root
+        except (ValueError, OSError):
+            return False
+
+    scoped = [c for c in candidates if under_root(str(c[1] or ""))] or candidates
+    scoped.sort(key=lambda c: str(c[2] or ""), reverse=True)
+    return str(scoped[0][0])
 
 
 def record_spend(

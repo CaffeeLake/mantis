@@ -187,8 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         type=str,
+        nargs="?",
+        const="latest",
         default="",
-        help="Run ID to resume execution from where it paused",
+        metavar="RUN_ID",
+        help=(
+            "Resume a run: scan only the campaigns it has not completed (failed ones "
+            "and ones it never reached), under the same run id, with a fresh budget. "
+            "With no RUN_ID, the most recent run recorded for this target. To rescan "
+            "everything, start a new run instead."
+        ),
     )
     parser.add_argument(
         "--inspect",
@@ -550,7 +558,7 @@ def run_launch(
         if effective_budget.max_node_tool_calls > 0:
             print(f"  • Max Node Tool Calls: {effective_budget.max_node_tool_calls}")
         if resume_run_id:
-            print(f"  • Resume Run ID: {resume_run_id}")
+            print(f"  • Resume Run ID: {'most recent run' if resume_run_id == 'latest' else resume_run_id}")
         return 0
 
     # Launch Pipeline

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -569,13 +570,15 @@ class FencingAndEgressTest(unittest.TestCase):
 
 
 class ResumeTargetTest(unittest.TestCase):
-    def test_resume_only_narrows_inside_the_validated_target(self):
+    def test_resume_never_moves_the_scan_target(self):
+        """A database row must not choose what gets scanned. `--resume` used
+        to re-point target_path at a stored finding's filepath; the target
+        now comes from the command line only, and resume narrows the
+        campaign list from the spend ledger instead."""
         src = Path(_REF_ROOT, "main.py").read_text(encoding="utf-8")
-        start = src.index("if resume_run_id:")
-        block = src[start:start + 1800]
-        self.assertIn("cand.relative_to(target_path)", block)
-        self.assertIn("validate_scan_target(stored_target)", block)
-        self.assertNotIn('get("target_file")', block)
+        assignments = re.findall(r"^\s*target_path\s*(?:,\s*\w+\s*)?=\s*(.+)$", src, re.M)
+        self.assertEqual(assignments, ["validate_scan_target(scan_target)"])
+        self.assertNotIn("target_path = cand", src)
 
 
 if __name__ == "__main__":
