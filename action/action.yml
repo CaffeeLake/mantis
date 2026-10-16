@@ -83,11 +83,23 @@ inputs:
     default: default
   fail-on:
     description: >-
-      none: advisory, the job passes whatever the verdict. block: fail the
-      job on BLOCK (an open HIGH/CRITICAL finding in the changed lines or
-      functions). review: fail on REVIEW or BLOCK.
+      What the findings do to the job. none: advisory, the job passes
+      whatever the verdict. block: fail the job on BLOCK (an open
+      HIGH/CRITICAL finding in the changed lines or functions). review: fail
+      on REVIEW or BLOCK.
     required: false
     default: none
+  fail-closed:
+    description: >-
+      Whether Mantis being unable to look fails the job: a setup failure, a
+      model outage, a changed file the run could not scan (over max-files,
+      over budget, timed out, crashed), a crash in the driver. false (the
+      default) never fails the job for any of those -- the summary says what
+      was not audited and the verdict carries REVIEW, but a broken scanner
+      does not stop a merge. true: a green check means every changed file
+      was audited in full.
+    required: false
+    default: "false"
   python-version:
     description: Python version for the pipeline (3.12 or newer).
     required: false
@@ -95,7 +107,7 @@ inputs:
 
 outputs:
   verdict:
-    description: PASS, REVIEW, or BLOCK.
+    description: PASS, REVIEW, or BLOCK; NOT_RUN when a setup failure stopped the scan.
     value: ${{ steps.scan.outputs.verdict }}
   report:
     description: Path of the JSON report (verdict, findings, blast radius, scan results).
@@ -108,16 +120,52 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
+    # Both steps run from the action's own directory with PYTHONSAFEPATH set.
+    # A composite step's default working directory is the checkout -- the
+    # pull request -- and `python -m` puts the working directory first on
+    # sys.path, so a pull request carrying pip/__init__.py would be what
+    # `python -m pip` imported, before any of the controls below existed.
     - name: Install Mantis
       shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        PYTHONSAFEPATH: "1"
       run: |
-        python -m pip install --quiet --require-hashes \
+        python -P -m pip install --quiet --require-hashes \
           -r "$GITHUB_ACTION_PATH/../reference/requirements.txt"
+
+    # The auth action writes its credential configuration into the checkout.
+    # That file is the credential: it holds the URL and token the job uses to
+    # mint identity tokens. Move it out of the tree the pipeline reads before
+    # the scan starts, so nothing that reads the pull request -- the model's
+    # tools, a sweep, a planted script -- can read it, and point every client
+    # at the new location.
+    - name: Move the credential out of the checkout
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+          case "$GOOGLE_APPLICATION_CREDENTIALS" in
+            "$GITHUB_WORKSPACE"/*)
+              dest="$RUNNER_TEMP/mantis-credentials.json"
+              install -m 0600 "$GOOGLE_APPLICATION_CREDENTIALS" "$dest"
+              rm -f -- "$GOOGLE_APPLICATION_CREDENTIALS"
+              {
+                echo "GOOGLE_APPLICATION_CREDENTIALS=$dest"
+                echo "GOOGLE_GHA_CREDS_PATH=$dest"
+                echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=$dest"
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
+        fi
 
     - name: Scan the pull request
       id: scan
       shell: bash
+      working-directory: ${{ github.action_path }}
       env:
+        PYTHONSAFEPATH: "1"
+        LITELLM_MODE: PRODUCTION
         MANTIS_ACTION_BASE_SHA: ${{ inputs.base-sha }}
         MANTIS_ACTION_MODEL: ${{ inputs.model }}
         MANTIS_ACTION_API_BASE: ${{ inputs.api-base }}
@@ -129,6 +177,7 @@ runs:
         MANTIS_ACTION_PER_FILE_TIMEOUT: ${{ inputs.per-file-timeout }}
         MANTIS_ACTION_IGNORE: ${{ inputs.ignore }}
         MANTIS_ACTION_FAIL_ON: ${{ inputs.fail-on }}
+        MANTIS_ACTION_FAIL_CLOSED: ${{ inputs.fail-closed }}
       run: |
         report="$RUNNER_TEMP/mantis-pr-scan.json"
         args=(
@@ -151,4 +200,7 @@ runs:
         if [ "$MANTIS_ACTION_IGNORE" != "default" ]; then
           args+=(--ignore "$MANTIS_ACTION_IGNORE")
         fi
+        case "$MANTIS_ACTION_FAIL_CLOSED" in
+          true|True|TRUE|yes|1) args+=(--fail-closed) ;;
+        esac
         python "$GITHUB_ACTION_PATH/../reference/scripts/pr_scan.py" "${args[@]}"

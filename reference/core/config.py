@@ -477,7 +477,9 @@ def meter_response_usage(response: Any) -> None:
     if controller is None or total <= 0:
         return
     cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
-    controller.record_tokens(total, cached_count=cached, cache_discount=0.1)
+    # The weight of a cached token is the run budget's to decide (a CI run
+    # counts every token at full price); this layer only reports the counts.
+    controller.record_tokens(total, cached_count=cached)
 
 
 class ContextBudgetExceededError(RuntimeError):

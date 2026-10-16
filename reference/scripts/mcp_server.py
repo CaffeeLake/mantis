@@ -507,7 +507,9 @@ def _uncovered(state: MantisState, rel_files: List[str]) -> Optional[List[str]]:
 
 
 def check_change(state: MantisState, files: Optional[List[str]] = None,
-                 diff: str = "") -> Dict[str, Any]:
+                 diff: str = "", renamed: Optional[Dict[str, str]] = None,
+                 deleted: Optional[List[str]] = None,
+                 include_coverage: bool = True) -> Dict[str, Any]:
     """The deterministic gate: what Mantis knows about this change, as a verdict.
 
     BLOCK  -- an open HIGH/CRITICAL finding intersects the change.
@@ -516,6 +518,21 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
               never been scanned, or the index/database needed to decide is
               missing (fail-closed).
     PASS   -- every check ran and nothing known intersects this change.
+
+    `renamed` ({old path: new path}) and `deleted` ([old path]) say what the
+    change did to paths the database may hold findings at. A finding at a
+    renamed path is judged against the new path, as direct: the code moved,
+    the finding did not go away. A finding at a deleted path is a REVIEW:
+    the code may have moved somewhere a rename could not be detected.
+    Without these, renaming a file would take its findings out of the
+    gate's sight, and renaming is cheaper than fixing.
+
+    `include_coverage=False` keeps the coverage checks -- never scanned,
+    index or database missing, paths outside the repository, ledger
+    unreadable -- OUT of the verdict and returns them under `coverage_gaps`
+    instead, for a caller that accounts for coverage itself and decides
+    separately whether a gap fails its job. The verdict is then a function
+    of findings only. The default folds them in as REVIEW, as before.
     """
     raw_changed: Dict[str, List[int]] = parse_unified_diff(diff)
     for f in files or []:
@@ -529,10 +546,17 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         elif f:
             rejected.append(f)
     changed = {f: sorted(set(lines)) for f, lines in changed.items()}
+    moved: Dict[str, str] = {}
+    for old, new in (renamed or {}).items():
+        o, n = state.rel(old), state.rel(new)
+        if o and n:
+            moved[o] = n
+    removed = [r for r in (state.rel(d) for d in (deleted or [])) if r]
 
     verdict = VERDICT_PASS
     reasons: List[str] = []
     next_actions: List[str] = []
+    coverage_gaps: List[Dict[str, str]] = []
 
     def raise_to(level: str, reason: str, action: str = "") -> None:
         nonlocal verdict
@@ -542,26 +566,31 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         if action and action not in next_actions:
             next_actions.append(action)
 
-    if not changed and not rejected:
+    def gap(reason: str, action: str = "", file: str = "") -> None:
+        coverage_gaps.append({"file": file, "reason": reason, "action": action})
+        if include_coverage:
+            raise_to(VERDICT_REVIEW, reason, action)
+
+    if not changed and not rejected and not removed:
         return {"verdict": VERDICT_REVIEW,
                 "reasons": ["No changed files given: pass `files` or a unified `diff`."],
-                "blast_radius": [], "findings": [], "next_actions": []}
+                "blast_radius": [], "findings": [], "next_actions": [],
+                "coverage_gaps": [{"file": "", "reason": "No changed files given.", "action": ""}]}
 
     # A path the gate cannot map into this repo is named, not dropped:
     # silently narrowing the change set is the fail-open direction.
     for f in rejected:
-        raise_to(VERDICT_REVIEW,
-                 f"'{f}' is outside this repository: not gated.",
-                 "Run the gate from the repository the change belongs to.")
+        gap(f"'{f}' is outside this repository: not gated.",
+            "Run the gate from the repository the change belongs to.", file=f)
 
     # Fail-closed context checks.
     idx = state.index()
     if not idx.available():
-        raise_to(VERDICT_REVIEW, "Structural index missing: blast radius unknown.",
-                 "Run mantis_reindex, then re-run mantis_check_change.")
+        gap("Structural index missing: blast radius unknown.",
+            "Run mantis_reindex, then re-run mantis_check_change.")
     if not state.db_exists():
-        raise_to(VERDICT_REVIEW, "No findings database: change set has never been audited.",
-                 "Run mantis_scan_change on the changed files.")
+        gap("No findings database: change set has never been audited.",
+            "Run mantis_scan_change on the changed files.")
 
     # Blast radius: changed lines -> enclosing functions -> direct callers.
     blast: List[Dict[str, Any]] = []
@@ -606,9 +635,27 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                 continue
             f_fp = str(f.get("filepath") or "")
             matched_files = [c for c in changed if _finding_matches(state, f_fp, c)]
+            # A finding at a path this change renamed belongs to the new
+            # path now, and to every changed line of it: the lines it was
+            # recorded at mean nothing after the move.
+            via_rename = ""
+            if not matched_files:
+                for old, new in moved.items():
+                    if _paths_match(f_fp, old) and new in changed:
+                        matched_files = [new]
+                        via_rename = old
+                        break
             in_file = bool(matched_files)
             in_radius = not in_file and any(_finding_matches(state, f_fp, r) for r in radius_files)
             if not in_file and not in_radius:
+                if any(_paths_match(f_fp, d) for d in removed):
+                    sev = str(f.get("severity") or f.get("priority") or "").upper()
+                    raise_to(VERDICT_REVIEW,
+                             f"Open finding '{f.get('title')}' ({sev or 'unrated'}) was in "
+                             f"{f_fp}, which this change deletes: confirm the code is gone, "
+                             f"not moved.",
+                             "Check where the deleted file's code went; dismiss the finding "
+                             "with evidence if it is gone.")
                 continue
 
             # When a diff gives changed line numbers and the finding records its
@@ -619,8 +666,8 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             # two-line registration in a legacy router does not block on eight
             # unrelated findings 400 lines away). Missing line info on either
             # side fails closed to "direct".
-            direct = False
-            if in_file:
+            direct = bool(via_rename)
+            if in_file and not via_rename:
                 diff_lines = sorted({
                     ln for c in matched_files for ln in (changed.get(c) or [])
                 })
@@ -653,9 +700,13 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                 view["relationship"] = "caller_radius"
             hits.append(view)
             sev = str(f.get("severity") or f.get("priority") or "").upper()
+            if via_rename:
+                view["filepath"] = matched_files[0]
+                view["renamed_from"] = via_rename
             if direct and sev in BLOCKING_SEVERITIES:
+                where = (f"{matched_files[0]} (renamed from {via_rename})" if via_rename else f_fp)
                 raise_to(VERDICT_BLOCK,
-                         f"Open {sev} finding '{f.get('title')}' touches changed file {f_fp}.",
+                         f"Open {sev} finding '{f.get('title')}' touches changed file {where}.",
                          "Fix the finding (or mark it false_positive with evidence) before merging.")
             elif in_file:
                 raise_to(VERDICT_REVIEW,
@@ -672,14 +723,12 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         # Coverage: a changed file no scan ever recorded is unknown ground.
         uncovered = _uncovered(state, list(changed))
         if uncovered is None:
-            raise_to(VERDICT_REVIEW,
-                     "Coverage ledger unreadable: scan history unknown.",
-                     "Check the knowledge database in the state directory, then run mantis_scan_change.")
+            gap("Coverage ledger unreadable: scan history unknown.",
+                "Check the knowledge database in the state directory, then run mantis_scan_change.")
         else:
             for rel_fp in uncovered:
-                raise_to(VERDICT_REVIEW,
-                         f"'{rel_fp}' has never been scanned by Mantis.",
-                         "Run mantis_scan_change on the changed files.")
+                gap(f"'{rel_fp}' has never been scanned by Mantis.",
+                    "Run mantis_scan_change on the changed files.", file=rel_fp)
 
     return {
         "verdict": verdict,
@@ -687,6 +736,7 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         "blast_radius": blast,
         "findings": hits,
         "next_actions": next_actions,
+        "coverage_gaps": coverage_gaps,
     }
 
 

@@ -5,6 +5,7 @@ import os
 import uuid
 import hashlib
 import dataclasses
+import fnmatch
 import subprocess
 import warnings
 from pathlib import Path
@@ -41,6 +42,26 @@ from core.llm_gateway import strip_terminal_control
 
 APP_NAME = "mantis_graph"
 USER_ID = "user1"
+
+# Event error codes that mean the provider refused the credential. ADK sets
+# error_code to the exception's class name (litellm's AuthenticationError,
+# google-auth's RefreshError and friends, our own MantisAuthError) or to a
+# provider status. Matched exactly; the free-text error_message is never
+# consulted for this, because a model can write it.
+_AUTH_ERROR_CODES = frozenset({
+    "MantisAuthError",
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "RefreshError",
+    "DefaultCredentialsError",
+    "ReauthError",
+    "ReauthFailError",
+    "ReauthSamlChallengeFailError",
+    "OAuthError",
+    "UserAccessTokenError",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+})
 
 
 def cprint(*args, **kwargs) -> None:
@@ -214,7 +235,12 @@ async def execute_sub_task(
                 node_key = node_path or "unknown"
                 errored.add(node_key)
                 err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
-                if event.error_code == "MantisAuthError" or is_auth_error(err_msg):
+                # Decided from the error CODE, which names an exception class
+                # or a provider status, never from the message: ADK copies
+                # model-authored text (a malformed call's finish message) into
+                # error_message, and a scanned file can put "unauthenticated"
+                # in that text. The code is not the model's to write.
+                if str(event.error_code) in _AUTH_ERROR_CODES:
                     raise MantisAuthError(err_msg)
                 if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
                     limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
@@ -368,6 +394,13 @@ def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list
         from core.exclusions import is_excluded
 
         found = [f for f in found if not is_excluded(os.path.relpath(f, str(target)), exclude)]
+    # Never a scan target, whatever the operator's patterns say: the
+    # credential configuration a CI auth step drops into the checkout
+    # (google-github-actions/auth writes gha-creds-<random>.json into
+    # $GITHUB_WORKSPACE; it is untracked, so `ls-files --others` lists it).
+    # The driver moves the file out of the tree, but a tree scanned without
+    # the driver -- a sweep -- must not read it either.
+    found = [f for f in found if not fnmatch.fnmatch(os.path.basename(f), "gha-creds-*.json")]
     return found
 
 

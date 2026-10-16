@@ -5,9 +5,11 @@
 files with the full Mantis pipeline, runs `check_change` over the PR diff, and
 reports the verdict as annotations on the diff plus a step summary.
 
-The action is **advisory by default**: the job passes whatever the verdict, and
-the findings appear as warnings on the changed lines. Set `fail-on` to turn it
-into a merge gate once you trust it on your code.
+The action is **advisory and fail-open by default**: the job passes whatever the
+verdict, the findings appear as warnings on the changed lines, and a broken
+scanner -- a model outage, a setup mistake, a crash -- never stops a merge. Two
+inputs change that independently once you trust it on your code: `fail-on` makes
+findings fail the job; `fail-closed` makes "Mantis could not look" fail it too.
 
 ## Setup
 
@@ -94,11 +96,22 @@ a run.
 
 ### GitHub
 
-1. Create an environment named `mantis-pr-scan` (Settings, Environments). The
+1. Create an environment named `mantis-pr-scan` (Settings, Environments) and
+   **put required reviewers on it**. This is not optional. On a `pull_request`
+   event GitHub runs the pull request's own copy of the workflow file, and a job
+   that declares the environment receives its secrets and can mint the identity
+   token the provider accepts. Without reviewers, anyone who can push a branch
+   can edit the workflow to send the credential wherever they like, remove every
+   budget, or run anything at all with it, and the run happens before anyone
+   reads the pull request. Branch protection and CODEOWNERS gate the merge, not
+   the run; a deployment-branch rule does not help either, because the run's ref
+   is the merge ref. The reviewers are the control: a person approves each run,
+   and before approving reads the diff of `.github/workflows/mantis-pr-scan.yml`
+   (and, if you run the action from this repository with `uses: ./action`, of
+   `action/` and `reference/`). Turn on "prevent self-review"; leave
+   administrator bypass off unless the administrators are the reviewers. The
    provider condition above admits tokens from this environment only, so the job
-   must declare it. Add required reviewers if the action runs from the same
-   repository it scans (see Threat model), or whenever you want a person
-   approving each run.
+   must declare it.
 
 2. On that environment, add three secrets: `GCP_WORKLOAD_IDENTITY_PROVIDER` (the
    provider's full resource name,
@@ -324,20 +337,21 @@ still scanning, and the files it did not reach are REVIEW too.
 
 ## Inputs
 
-| Input                | Default            | Meaning                                                                                                                                                                          |
-| -------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base-sha`           | the PR's base SHA  | Commit the diff is taken against.                                                                                                                                                |
-| `model`              | `gemini-3.8-flash` | Model id; a bare `gemini-*` id routes to the Gemini API when `GEMINI_API_KEY` is set, otherwise to the Agent Platform when a project is.                                         |
-| `api-base`           | empty              | Custom OpenAI-compatible endpoint. Skips the credential check.                                                                                                                   |
-| `max-llm-calls`      | `150`              | LLM call ceiling **per changed file**; a loop guard, not the spend control.                                                                                                      |
-| `max-tokens`         | `10M`              | Token budget **per run**, every token at full price, shared equally over the files left to scan; files it cannot reach are reported unscanned (REVIEW). `0` removes it.          |
-| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left. Unreadable when set: exit 3. `0` disables. |
-| `max-input-tokens`   | `262144`           | Input tokens one model request may carry; larger requests are refused before dispatch, for any model. `0` leaves only the model's window.                                        |
-| `max-files`          | `25`               | Files scanned per run; the rest are reported unscanned (REVIEW).                                                                                                                 |
-| `per-file-timeout`   | `1800`             | Seconds before one file's scan is abandoned.                                                                                                                                     |
-| `ignore`             | `default`          | Comma-separated fnmatch patterns left out of the scan and the gate. `default` is the built-in list (docs, images, lockfiles, fonts); an empty string ignores nothing.            |
-| `fail-on`            | `none`             | `none`: advisory. `block`: fail on BLOCK. `review`: fail on REVIEW or BLOCK.                                                                                                     |
-| `python-version`     | `3.13`             | Interpreter for the pipeline (3.12 or newer).                                                                                                                                    |
+| Input                | Default            | Meaning                                                                                                                                                                                                         |
+| -------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base-sha`           | the PR's base SHA  | Commit the diff is taken against.                                                                                                                                                                               |
+| `model`              | `gemini-3.8-flash` | Model id; a bare `gemini-*` id routes to the Gemini API when `GEMINI_API_KEY` is set, otherwise to the Agent Platform when a project is.                                                                        |
+| `api-base`           | empty              | Custom OpenAI-compatible endpoint. Skips the credential check.                                                                                                                                                  |
+| `max-llm-calls`      | `150`              | LLM call ceiling **per changed file**; a loop guard, not the spend control.                                                                                                                                     |
+| `max-tokens`         | `10M`              | Token budget **per run**, every token at full price, shared equally over the files left to scan; files it cannot reach are reported unscanned (REVIEW). `0` removes it.                                         |
+| `daily-token-budget` | `100M`             | Tokens the project may be served in any 24 hours, read from Cloud Monitoring before the run; the run's budget is cut to what is left. Unreadable when set: exit 3. `0` disables.                                |
+| `max-input-tokens`   | `262144`           | Input tokens one model request may carry; larger requests are refused before dispatch, for any model. `0` leaves only the model's window.                                                                       |
+| `max-files`          | `25`               | Files scanned per run; the rest are reported unscanned (REVIEW).                                                                                                                                                |
+| `per-file-timeout`   | `1800`             | Seconds before one file's scan is abandoned.                                                                                                                                                                    |
+| `ignore`             | `default`          | Comma-separated fnmatch patterns left out of the scan and the gate. `default` is the built-in list (docs, images, lockfiles, fonts); an empty string ignores nothing.                                           |
+| `fail-on`            | `none`             | What the findings do to the job. `none`: advisory. `block`: fail on BLOCK. `review`: fail on REVIEW or BLOCK.                                                                                                   |
+| `fail-closed`        | `false`            | Whether Mantis being unable to look fails the job (setup failure, model outage, a changed file not scanned, a crash). `false`: never; the summary says what was not audited. `true`: green means fully audited. |
+| `python-version`     | `3.13`             | Interpreter for the pipeline (3.12 or newer).                                                                                                                                                                   |
 
 Outputs: `verdict` (`PASS`, `REVIEW`, or `BLOCK`) and `report` (path of the JSON
 report with findings, blast radius, per-file scan results, and `usage`: tokens
@@ -345,16 +359,37 @@ and calls for the run against its budget).
 
 ## What the verdict means
 
-The gate is the MCP server's `check_change`, unchanged:
+The gate is the MCP server's `check_change`. Two things come out of a run, and
+two inputs decide what each does to the job.
+
+**The verdict** is what the findings say:
 
 - **BLOCK**: an open HIGH or CRITICAL finding sits in the changed lines or in a
-  function the change modified.
-- **REVIEW**: something needs a human. Lower-severity findings in the change,
-  findings elsewhere in a changed file or in a caller of changed code, a file
-  the run could not scan (over `max-files`, over the token budget, timed out, or
-  failed), or a missing index or database. The gate fails closed: it never
-  answers PASS when it could not look.
-- **PASS**: every check ran and nothing known intersects the change.
+  function the change modified. A known finding follows its file through a
+  rename; a known finding in a file the change deletes is a REVIEW until someone
+  confirms the code is gone rather than moved.
+- **REVIEW**: something needs a human: lower-severity findings in the change,
+  findings elsewhere in a changed file or in a caller of changed code.
+- **PASS**: nothing known intersects the change.
+
+`fail-on` decides whether a BLOCK (or, with `review`, a REVIEW) fails the job.
+
+**Coverage** is whether Mantis could look: `complete`, `partial`, or `none`. A
+changed file over `max-files`, over the token budget, timed out, failed, or
+unparseable, or a missing index or database, makes coverage partial. The verdict
+shown is floored to REVIEW when coverage is incomplete, so a person sees it, and
+the summary names every file and why. `fail-closed` decides whether that fails
+the job; by default it does not, so a scanner that cannot look is never the
+reason a merge stops. With `fail-closed: true` a green check means every changed
+file was audited in full -- and means a model outage or a budget exhausted by a
+sibling repository on the same project turns the check red until it is fixed.
+That is a trade you make knowingly.
+
+A setup failure (no base commit, credentials missing or rejected, the daily
+meter unreadable, nothing launched) is reported as **not run**: an annotation, a
+summary saying what to fix, a `verdict` output of `NOT_RUN`, and exit 3 under
+`fail-closed`, exit 0 otherwise. Never a verdict on the pull request, never a
+silent pass.
 
 Annotations: direct findings are warnings (errors when `fail-on` would fail the
 job on them); same-file and caller-radius findings are notices; unscanned files
@@ -362,11 +397,8 @@ are warnings. GitHub shows ten per level per step; the summary lists all of
 them.
 
 Exit codes of the underlying driver (`reference/scripts/pr_scan.py`): `0` the
-gate ran and `fail-on` is satisfied, `1` it is not, `3` a setup failure: no base
-commit, credentials missing for the chosen route or rejected by the provider, or
-nothing launched. A setup failure is a red check for the workflow's owner to
-fix, never a verdict on the pull request and never a silent pass. What the model
-found, or did not find, is reported as-is.
+job passes under the two policies, `1` it fails under them, `3` a setup failure
+under `fail-closed`. What the model found, or did not find, is reported as-is.
 
 ## Threat model
 
@@ -374,10 +406,14 @@ The job processes attacker-influenced input (the pull request) while holding a
 model credential. The design keeps those two facts apart:
 
 - **The checkout is data.** Nothing from the pull request is imported,
-  installed, or executed. The pipeline reads it; the sandbox is pinned to
+  installed, or executed. Both of the action's steps run from the action's own
+  directory with `PYTHONSAFEPATH` set, so a `pip/` package or a module planted
+  at the root of the pull request is not what `python -m pip` or the driver
+  imports. The pipeline reads the checkout; the sandbox is pinned to
   `static-only`, so dynamic exploit reproduction is off and no PR-supplied code
   runs on the runner regardless of what the repository's own Mantis
-  configuration says.
+  configuration says. The workflow file is the exception, and is why the
+  environment's reviewers exist (Setup, GitHub).
 - **Nothing is written into the checkout.** The run's database, structural
   index, and scan log live in a fresh directory under `$RUNNER_TEMP` (or
   `--state-dir`), never under the repository, and the log is opened without
@@ -393,37 +429,49 @@ model credential. The design keeps those two facts apart:
   the gate treats as `direct`. Inside a hunk, a content line that reads
   `+++ b/other.py` is content; headers are recognized only between hunks.
 - **Credential rejection is an exit status, not a log string.** The pipeline
-  exits with a reserved status when the provider refuses the credentials; the
-  action keys on that alone. The log echoes file names and contents the pull
-  request author wrote, so no marker string in it is trusted.
+  exits with a reserved status when the provider refuses the credentials, and
+  decides that from the error's class or the provider's status code, never from
+  an error message, which a model can write. The action keys on the exit status
+  alone. The log echoes file names and contents the pull request author wrote,
+  so no marker string in it is trusted.
 - **No GitHub token.** The action never reads `github.token`. Annotations and
   the summary go through workflow commands and `GITHUB_STEP_SUMMARY`. With
   `permissions: contents: read` and `persist-credentials: false`, a compromised
   job cannot push, comment, approve, or reach other repositories. The pipeline
-  subprocess also does not inherit GitHub's own runtime tokens (`GITHUB_TOKEN`,
+  subprocess does not inherit GitHub's own runtime tokens (`GITHUB_TOKEN`,
   `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_*`); every other variable
   on the step passes through, since which provider credentials a run needs is
-  the consumer's choice of model.
+  the consumer's choice of model. The credential configuration the auth step
+  writes into the checkout -- which holds the URL and token for minting the
+  job's identity tokens -- is moved out of the tree before the scan, and the
+  pipeline never lists a `gha-creds-*.json` as a scan target. What the pipeline
+  holds is the provider credential itself, for the life of the job; it holds
+  nothing that reaches GitHub.
 - **Output is escaped at every sink.** Annotation properties and data follow
   GitHub's workflow-command escaping, so a finding title cannot start a second
   command. Every value in the step summary that originates from the pull request
   (file names) or from the model after reading it (titles, reasons, function
-  names) passes through the repository's markdown sanitizer: no raw HTML, no
-  links, no headings, no escaping out of a code span.
-- **Pinned code only.** The action's own code comes from the commit you pin, and
-  its Python dependencies install with `--require-hashes` from the pipeline's
-  lock file; nothing is upgraded from the index first. The only third-party
-  action it uses is `actions/setup-python`, pinned to a commit; the workflow
-  above pins `checkout` and `auth` the same way.
+  names) passes through the repository's markdown sanitizer and then has every
+  angle bracket and ampersand encoded: no HTML of any kind, no headings, no
+  escaping out of a code span. The JSON report is passed through the same
+  credential scrubber before it is written.
+- **Pinned code only, given the reviewers.** The action's own code comes from
+  the commit you pin, and its Python dependencies install with
+  `--require-hashes` from the pipeline's lock file; nothing is upgraded from the
+  index first. The only third-party action it uses is `actions/setup-python`,
+  pinned to a commit; the workflow above pins `checkout` and `auth` the same
+  way. None of that binds the workflow file, which a pull request can rewrite
+  and which GitHub runs as rewritten; the environment's required reviewers are
+  what keep a rewritten workflow from receiving the credential.
 - **No template injection.** Every input crosses into the shell through
   environment variables, never `${{ }}` interpolation inside `run:`. Revision
   arguments are validated as commit SHAs before they reach git, and every git
   call terminates option parsing explicitly.
 - **Bounded spend, in tokens, by the driver.** One token budget per run, shared
   out by the driver and charged from each scan's own account (or in full when
-  there is none), with an input cap on every request; a pull request can make a
-  run hit its budget, which is REVIEW with files named, and nothing more. See
-  Spend.
+  there is none), with an input cap on every request and the day's meter read
+  again before every file; a pull request can make a run hit its budget, which
+  is a coverage gap with files named, and nothing more. See Spend.
 
 What it does **not** defend against:
 
@@ -436,20 +484,19 @@ What it does **not** defend against:
   withholds from fork-triggered `pull_request` jobs by design. Keep the
   `head.repo.full_name == github.repository` condition; do not switch to
   `pull_request_target` to get credentials onto fork code.
-- **Credential blast radius.** A fully compromised job could spend the model
-  quota of the project it authenticates to, up to the run's token budget per
-  run. What limits it: a dedicated project, two read-and-call roles, a token
-  that lives about an hour (workload identity; the repository secrets hold only
-  names), the budget, and the platform-side stop. Treat it as a cost control,
-  not an access control.
+- **Credential blast radius.** A fully compromised job holds the project's model
+  credential for up to an hour. What limits it: a dedicated project that holds
+  nothing else, the narrowest role that can call the model and read the meter
+  (the setup script creates one; `roles/aiplatform.user` can also create
+  training jobs and endpoints the token meter never sees, so prefer the custom
+  role), a token that lives about an hour (workload identity; the repository
+  secrets hold only names), the budget, and the platform-side stop. Treat it as
+  a cost control, not an access control.
 
-If you run the action from the same repository with `uses: ./action`, the
-pinned-code guarantee does not hold: a pull request can edit `action/` and
-`reference/` and the job runs that version with the credential. This
-repository's own workflow does exactly that, so its job is bound to a deployment
-environment (`mantis-pr-scan`); add required reviewers to that environment in
-the repository settings so a person approves each run. Do the same, or pin to a
-commit, anywhere else you dogfood.
+If you run the action from the same repository with `uses: ./action`, the pull
+request also controls `action/` and `reference/`, so the reviewer has more to
+read before approving a run (Setup, GitHub). This repository's own workflow does
+exactly that. Pin to a commit anywhere else you dogfood.
 
 ## Local use
 

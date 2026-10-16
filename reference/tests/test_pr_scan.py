@@ -160,13 +160,39 @@ class DriverCase(unittest.TestCase):
 
 
 class TestChangeSet(DriverCase):
-    def test_covers_edits_and_additions_not_deletions(self):
-        changed, diff = pr_scan.pr_changes(self.repo, self.base)
+    def test_covers_edits_and_additions_and_reports_deletions(self):
+        changed, diff, moves = pr_scan.pr_changes(self.repo, self.base)
         self.assertEqual(changed["app.py"], [2])
         self.assertIn("new.py", changed)
         self.assertIn("README.md", changed)
-        self.assertNotIn("gone.py", changed)
+        self.assertNotIn("gone.py", changed, "nothing to scan in a deleted file")
+        self.assertEqual(moves, {"renamed": {}, "deleted": ["gone.py"]},
+                         "but the gate is told, so findings it knew there are not forgotten")
         self.assertIn("+++ b/app.py", diff)
+
+    def test_a_rename_is_reported_as_old_to_new(self):
+        (self.repo / "lib").mkdir()
+        _git(self.repo, "mv", "app.py", "lib/app_v2.py")
+        _git(self.repo, "commit", "-q", "-m", "move")
+        changed, _diff, moves = pr_scan.pr_changes(self.repo, self.base)
+        self.assertIn("lib/app_v2.py", changed)
+        self.assertNotIn("app.py", changed)
+        self.assertEqual(moves["renamed"], {"app.py": "lib/app_v2.py"})
+        self.assertEqual(moves["deleted"], ["gone.py"])
+
+    def test_a_type_change_is_a_change(self):
+        # A symlink on the base that becomes a regular file with content on
+        # the head is status T. It is scanned and gated like a modification.
+        (self.repo / "link.py").symlink_to("new.py")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "link")
+        base2 = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "link.py").unlink()
+        (self.repo / "link.py").write_text("import os\nos.system(input())\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "unlink")
+        changed, _diff, _moves = pr_scan.pr_changes(self.repo, base2)
+        self.assertIn("link.py", changed)
 
     def test_missing_or_unknown_base_is_infrastructure(self):
         with self.assertRaises(pr_scan.InfraError):
@@ -190,21 +216,21 @@ class TestChangeSet(DriverCase):
         # set (line-less), so it is scanned and gated fail-closed.
         self.commit_pr({".gitattributes": "evil.py -diff\n",
                         "evil.py": "import os\nos.system(input())\n"})
-        changed, diff = pr_scan.pr_changes(self.repo, self.base)
+        changed, diff, _ = pr_scan.pr_changes(self.repo, self.base)
         self.assertIn("evil.py", changed)
         self.assertEqual(changed["evil.py"], [])
         self.assertNotIn("+++ b/evil.py", diff)
 
     def test_binary_detection_cannot_hide_a_changed_file(self):
         self.commit_pr({"blob.py": "x = 1\n\x00\nimport os\n"})
-        changed, _ = pr_scan.pr_changes(self.repo, self.base)
+        changed, _, _ = pr_scan.pr_changes(self.repo, self.base)
         self.assertIn("blob.py", changed)
 
     def test_content_that_looks_like_a_diff_header_does_not_rename_the_section(self):
         # A new file whose first line is "++ b/README.md" appears in the diff
         # as "+++ b/README.md" inside the hunk. It is content, not a header.
         self.commit_pr({"evil.py": "++ b/README.md\nimport os\nos.system(input())\n"})
-        changed, diff = pr_scan.pr_changes(self.repo, self.base)
+        changed, diff, _ = pr_scan.pr_changes(self.repo, self.base)
         self.assertEqual(changed["evil.py"], [1, 2, 3])
         self.assertEqual(changed["README.md"], [1])  # README's own one-line change only
         kept = pr_scan.filter_diff(diff, {"evil.py", "app.py", "new.py"})
@@ -220,6 +246,10 @@ class TestIgnoreAndFilter(unittest.TestCase):
         self.assertTrue(pr_scan.is_ignored("img/logo.png", pats))
         self.assertFalse(pr_scan.is_ignored("src/app.py", pats))
         self.assertFalse(pr_scan.is_ignored("Dockerfile", pats))
+        # Dependency manifests and lockfiles are supply-chain changes: scanned.
+        for manifest in ("requirements.txt", "constraints.txt", "go.sum", "yarn.lock",
+                         "Cargo.lock", "Gemfile.lock", "CMakeLists.txt"):
+            self.assertFalse(pr_scan.is_ignored(manifest, pats), manifest)
 
     def test_explicit_patterns_replace_defaults(self):
         pats = pr_scan.parse_ignore("vendor/*, *.gen.go")
@@ -264,6 +294,24 @@ class TestPreflightAndCommand(unittest.TestCase):
         self.assertIsNone(self._preflight({}, "openai/glm-5.3", api_base="http://x/v1"))
         reason = self._preflight({}, "openai/glm-5.3")
         self.assertIn("OPENAI_API_KEY", reason)
+
+    def test_vertex_route_refuses_an_api_base_off_google(self):
+        # The Agent Platform route sends the job's Google credential as a
+        # bearer token to api_base. An api_base on another host would hand
+        # that credential to whoever runs it.
+        reason = self._preflight({"GOOGLE_CLOUD_PROJECT": "p"}, "vertex_ai/gemini-3.8-flash",
+                                 api_base="https://evil.example/v1")
+        self.assertIn("googleapis.com", reason)
+        self.assertIn("credential", reason)
+        self.assertIsNone(self._preflight({"GOOGLE_CLOUD_PROJECT": "p"}, "vertex_ai/gemini-3.8-flash",
+                                          api_base="https://us-central1-aiplatform.googleapis.com"))
+        self.assertIsNone(self._preflight({"GOOGLE_CLOUD_PROJECT": "p"}, "vertex_ai/gemini-3.8-flash",
+                                          api_base="https://aiplatform.googleapis.com/v1"))
+        # Look-alikes are not Google.
+        for host in ("https://googleapis.com.evil.example", "https://evilgoogleapis.com",
+                     "https://user@googleapis.com@evil.example/", "not a url"):
+            self.assertIsNotNone(self._preflight({"GOOGLE_CLOUD_PROJECT": "p"},
+                                                 "vertex_ai/gemini-3.8-flash", api_base=host), host)
 
     def test_vertex_route_needs_a_project(self):
         self.assertIsNone(self._preflight({"GOOGLE_CLOUD_PROJECT": "p"}, "vertex_ai/gemini-3.8-flash"))
@@ -394,15 +442,37 @@ class TestEndToEnd(DriverCase):
         self.assertEqual(rep["findings"][0]["relationship"], "unrelated_in_file")
         self.assertIn("::notice ", out)
 
-    def test_failed_scan_floors_review_and_fail_on_review_fails(self):
+    def test_failed_scan_is_a_coverage_gap_that_fails_only_when_asked(self):
         rc, out = self.run_main(scan=fake_scan(code=1))
         self.assertEqual(rc, pr_scan.EXIT_OK)
         rep = self.report()
-        self.assertEqual(rep["verdict"], "REVIEW")
+        self.assertEqual(rep["verdict"], "REVIEW", "a person should know")
+        self.assertEqual(rep["findings_verdict"], "PASS", "the findings said nothing")
+        self.assertEqual(rep["coverage"]["status"], "none")
         self.assertTrue(any("finished with errors" in r for r in rep["reasons"]), rep["reasons"])
         self.assertIn("title=Mantis%3A unscanned", out)
+        self.assertIn("fail-closed` is off", self.summary.read_text(encoding="utf-8"))
+        # fail-on judges findings only: a broken scanner does not fail the job.
         rc, _ = self.run_main("--fail-on", "review", scan=fake_scan(code=1))
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        rc, _ = self.run_main("--fail-on", "block", scan=fake_scan(code=1))
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        # fail-closed judges coverage, whatever fail-on says.
+        rc, _ = self.run_main("--fail-closed", scan=fake_scan(code=1))
         self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        self.assertTrue(self.report()["fail_closed"])
+        self.assertIn("fail-closed` is on", self.summary.read_text(encoding="utf-8"))
+
+    def test_a_real_review_finding_still_fails_under_fail_on_review(self):
+        low = {"title": "Weak hash", "severity": "LOW", "status": "confirmed",
+               "description": "md5", "filepath": "app.py", "line_numbers": [2], "cwe": "CWE-328"}
+        rc, _ = self.run_main("--fail-on", "review", scan=fake_scan(finding=low))
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        rep = self.report()
+        self.assertEqual(rep["findings_verdict"], "REVIEW")
+        self.assertEqual(rep["coverage"]["status"], "complete")
+        rc, _ = self.run_main("--fail-on", "block", scan=fake_scan(finding=low))
+        self.assertEqual(rc, pr_scan.EXIT_OK)
 
     def test_budget_pause_is_partial_coverage_not_a_failure(self):
         # The pipeline exits 2 when it hits a ceiling: findings so far are
@@ -415,6 +485,7 @@ class TestEndToEnd(DriverCase):
         rep = self.report()
         self.assertTrue(all(r["status"] == "paused_at_budget" for r in rep["scan"]["results"]))
         self.assertEqual(rep["verdict"], "REVIEW", rep["reasons"])
+        self.assertEqual(rep["coverage"]["status"], "none")
         self.assertTrue(any("LLM call ceiling" in r for r in rep["reasons"]), rep["reasons"])
         self.assertTrue(any("max-llm-calls" in a for a in rep["next_actions"]))
         self.assertNotIn("unscanned", out)
@@ -424,6 +495,9 @@ class TestEndToEnd(DriverCase):
         rep = self.report()
         self.assertTrue(any("run token budget" in r for r in rep["reasons"]), rep["reasons"])
         self.assertTrue(any("max-tokens" in a for a in rep["next_actions"]))
+        self.assertEqual(rc, pr_scan.EXIT_OK, "partial coverage is not a finding")
+        rc, _ = self.run_main("--fail-closed",
+                              scan=fake_scan(code=2, pause_trigger="token_budget"))
         self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
         # No account at all (the process died after deciding to pause): the
         # reason stays honest about not knowing which ceiling.
@@ -467,13 +541,18 @@ class TestEndToEnd(DriverCase):
                if k not in ("ANTHROPIC_API_KEY", "GOOGLE_CLOUD_PROJECT", "VERTEXAI_PROJECT")}
         with mock.patch("google.auth.default", side_effect=Exception("no ADC")):
             rc, out = self.run_main("--model", "anthropic/claude-opus-5", env=env)
-        self.assertEqual(rc, pr_scan.EXIT_INFRA)
-        self.assertIn("::error title=Mantis%3A cannot scan::", out)
+        self.assertEqual(rc, pr_scan.EXIT_OK, "fail-open: a setup failure does not fail the job")
+        self.assertIn("::warning title=Mantis%3A cannot scan::", out)
         self.assertIn("ANTHROPIC_API_KEY", out)
         self.assertFalse((self.repo / ".mantis").exists())
         self.assertFalse(self.state_root.exists())
         self.assertFalse(self.out_json.exists())
         self.assertIn("not run", self.summary.read_text(encoding="utf-8"))
+        self.assertIn("verdict=NOT_RUN", self.gh_out.read_text(encoding="utf-8"))
+        with mock.patch("google.auth.default", side_effect=Exception("no ADC")):
+            rc, out = self.run_main("--model", "anthropic/claude-opus-5", "--fail-closed", env=env)
+        self.assertEqual(rc, pr_scan.EXIT_INFRA, "fail-closed: red, for the owner to fix")
+        self.assertIn("::error title=Mantis%3A cannot scan::", out)
 
     def test_rejected_credentials_are_a_setup_failure_not_a_verdict(self):
         # The pipeline exits with its reserved status when the provider
@@ -481,7 +560,7 @@ class TestEndToEnd(DriverCase):
         # stops after the first file instead of burning the timeout N times.
         rejecting = lambda *a, **k: [sys.executable, "-c",
                                      f"import sys; sys.exit({pr_scan.EXIT_AUTH})"]
-        rc, out = self.run_main(scan=rejecting)
+        rc, out = self.run_main("--fail-closed", scan=rejecting)
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
         self.assertIn("rejected the credentials", out)
         self.assertFalse(self.out_json.exists())
@@ -536,7 +615,7 @@ class TestEndToEnd(DriverCase):
         self.assertTrue((Path(rep["state_dir"]) / "knowledge.db").stat().st_size > 100)
 
     def test_state_dir_inside_the_repository_is_refused(self):
-        rc, out = self.run_main("--state-dir", str(self.repo / "sub"), scan=fake_scan())
+        rc, out = self.run_main("--state-dir", str(self.repo / "sub"), "--fail-closed", scan=fake_scan())
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
         self.assertIn("outside the repository", out)
 
@@ -591,13 +670,162 @@ class TestEndToEnd(DriverCase):
                 "--summary", str(self.summary)]
         with contextlib.redirect_stdout(io.StringIO()):
             rc = pr_scan.main(argv, env=self.env)
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = pr_scan.main(argv + ["--fail-closed"], env=self.env)
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
 
     def test_launch_failure_everywhere_is_infrastructure(self):
         broken = lambda *a, **k: ["/nonexistent/mantis-pipeline"]
         rc, out = self.run_main(scan=broken)
-        self.assertEqual(rc, pr_scan.EXIT_INFRA)
+        self.assertEqual(rc, pr_scan.EXIT_OK)
         self.assertIn("failed to launch", out)
+        rc, out = self.run_main("--fail-closed", scan=broken)
+        self.assertEqual(rc, pr_scan.EXIT_INFRA)
+
+
+class TestKnownFindingsFollowFiles(DriverCase):
+    """A finding the database knows at a path is not lost when the path moves."""
+
+    def seed_known(self, rel, title="Command injection", severity="HIGH", line=2):
+        # A finding recorded by an earlier run (a different run id, as an
+        # imported one would be), at the path the base commit has.
+        from core.database import init_db, write_findings
+
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        self._seed = {"title": title, "description": "d", "severity": severity,
+                      "filepath": rel, "line_numbers": [line], "cwe": "CWE-78"}
+        self._seed_rel = rel
+
+    def run_with_seed(self, *extra, scan=None):
+        # The driver makes a fresh database per run, so the seed is written
+        # by the fake scan's first invocation into that database; the finding
+        # keeps the OLD path, as an imported finding would.
+        seed = dict(self._seed)
+        seed_db = []
+
+        def seeding(state, target, max_llm_calls, model):
+            if not seed_db:
+                from core.database import write_findings
+                write_findings(state.db_path, seed["filepath"], [seed], run_id="run-base", status="")
+                seed_db.append(state.db_path)
+            return (scan or fake_scan())(state, target, max_llm_calls, model)
+
+        return self.run_main(*extra, scan=seeding)
+
+    def test_a_rename_carries_the_finding_and_blocks(self):
+        (self.repo / "lib").mkdir()
+        _git(self.repo, "mv", "app.py", "lib/app_v2.py")
+        _git(self.repo, "commit", "-q", "-m", "move")
+        self.seed_known("app.py")
+        rc, out = self.run_with_seed("--fail-on", "block")
+        rep = self.report()
+        self.assertEqual(rep["findings_verdict"], "BLOCK", rep["reasons"])
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        self.assertTrue(any("renamed from app.py" in r for r in rep["reasons"]), rep["reasons"])
+        hit = next(f for f in rep["findings"] if f["title"] == "Command injection")
+        self.assertEqual(hit["filepath"], "lib/app_v2.py")
+        self.assertEqual(hit["renamed_from"], "app.py")
+        self.assertEqual(hit["relationship"], "direct")
+        self.assertEqual(rep["renamed"], {"app.py": "lib/app_v2.py"})
+
+    def test_a_deleted_file_with_a_finding_is_a_review(self):
+        # gone.py is deleted between base and head in the fixture.
+        self.seed_known("gone.py", title="Hardcoded secret", severity="HIGH")
+        rc, _ = self.run_with_seed("--fail-on", "review")
+        rep = self.report()
+        self.assertEqual(rep["findings_verdict"], "REVIEW", rep["reasons"])
+        self.assertTrue(any("gone.py" in r and "deletes" in r for r in rep["reasons"]), rep["reasons"])
+        self.assertEqual(rep["deleted"], ["gone.py"])
+        self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
+        rc, _ = self.run_with_seed("--fail-on", "block")
+        self.assertEqual(rc, pr_scan.EXIT_OK, "a deletion is a question, not a BLOCK")
+
+    def test_an_unrelated_rename_is_not_blamed(self):
+        (self.repo / "lib").mkdir()
+        _git(self.repo, "mv", "new.py", "lib/other.py")
+        _git(self.repo, "commit", "-q", "-m", "move")
+        self.seed_known("app.py")  # app.py is modified, not renamed: direct on its own
+        rc, _ = self.run_with_seed()
+        rep = self.report()
+        hit = next(f for f in rep["findings"] if f["title"] == "Command injection")
+        self.assertEqual(hit["filepath"], "app.py")
+        self.assertNotIn("renamed_from", hit)
+
+
+class TestOutputHygiene(DriverCase):
+    def test_html_in_a_title_is_encoded_in_the_summary(self):
+        finding = {"title": "<h1>PASS</h1><a href=\"https://evil\">x</a> & <details>",
+                   "description": "d", "severity": "HIGH", "filepath": "app.py",
+                   "line_numbers": [2]}
+        self.run_main(scan=fake_scan(finding))
+        text = self.summary.read_text(encoding="utf-8")
+        self.assertNotIn("<h1>", text)
+        self.assertNotIn("<a href", text)
+        self.assertNotIn("<details>", text)
+        self.assertIn("&lt;h1&gt;", text)
+        self.assertIn("&amp;", text)
+        # The JSON report went through the egress scrubber too.
+        rep = self.report()
+        self.assertIsInstance(rep["findings"][0]["title"], str)
+
+    def test_the_credentials_file_is_never_a_scan_target(self):
+        # google-github-actions/auth drops gha-creds-<random>.json into the
+        # checkout, untracked. The driver's file selection is the diff, so it
+        # never sees it; the pipeline's own discovery must not either.
+        import main as pipeline_main
+
+        (self.repo / "gha-creds-abc123.json").write_text('{"type": "external_account"}', encoding="utf-8")
+        found = pipeline_main.discover_files(self.repo)
+        self.assertFalse(any(f.endswith("gha-creds-abc123.json") for f in found), found)
+        self.assertTrue(any(f.endswith("app.py") for f in found))
+
+
+class TestActionDefinition(unittest.TestCase):
+    """What action.yml must do before the driver gets a say."""
+
+    def setUp(self):
+        self.text = (pr_scan._REF_ROOT.parent / "action" / "action.yml").read_text(encoding="utf-8")
+
+    def test_steps_run_from_the_action_directory_with_a_safe_path(self):
+        # A composite step's default cwd is the pull-request checkout, and
+        # `python -m` puts the cwd first on sys.path: a pip/__init__.py in
+        # the pull request would be what `python -m pip` imports.
+        import yaml
+
+        spec = yaml.safe_load(self.text)
+        steps = [st for st in spec["runs"]["steps"] if "run" in st]
+        self.assertGreaterEqual(len(steps), 3)
+        for st in steps:
+            self.assertEqual(st.get("working-directory"), "${{ github.action_path }}", st.get("name"))
+        install = next(st for st in steps if "pip install" in st["run"])
+        self.assertEqual(install["env"]["PYTHONSAFEPATH"], "1")
+        self.assertIn("python -P -m pip", install["run"])
+        self.assertIn("--require-hashes", install["run"])
+        scan = next(st for st in steps if "pr_scan.py" in st["run"])
+        self.assertEqual(scan["env"]["PYTHONSAFEPATH"], "1")
+        self.assertEqual(scan["env"]["LITELLM_MODE"], "PRODUCTION")
+
+    def test_the_credentials_file_is_moved_out_of_the_checkout_before_the_scan(self):
+        import yaml
+
+        spec = yaml.safe_load(self.text)
+        names = [st.get("name") for st in spec["runs"]["steps"]]
+        move = names.index("Move the credential out of the checkout")
+        scan = names.index("Scan the pull request")
+        self.assertLess(move, scan)
+        body = spec["runs"]["steps"][move]["run"]
+        for needle in ("$GITHUB_WORKSPACE", "$RUNNER_TEMP", "GOOGLE_APPLICATION_CREDENTIALS=",
+                       "GOOGLE_GHA_CREDS_PATH=", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=", "rm -f"):
+            self.assertIn(needle, body, needle)
+
+    def test_fail_closed_is_an_input_defaulting_off(self):
+        import yaml
+
+        spec = yaml.safe_load(self.text)
+        self.assertEqual(spec["inputs"]["fail-closed"]["default"], "false")
+        self.assertIn("--fail-closed", self.text)
+        self.assertIn("MANTIS_ACTION_FAIL_CLOSED", self.text)
 
 
 class TestSpendArithmetic(unittest.TestCase):
@@ -647,7 +875,8 @@ class TestSpendArithmetic(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--spend-report") + 1], "/tmp/x.json")
         cmd = pr_scan.scan_command(state, "a.py", 7, "m", max_tokens=0)
         self.assertNotIn("--max-tokens", cmd)
-        self.assertNotIn("--cache-discount", cmd)
+        self.assertEqual(cmd[cmd.index("--cache-discount") + 1], "1",
+                         "no run budget still means every token at full price")
 
 
 class TestRunBudget(DriverCase):
@@ -698,6 +927,8 @@ class TestRunBudget(DriverCase):
         self.assertEqual(probe.read_text().count("\n"), 1, "new.py must not be launched")
         rep = self.report()
         self.assertEqual(rep["verdict"], "REVIEW")
+        self.assertEqual(rep["coverage"]["status"], "partial")
+        self.assertEqual([u["file"] for u in rep["coverage"]["unaudited"]], ["new.py"])
         self.assertTrue(any("run token budget was spent" in r and "new.py" in r
                             for r in rep["reasons"]), rep["reasons"])
         self.assertTrue(any("max-tokens" in a for a in rep["next_actions"]))
@@ -708,6 +939,8 @@ class TestRunBudget(DriverCase):
                       self.summary.read_text(encoding="utf-8"))
         self.assertEqual(rc, pr_scan.EXIT_OK)
         rc, _ = self.run_main("--fail-on", "review", "--max-tokens", str(2 * floor), scan=inner)
+        self.assertEqual(rc, pr_scan.EXIT_OK, "an unscanned file is coverage, not a finding")
+        rc, _ = self.run_main("--fail-closed", "--max-tokens", str(2 * floor), scan=inner)
         self.assertEqual(rc, pr_scan.EXIT_FAILED_GATE)
 
     def test_a_scan_that_leaves_no_account_is_charged_its_whole_share(self):
@@ -787,10 +1020,10 @@ class TestRunBudget(DriverCase):
         self.assertNotIn("MANTIS_MAX_INPUT_TOKENS", seen["env"])
 
     def test_bad_budget_values_are_setup_errors(self):
-        rc, out = self.run_main("--max-tokens", "lots", scan=fake_scan())
+        rc, out = self.run_main("--max-tokens", "lots", "--fail-closed", scan=fake_scan())
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
         self.assertIn("max-tokens", out)
-        rc, _ = self.run_main("--max-input-tokens", "-1", scan=fake_scan())
+        rc, _ = self.run_main("--max-input-tokens", "-1", "--fail-closed", scan=fake_scan())
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
 
     def test_defaults_are_the_documented_ones(self):
@@ -888,6 +1121,29 @@ class TestDailyBudgetInTheRun(DriverCase):
     def with_meter(self, used):
         return mock.patch.object(pr_scan, "tokens_served_today", lambda env, **kw: used)
 
+    def test_the_meter_is_read_again_before_each_file(self):
+        # Two runs start inside the meter's lag and both see the day nearly
+        # unspent. Here the meter jumps after the first file (a sibling run's
+        # spend became visible): the second file is not launched.
+        readings = iter([1_000_000, 99_950_000, 99_950_000])
+        probe = Path(self.tmp) / "launched.txt"
+
+        def counting(state, target, max_llm_calls, model):
+            with open(probe, "a") as fh:
+                fh.write(target + "\n")
+            return fake_scan(tokens=10_000)(state, target, max_llm_calls, model)
+
+        with mock.patch.object(pr_scan, "tokens_served_today", lambda env, **kw: next(readings)):
+            rc, _ = self.run_main("--max-tokens", "4M", scan=counting,
+                                  daily=("--daily-token-budget", "100M"))
+        rep = self.report()
+        res = {r["file"]: r for r in rep["scan"]["results"]}
+        self.assertEqual(res["app.py"]["status"], "done")
+        self.assertEqual(res["new.py"]["status"], "over_budget", res)
+        self.assertEqual(probe.read_text().count("\n"), 1)
+        self.assertEqual(rep["coverage"]["status"], "partial")
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+
     def test_a_spent_day_launches_nothing_and_floors_review(self):
         probe = Path(self.tmp) / "launched.txt"
 
@@ -937,9 +1193,14 @@ class TestDailyBudgetInTheRun(DriverCase):
             raise pr_scan.DailyMeterUnavailable("grant roles/monitoring.viewer")
 
         with mock.patch.object(pr_scan, "tokens_served_today", refuse):
-            rc, out = self.run_main(scan=fake_scan(), daily=("--daily-token-budget", "100M"))
+            rc, out = self.run_main("--fail-closed", scan=fake_scan(),
+                                    daily=("--daily-token-budget", "100M"))
         self.assertEqual(rc, pr_scan.EXIT_INFRA)
         self.assertIn("roles/monitoring.viewer", out)
+        self.assertFalse(self.out_json.exists())
+        with mock.patch.object(pr_scan, "tokens_served_today", refuse):
+            rc, out = self.run_main(scan=fake_scan(), daily=("--daily-token-budget", "100M"))
+        self.assertEqual(rc, pr_scan.EXIT_OK, "fail-open by default")
         self.assertFalse(self.out_json.exists())
         # Disabled explicitly: the meter is never consulted.
         with mock.patch.object(pr_scan, "tokens_served_today", refuse):

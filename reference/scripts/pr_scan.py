@@ -53,7 +53,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _REF_ROOT = Path(__file__).resolve().parent.parent
 if str(_REF_ROOT) not in sys.path:
@@ -78,6 +78,17 @@ EXIT_INFRA = 3
 
 FAIL_ON_CHOICES = ("none", "block", "review")
 
+# Two independent policies decide the job's exit status. `fail-on` is about
+# what the FINDINGS say: none (advisory), block, or review. `fail-closed` is
+# about whether Mantis could LOOK: when it is off (the default) a setup
+# failure, a model outage, a file the run could not scan, or a crash in this
+# code never fails the job -- the summary says what was not audited and the
+# verdict carries REVIEW, but a broken scanner does not stop a merge. When it
+# is on, a job is green only if every changed file was audited in full.
+COVERAGE_COMPLETE = "complete"
+COVERAGE_PARTIAL = "partial"
+COVERAGE_NONE = "none"
+
 # GitHub renders at most this many annotations per level per step; the
 # rest are only in the summary, which says so.
 MAX_ANNOTATIONS_PER_LEVEL = 10
@@ -86,8 +97,12 @@ MAX_ANNOTATIONS_PER_LEVEL = 10
 # Ignored files leave both the scan list and the gate's diff, so a
 # docs-only pull request is a PASS rather than a "never scanned" REVIEW.
 # Consumers replace the list with --ignore; an empty value ignores nothing.
+# Prose and binary assets only. Dependency manifests and lockfiles are NOT
+# here: a change to requirements.txt, go.sum or yarn.lock is a supply-chain
+# change, which is exactly what a reviewer wants looked at, and `*.txt`
+# would also have swallowed CMakeLists.txt.
 DEFAULT_IGNORE = (
-    "*.md", "*.rst", "*.txt", "*.lock", "*.sum",
+    "*.md", "*.rst",
     "*.svg", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf",
     "*.woff", "*.woff2", "*.ttf", "*.eot",
 )
@@ -241,9 +256,10 @@ def _commit_present(repo: Path, rev: str) -> bool:
                 f"{rev}^{{commit}}", check=False).returncode == 0
 
 
-def pr_changes(repo: Path, base: str, head: str = "HEAD") -> Tuple[Dict[str, List[int]], str]:
+def pr_changes(repo: Path, base: str, head: str = "HEAD") -> Tuple[Dict[str, List[int]], str, Dict[str, Any]]:
     """What the PR changes: {repo-relative path: new-side changed lines},
-    plus the unified diff text for the gate.
+    the unified diff text for the gate, and the paths the change moved or
+    removed: {"renamed": {old: new}, "deleted": [old, ...]}.
 
     Two git views are combined on purpose. `--name-status -z` is the
     authority on WHICH files changed: it does not depend on how git chose
@@ -254,11 +270,18 @@ def pr_changes(repo: Path, base: str, head: str = "HEAD") -> Tuple[Dict[str, Lis
     no parsable hunk keeps an empty line list, which the gate treats as
     fail-closed (any finding in it is `direct`).
 
+    Renames and deletions are reported rather than dropped. A finding the
+    repository already knows about lives at a path; a change that moves or
+    removes that path would otherwise take the finding out of the gate's
+    sight, and renaming a file is cheaper than fixing it. The gate carries
+    known findings across a rename and asks for a look when their file is
+    deleted.
+
     On a pull_request event the checkout is GitHub's merge commit, so the
     two-dot diff against the base tip is exactly the PR's effect on the
     branch it targets. A shallow checkout may lack the base commit; one
     depth-1 fetch of that commit is enough, since a diff needs the two
-    trees and no history. Deleted files are left out: nothing to scan.
+    trees and no history.
     """
     base = str(base or "").strip()
     head = str(head or "HEAD").strip()
@@ -278,35 +301,41 @@ def pr_changes(repo: Path, base: str, head: str = "HEAD") -> Tuple[Dict[str, Lis
     if not _commit_present(repo, head):
         raise InfraError(f"Head revision '{head}' is not in the checkout.")
 
-    common = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
-              "--diff-filter=ACMR"]
-    names = _git(repo, "diff", *common, "--name-status", "-z", "--end-of-options",
-                 base, head, check=False, text=False)
+    common = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames"]
+    names = _git(repo, "diff", *common, "--diff-filter=ACDMRT", "--name-status", "-z",
+                 "--end-of-options", base, head, check=False, text=False)
     if names.returncode != 0:
         raise InfraError(f"git diff --name-status failed: "
                          f"{names.stderr.decode('utf-8', 'replace').strip()}")
     changed: Dict[str, List[int]] = {}
+    renamed: Dict[str, str] = {}
+    deleted: List[str] = []
     fields = [f.decode("utf-8", "replace") for f in names.stdout.split(b"\0") if f]
     i = 0
     while i < len(fields):
         status = fields[i]
         if status[:1] in ("R", "C") and i + 2 < len(fields):
             changed.setdefault(fields[i + 2], [])  # the NEW path of a rename/copy
+            if status[:1] == "R":
+                renamed[fields[i + 1]] = fields[i + 2]
             i += 3
         elif i + 1 < len(fields):
-            changed.setdefault(fields[i + 1], [])
+            if status[:1] == "D":
+                deleted.append(fields[i + 1])
+            else:
+                changed.setdefault(fields[i + 1], [])
             i += 2
         else:
             break
 
-    hunks = _git(repo, "diff", *common, "--unified=0", "--end-of-options",
-                 base, head, check=False)
+    hunks = _git(repo, "diff", *common, "--diff-filter=ACMRT", "--unified=0",
+                 "--end-of-options", base, head, check=False)
     if hunks.returncode != 0:
         raise InfraError(f"git diff failed: {hunks.stderr.strip()}")
     for path, lines in parse_unified_diff(hunks.stdout).items():
         if path in changed:
             changed[path] = lines
-    return changed, hunks.stdout
+    return changed, hunks.stdout, {"renamed": renamed, "deleted": deleted}
 
 
 def fresh_state_dir(repo: Path, requested: str = "") -> Path:
@@ -340,8 +369,6 @@ def credential_preflight(env: Optional[Dict[str, str]] = None, api_base: str = "
     check. Anything this cannot classify passes through; the pipeline's own
     authentication error is the backstop and is reported as a setup failure.
     """
-    if api_base:
-        return None
     env = os.environ if env is None else env
     try:
         from core.config import DEFAULT_MODEL, normalize_model_id
@@ -349,6 +376,17 @@ def credential_preflight(env: Optional[Dict[str, str]] = None, api_base: str = "
         return None
     with _scoped_environ(env):
         resolved = normalize_model_id(model or DEFAULT_MODEL)
+        if api_base:
+            # The Agent Platform route authenticates with the job's workload
+            # identity credential, and litellm sends that bearer token to
+            # whatever api_base names. An api_base off Google's domain with
+            # a vertex_ai/ model is a credential sent to a third party; an
+            # OpenAI-compatible gateway is the openai/ route.
+            if resolved.startswith("vertex_ai/") and not _google_host(api_base):
+                return (f"api-base '{api_base}' is not a *.googleapis.com host, and model "
+                        f"'{resolved}' authenticates with the job's Google Cloud credential, "
+                        "which would be sent there. Use an openai/ model id for a gateway.")
+            return None
         if resolved.startswith("vertex_ai/"):
             if any(env.get(v) for v in ("VERTEXAI_PROJECT", "GOOGLE_CLOUD_PROJECT")):
                 return None
@@ -375,6 +413,16 @@ def credential_preflight(env: Optional[Dict[str, str]] = None, api_base: str = "
             return None
         return (f"Missing credentials for '{resolved}': set "
                 + ", ".join(missing) + " on the step.")
+
+
+def _google_host(api_base: str) -> bool:
+    try:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(str(api_base)).hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(host) and (host == "googleapis.com" or host.endswith(".googleapis.com"))
 
 
 class _scoped_environ:
@@ -490,15 +538,15 @@ def tokens_served_today(env: Dict[str, str], now: Optional[float] = None,
         resp = session.get(url, params=params, timeout=30)
     except Exception as exc:
         raise DailyMeterUnavailable(
-            f"could not reach Cloud Monitoring for project '{project}': {exc}") from exc
+            f"could not reach Cloud Monitoring for the configured project: {exc}") from exc
     if resp.status_code == 403:
         raise DailyMeterUnavailable(
-            f"Cloud Monitoring refused the read for project '{project}' (HTTP 403): grant "
+            f"Cloud Monitoring refused the read for the configured project (HTTP 403): grant "
             "the service account roles/monitoring.viewer and enable "
             "monitoring.googleapis.com, or set daily-token-budget to 0.")
     if resp.status_code != 200:
         raise DailyMeterUnavailable(
-            f"Cloud Monitoring returned HTTP {resp.status_code} for project '{project}'.")
+            f"Cloud Monitoring returned HTTP {resp.status_code} for the configured project.")
     try:
         body = resp.json()
     except ValueError as exc:
@@ -546,11 +594,13 @@ def scan_command(state: MantisState, rel_fp: str, max_llm_calls: int,
     cmd += ["--sandbox", "static-only"]
     if api_base:
         cmd += ["--api-base", api_base]
+    # Every token at full price, run budget or not: a ceiling on discounted
+    # tokens would bound the bill only if every token were served from cache
+    # at the discount assumed, and with no run budget the pipeline's own
+    # ceiling still applies and must mean raw tokens too.
+    cmd += ["--cache-discount", "1"]
     if max_tokens > 0:
-        # This file's share of the run budget, counted at full price: a
-        # ceiling on discounted tokens would bound the bill only if every
-        # token were served from cache at the discount assumed.
-        cmd += ["--max-tokens", str(max_tokens), "--cache-discount", "1"]
+        cmd += ["--max-tokens", str(max_tokens)]  # this file's share of the run budget
     if spend_report:
         cmd += ["--spend-report", spend_report]
     return cmd
@@ -629,7 +679,9 @@ def _open_log(log_path: Path):
 def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: str,
               api_base: str, per_file_timeout: float, log_path: Path,
               env: Optional[Dict[str, str]] = None, max_tokens: int = 0,
-              max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS) -> List[Dict[str, Any]]:
+              max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+              daily: Optional[Dict[str, Any]] = None,
+              meter: Optional[Callable[[Dict[str, str]], int]] = None) -> List[Dict[str, Any]]:
     """Runs the pipeline over each file in turn, then restores the
     repo-rooted index (the pipeline re-roots the shared catalog at the one
     file it scanned, which would blind the gate's blast radius).
@@ -646,8 +698,19 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     status the pipeline reserves for it, not from anything in the log --
     ends the loop: every later file would fail the same way, and the caller
     reports a setup failure rather than N failed scans.
+
+    With a daily budget in force the platform's meter is read again before
+    each file, not only once at the start. The meter lags by minutes, so
+    runs that start inside that window all see the same reading; re-reading
+    bounds what N runs in flight can overspend to about one file's share
+    each after the lag, instead of a whole run budget each. This run's own
+    spend is not yet in the meter, so the floor is what the meter showed at
+    the start plus what this run has charged since.
     """
     results: List[Dict[str, Any]] = []
+    daily_budget = int(daily["budget"]) if daily else 0
+    used_start = int(daily.get("used_before_run") or 0) if daily else 0
+    read_meter = meter or tokens_served_today
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_env = subprocess_env(dict(os.environ if env is None else env))
     if max_input_tokens > 0:
@@ -659,10 +722,23 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     spent = 0
     with _open_log(log_path) as log:
         for i, rel_fp in enumerate(rels):
-            granted = allowance(max_tokens, spent, len(rels) - i)
-            if max_tokens > 0 and granted < MIN_SCAN_ALLOWANCE:
+            budget_now = max_tokens
+            if daily_budget > 0 and i > 0:
+                try:
+                    used_now = int(read_meter(dict(os.environ if env is None else env)))
+                except DailyMeterUnavailable as exc:
+                    # Readable at the start, not now: keep the run's own
+                    # budget, which already fit under the day's when it was
+                    # set, and say so in the log.
+                    log.write(f"[pr_scan] daily meter unreadable mid-run ({exc}); "
+                              f"holding to the run budget\n".encode())
+                else:
+                    day_left = max(0, daily_budget - max(used_now, used_start + spent))
+                    budget_now = min(max_tokens, spent + day_left) if max_tokens > 0 else spent + day_left
+            granted = allowance(budget_now, spent, len(rels) - i)
+            if budget_now > 0 and granted < MIN_SCAN_ALLOWANCE:
                 log.write(f"\n=== mantis scan {rel_fp}: not launched, {granted} of "
-                          f"{max_tokens} run tokens left ===\n".encode())
+                          f"{budget_now} run tokens left ===\n".encode())
                 results.append({"file": rel_fp, "returncode": None,
                                 "status": SCAN_OVER_BUDGET, "seconds": 0.0,
                                 "tokens": 0, "llm_calls": 0, "granted": granted,
@@ -714,9 +790,11 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
 # --- The verdict ---------------------------------------------------------------------
 
 
-def _floor_review(report: Dict[str, Any], reason: str, action: str) -> None:
-    if report["verdict"] == VERDICT_PASS:
-        report["verdict"] = VERDICT_REVIEW
+def _gap(report: Dict[str, Any], file: str, reason: str, action: str) -> None:
+    """A changed file this run did not fully audit. Recorded as coverage,
+    shown as a REVIEW reason, and left to exit_code_for -- not fail-on -- to
+    decide whether it fails the job."""
+    report["coverage"]["unaudited"].append({"file": file, "reason": reason, "action": action})
     report["reasons"].append(reason)
     if action not in report["next_actions"]:
         report["next_actions"].append(action)
@@ -725,23 +803,45 @@ def _floor_review(report: Dict[str, Any], reason: str, action: str) -> None:
 def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
                  scan_results: List[Dict[str, Any]], skipped: List[str],
                  log_path: Path, fail_on: str, max_tokens: int = 0,
-                 daily: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """check_change over the change set, floored by what this run failed to cover.
+                 daily: Optional[Dict[str, Any]] = None,
+                 moves: Optional[Dict[str, Any]] = None,
+                 fail_closed: bool = False) -> Dict[str, Any]:
+    """check_change over the change set, plus what this run failed to cover.
 
     The gate gets both views: the diff text for changed lines, and the
     authoritative file list so a file git rendered without hunks is still
     gated (with no line information, which the gate treats as `direct`).
+    It also gets the renames and deletions, so a known finding follows its
+    file.
+
+    Two verdicts come out. `findings_verdict` is what the findings say,
+    nothing else. `verdict`, the one shown, is that floored to REVIEW when
+    any changed file was not fully audited, because a person should know.
+    Which of the two fails the job is `fail-on` and `fail-closed`'s business
+    (exit_code_for).
     """
-    report = check_change(state, files=list(changed), diff=diff)
+    moves = moves or {}
+    report = check_change(state, files=list(changed), diff=diff,
+                          renamed=moves.get("renamed"), deleted=moves.get("deleted"),
+                          include_coverage=False)
     report.setdefault("reasons", [])
     report.setdefault("next_actions", [])
+    report["findings_verdict"] = report["verdict"]
+    report["coverage"] = {"status": COVERAGE_COMPLETE, "unaudited": []}
     over_budget = [r["file"] for r in scan_results if r["status"] == SCAN_OVER_BUDGET]
+    # The gate reports a file with no coverage row as "never scanned". For a
+    # file this run tried and could not finish, the scan result says why,
+    # which is the better reason; the gate's is kept for everything else.
+    accounted = {r["file"] for r in scan_results if r["status"] != SCAN_DONE} | set(skipped)
+    for g in report.pop("coverage_gaps", None) or []:
+        if g.get("file") and g["file"] in accounted:
+            continue
+        _gap(report, g.get("file") or "", g["reason"], g.get("action") or "")
     for r in scan_results:
         if r["status"] in (SCAN_FAILED, SCAN_TIMED_OUT):
-            _floor_review(
-                report,
-                f"Scan of '{r['file']}' {r['status'].replace('_', ' ')}: its content is unaudited.",
-                "Check the scan log and re-run the workflow.")
+            _gap(report, r["file"],
+                 f"Scan of '{r['file']}' {r['status'].replace('_', ' ')}: its content is unaudited.",
+                 "Check the scan log and re-run the workflow.")
         elif r["status"] == SCAN_PAUSED:
             # The pipeline stops cleanly at a ceiling with whatever it found
             # so far stored, but it records no coverage for a cut-off
@@ -753,30 +853,39 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
                 what, fix = "its LLM call ceiling", "Raise max-llm-calls to let the scan finish."
             else:
                 what, fix = "a pipeline ceiling", "Check the scan log; raise max-tokens or max-llm-calls to let the scan finish."
-            _floor_review(
-                report,
-                f"Scan of '{r['file']}' paused at {what} before finishing: coverage is partial.",
-                fix)
+            _gap(report, r["file"],
+                 f"Scan of '{r['file']}' paused at {what} before finishing: coverage is partial.",
+                 fix)
     if over_budget:
         if daily and daily["run_budget"] < MIN_SCAN_ALLOWANCE:
-            _floor_review(
-                report,
-                f"The project's daily token budget is spent ({int(daily['used_before_run'] or 0):,} "
-                f"of {int(daily['budget']):,} tokens served in the last 24 hours), so "
-                f"{len(over_budget)} changed file(s) were not scanned: " + ", ".join(over_budget) + ".",
-                "Wait for the window to pass, or raise daily-token-budget.")
+            reason = (f"The project's daily token budget is spent ({int(daily['used_before_run'] or 0):,} "
+                      f"of {int(daily['budget']):,} tokens served in the last 24 hours), so "
+                      f"{len(over_budget)} changed file(s) were not scanned: " + ", ".join(over_budget) + ".")
+            action = "Wait for the window to pass, or raise daily-token-budget."
         else:
-            _floor_review(
-                report,
-                f"{len(over_budget)} changed file(s) were not scanned because the run token "
-                f"budget was spent: " + ", ".join(over_budget) + ".",
-                "Raise max-tokens or split the pull request.")
+            reason = (f"{len(over_budget)} changed file(s) were not scanned because the run token "
+                      f"budget was spent: " + ", ".join(over_budget) + ".")
+            action = "Raise max-tokens or split the pull request."
+        for f in over_budget:
+            report["coverage"]["unaudited"].append({"file": f, "reason": reason, "action": action})
+        report["reasons"].append(reason)
+        if action not in report["next_actions"]:
+            report["next_actions"].append(action)
     if skipped:
-        _floor_review(
-            report,
-            f"{len(skipped)} changed file(s) over the max-files cap were not scanned: "
-            + ", ".join(skipped) + ".",
-            "Raise max-files or split the pull request.")
+        reason = (f"{len(skipped)} changed file(s) over the max-files cap were not scanned: "
+                  + ", ".join(skipped) + ".")
+        action = "Raise max-files or split the pull request."
+        for f in skipped:
+            report["coverage"]["unaudited"].append({"file": f, "reason": reason, "action": action})
+        report["reasons"].append(reason)
+        if action not in report["next_actions"]:
+            report["next_actions"].append(action)
+    unaudited = report["coverage"]["unaudited"]
+    if unaudited:
+        audited_files = {r["file"] for r in scan_results if r["status"] == SCAN_DONE}
+        report["coverage"]["status"] = COVERAGE_PARTIAL if audited_files else COVERAGE_NONE
+        if report["verdict"] == VERDICT_PASS:
+            report["verdict"] = VERDICT_REVIEW
     report["scan"] = {
         "files": [r["file"] for r in scan_results],
         "results": scan_results,
@@ -786,7 +895,10 @@ def build_report(state: MantisState, diff: str, changed: Dict[str, List[int]],
     }
     report["usage"] = usage_summary(scan_results, max_tokens, daily)
     report["fail_on"] = fail_on
-    report["exit_code"] = exit_code_for(report["verdict"], fail_on)
+    report["fail_closed"] = bool(fail_closed)
+    report["exit_code"] = exit_code_for(report["findings_verdict"], fail_on,
+                                        fail_closed=fail_closed,
+                                        coverage=report["coverage"]["status"])
     return report
 
 
@@ -825,11 +937,23 @@ def usage_summary(scan_results: List[Dict[str, Any]], max_tokens: int,
     return out
 
 
-def exit_code_for(verdict: str, fail_on: str) -> int:
-    if fail_on == "block":
-        return EXIT_FAILED_GATE if verdict == VERDICT_BLOCK else EXIT_OK
-    if fail_on == "review":
-        return EXIT_FAILED_GATE if verdict in (VERDICT_REVIEW, VERDICT_BLOCK) else EXIT_OK
+def exit_code_for(findings_verdict: str, fail_on: str, fail_closed: bool = False,
+                  coverage: str = COVERAGE_COMPLETE) -> int:
+    """The job's exit status from the two policies.
+
+    `fail_on` judges the findings: a BLOCK (or, under `review`, a REVIEW)
+    that the findings themselves produced fails the job. `fail_closed`
+    judges coverage: when on, anything short of every changed file audited
+    in full fails the job too; when off, it does not, whatever the findings
+    policy -- a scanner that could not look must not be the reason a merge
+    stops, unless its owner asked for exactly that.
+    """
+    if fail_on == "block" and findings_verdict == VERDICT_BLOCK:
+        return EXIT_FAILED_GATE
+    if fail_on == "review" and findings_verdict in (VERDICT_REVIEW, VERDICT_BLOCK):
+        return EXIT_FAILED_GATE
+    if fail_closed and coverage != COVERAGE_COMPLETE:
+        return EXIT_FAILED_GATE
     return EXIT_OK
 
 
@@ -935,16 +1059,35 @@ def _md(value: Any) -> str:
     """
     from core.llm_gateway import safe_markdown_span
 
-    return safe_markdown_span(str(value if value is not None else "")).replace("|", "\\|")
+    text = safe_markdown_span(str(value if value is not None else ""))
+    # The repository sanitizer neutralizes the tags that execute or load;
+    # the summary also must not let a title open a heading, a link or a
+    # collapsed block, so every angle bracket and ampersand is encoded.
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("|", "\\|")
 
 
 def render_summary(report: Dict[str, Any]) -> str:
     verdict = report.get("verdict")
     icon = {VERDICT_PASS: "✅", VERDICT_REVIEW: "⚠️", VERDICT_BLOCK: "⛔"}.get(verdict, "")
     lines = [f"## {icon} Mantis PR scan: {verdict}", ""]
+    coverage = report.get("coverage") or {}
     if report.get("fail_on") == "none":
         lines.append("Advisory run: the verdict does not fail the job "
                      "(set `fail-on: block` or `review` to change that).")
+        lines.append("")
+    if coverage.get("status") in (COVERAGE_PARTIAL, COVERAGE_NONE):
+        n = len(coverage.get("unaudited") or [])
+        what = "No changed file" if coverage["status"] == COVERAGE_NONE else f"{n} changed file(s)"
+        if report.get("fail_closed"):
+            lines.append(f"**Coverage {coverage['status']}:** {what} "
+                         f"{'was' if coverage['status'] == COVERAGE_NONE else 'were'} not fully "
+                         "audited, and `fail-closed` is on, so the job fails.")
+        else:
+            lines.append(f"**Coverage {coverage['status']}:** {what} "
+                         f"{'was' if coverage['status'] == COVERAGE_NONE else 'were'} not fully "
+                         "audited. The job does not fail for that (`fail-closed` is off); "
+                         "the verdict is REVIEW so a person knows.")
         lines.append("")
     findings = report.get("findings") or []
     if findings:
@@ -1073,7 +1216,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--per-file-timeout", type=float, default=1800.0,
                    help="Seconds before one file's scan is abandoned (0 = none)")
     p.add_argument("--fail-on", choices=FAIL_ON_CHOICES, default="none",
-                   help="none: advisory; block: fail on BLOCK; review: fail on REVIEW or BLOCK")
+                   help="What the findings do to the job. none: advisory; block: fail on "
+                        "BLOCK; review: fail on REVIEW or BLOCK")
+    p.add_argument("--fail-closed", action="store_true",
+                   help="Fail the job when Mantis could not look: a setup failure, a model "
+                        "outage, a changed file not fully scanned, a crash. Off by default, "
+                        "so a broken scanner never stops a merge; on, a green check means "
+                        "every changed file was audited.")
     p.add_argument("--output-json", default="", help="Write the full report here")
     p.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY", ""),
                    help="Append the markdown summary here (default: $GITHUB_STEP_SUMMARY)")
@@ -1088,11 +1237,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _not_run(summary_path: str, message: str) -> int:
-    """A setup failure: the error annotation, a one-line summary, exit 3."""
-    print(annotation("error", message, title="Mantis: cannot scan"))
-    _append(summary_path, f"## ⛔ Mantis PR scan: not run\n\n{_md(message)}\n")
-    return EXIT_INFRA
+def _not_run(summary_path: str, message: str, fail_closed: bool = False,
+             github_output: str = "") -> int:
+    """A setup failure: nothing was scanned and there is no verdict.
+
+    Exit 3 under --fail-closed, so the check is red for the workflow's owner
+    to fix. Otherwise exit 0: the summary and an annotation say what went
+    wrong, and the pull request is not held up by it. Never a verdict,
+    never a silent pass -- the output names it NOT_RUN.
+    """
+    level = "error" if fail_closed else "warning"
+    print(annotation(level, message, title="Mantis: cannot scan"))
+    policy = ("`fail-closed` is on, so the job fails." if fail_closed else
+              "`fail-closed` is off, so the job passes without a verdict; "
+              "set it to fail instead.")
+    _append(summary_path, f"## ⛔ Mantis PR scan: not run\n\n{_md(message)}\n\n{policy}\n")
+    _append(github_output, "verdict=NOT_RUN\nreport=\n")
+    return EXIT_INFRA if fail_closed else EXIT_OK
 
 
 def main(argv: Optional[List[str]] = None,
@@ -1130,10 +1291,11 @@ def main(argv: Optional[List[str]] = None,
                     f"daily-token-budget is set but the project's token meter could not be "
                     f"read: {exc}")
             run_budget = run_budget_for_today(max_tokens, daily_budget, used_today)
-        changed_all, diff = pr_changes(repo, args.base, args.head)
+        changed_all, diff, moves = pr_changes(repo, args.base, args.head)
         state_dir = fresh_state_dir(repo, args.state_dir)
     except InfraError as exc:
-        return _not_run(args.summary, str(exc))
+        return _not_run(args.summary, str(exc), fail_closed=args.fail_closed,
+                        github_output=args.github_output)
 
     # All mutable state lives in the fresh directory, never in the checkout.
     state = MantisState(str(repo))
@@ -1164,16 +1326,19 @@ def main(argv: Optional[List[str]] = None,
         results = run_scans(state, rels, args.max_llm_calls, args.model, args.api_base,
                             args.per_file_timeout, log_path, env=env_map,
                             max_tokens=run_budget,
-                            max_input_tokens=args.max_input_tokens) if rels else []
+                            max_input_tokens=args.max_input_tokens,
+                            daily=daily) if rels else []
     rejected = next((r for r in results if r["status"] == SCAN_AUTH_REJECTED), None)
     if rejected:
         return _not_run(
             args.summary,
             f"The model provider rejected the credentials (pipeline exit {EXIT_AUTH}) while "
             f"scanning '{rejected['file']}'. Check the credentials and model configured on "
-            f"the workflow step; the provider's message is in the scan log: {log_path}")
+            f"the workflow step; the provider's message is in the scan log: {log_path}",
+            fail_closed=args.fail_closed, github_output=args.github_output)
     if rels and all(r["status"] == SCAN_FAILED and r["returncode"] == -1 for r in results):
-        return _not_run(args.summary, f"Every scan failed to launch; see the scan log: {log_path}")
+        return _not_run(args.summary, f"Every scan failed to launch; see the scan log: {log_path}",
+                        fail_closed=args.fail_closed, github_output=args.github_output)
 
     if changed_all and not changed:
         # Every changed file matched an ignore pattern: nothing the pipeline
@@ -1187,20 +1352,27 @@ def main(argv: Optional[List[str]] = None,
             "scan": {"files": [], "results": [], "skipped": [], "over_budget": [],
                      "log": str(log_path)},
             "usage": usage_summary([], run_budget, daily),
-            "fail_on": args.fail_on, "exit_code": EXIT_OK,
+            "fail_on": args.fail_on, "fail_closed": bool(args.fail_closed), "exit_code": EXIT_OK,
+            "findings_verdict": VERDICT_PASS,
+            "coverage": {"status": COVERAGE_COMPLETE, "unaudited": []},
         }
     else:
         report = build_report(state, diff, changed, results, skipped, log_path,
-                              args.fail_on, max_tokens=run_budget, daily=daily)
-        if not changed_all:
+                              args.fail_on, max_tokens=run_budget, daily=daily,
+                              moves=moves, fail_closed=args.fail_closed)
+        if not changed_all and not moves.get("deleted"):
             report["reasons"].insert(0, "The pull request changes no scannable files.")
     report["ignored"] = ignored
+    report["renamed"] = moves.get("renamed") or {}
+    report["deleted"] = moves.get("deleted") or []
     report["state_dir"] = str(state_dir)
 
     if args.output_json:
+        from core.llm_gateway import sanitize_egress_data
+
         Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output_json).write_text(json.dumps(report, indent=2, default=str),
-                                          encoding="utf-8")
+        Path(args.output_json).write_text(
+            json.dumps(sanitize_egress_data(report), indent=2, default=str), encoding="utf-8")
     if not args.no_annotations:
         for line in render_annotations(report):
             print(line)
