@@ -543,6 +543,35 @@ fix it or a person has to dismiss it.
 Cost per nightly refresh is one pull-request scan's worth for the day's changes;
 the weekly sweep is whatever `--max-tokens` allows.
 
+### Knowledge from more than one model
+
+Models differ in what they find, and knowledge worth keeping is the union. Every
+record Mantis writes names its run, and every run names its model (`runs.jsonl`
+in the export), so a knowledge base can be built by several models and still say
+who found what and who covered what:
+
+- **Coverage is per model.** A file one model swept is still uncovered for
+  another; `auto` mode with `--model X` sweeps what X has not seen. The gate's
+  "never scanned" question stays model-agnostic: scanned by anyone counts.
+- **Only the finder shelves.** A refresh archives a known finding when the
+  rescan of its rewritten lines, by the model that found it, does not report it
+  again. A different model's miss leaves it open and is reported as such; a
+  weaker model cannot quietly retire a stronger one's finding.
+- **Findings are not merged across models.** Two models describing one bug
+  differently produce two lineages; both gate, both export, and the duplicate is
+  a person's to dismiss. Conservative, and the safe side.
+- **The threat model and architecture are the latest run's.** They seed the
+  model's view of the repository; it rebuilds them per campaign.
+
+To build with several, set `MANTIS_MODELS` in
+`.github/workflows/mantis-knowledge-refresh.yml` to a space-separated list. The
+delta scan runs every file under every model (`pr_scan.py --models`), the sweep
+runs the models one after another over the same database, and the export carries
+all of it. Spend is additive: each model gets the per-run budget, at its own
+price per token. A pull-request check stays single-model: the gate reads the
+knowledge whatever produced it, and a second model per pull request doubles the
+cost of every pull request for a smaller gain than a second model in the sweep.
+
 ## What the verdict means
 
 The gate is the MCP server's `check_change`. Two things come out of a run, and

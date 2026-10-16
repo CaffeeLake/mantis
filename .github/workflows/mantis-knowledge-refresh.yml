@@ -16,6 +16,14 @@
 # first step refuses to continue on any other ref.
 name: Mantis knowledge refresh
 
+# The models that build the knowledge, space-separated. With more than one,
+# every file is scanned by every model: the models differ in what they find,
+# and each keeps its own coverage, so a file one has seen is still open for
+# the other. The spend is additive -- each model gets the full per-run
+# budget below -- so list the expensive one knowingly.
+env:
+  MANTIS_MODELS: vertex_ai/gemini-3.8-flash
+
 on:
   schedule:
     - cron: "17 3 * * *"   # nightly: the delta since the last refresh
@@ -136,8 +144,9 @@ jobs:
         run: |
           set +e
           python scripts/pr_scan.py --repo "$GITHUB_WORKSPACE" \
-            --base "$BASE" --head HEAD --model vertex_ai/gemini-3.8-flash \
-            --radius 1 --max-llm-calls 400 --max-tokens 20M --export-knowledge "$GITHUB_WORKSPACE/.mantis/knowledge" \
+            --base "$BASE" --head HEAD --models "$(echo "$MANTIS_MODELS" | tr -s ' ' ',')" \
+            --radius 1 --max-llm-calls 400 --max-tokens "$((20 * $(echo "$MANTIS_MODELS" | wc -w)))M" \
+            --export-knowledge "$GITHUB_WORKSPACE/.mantis/knowledge" \
             --state-dir "$RUNNER_TEMP" --output-json "$RUNNER_TEMP/refresh.json" --no-annotations \
             --fail-closed
           rc=$?
@@ -163,11 +172,20 @@ jobs:
           # The pipeline runs without GitHub's runtime tokens, as it does
           # under the driver: scripts/pr_scan.py's subprocess_env is the one
           # list of what is stripped.
-          env $(python -c 'import sys; sys.path.insert(0, "."); from scripts.pr_scan import _STRIPPED_ENV; print(" ".join("-u " + k for k in sorted(_STRIPPED_ENV)))') \
-            python main.py "$GITHUB_WORKSPACE" --scan-mode auto --yes --sandbox static-only \
-            --model vertex_ai/gemini-3.8-flash --max-tokens 20M --cache-discount 1 \
-            --exclude tests --db "$RUNNER_TEMP/knowledge.db" "${import_flag[@]}"
-          rc=$?
+          # One pass per model over the same database. `auto` mode sweeps the
+          # files THIS model has not covered, so each model works through the
+          # repository on its own schedule within its own budget.
+          rc=0
+          for m in $MANTIS_MODELS; do
+            env $(python -c 'import sys; sys.path.insert(0, "."); from scripts.pr_scan import _STRIPPED_ENV; print(" ".join("-u " + k for k in sorted(_STRIPPED_ENV)))') \
+              python main.py "$GITHUB_WORKSPACE" --scan-mode auto --yes --sandbox static-only \
+              --model "$m" --max-tokens 20M --cache-discount 1 \
+              --exclude tests --db "$RUNNER_TEMP/knowledge.db" "${import_flag[@]}"
+            this=$?
+            [ "$this" -eq 4 ] && { rc=4; break; }
+            # After the first model the knowledge is in the database already.
+            import_flag=()
+          done
           # 2 is a pause at the budget, which is the plan; 4 is rejected credentials.
           [ "$rc" -eq 4 ] && exit 4
           set -e

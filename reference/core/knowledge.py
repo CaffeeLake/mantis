@@ -31,7 +31,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Versions this importer reads. 1 predates per-record model provenance; its
+# records import with an unknown model.
+READABLE_SCHEMA_VERSIONS = (1, 2)
 KNOWLEDGE_DIR = ".mantis/knowledge"
 
 MANIFEST = "manifest.json"
@@ -42,6 +45,7 @@ THREAT_MODEL_MD = "threat_model.md"
 ARCHITECTURE_MD = "architecture.md"
 SUMMARY_JSON = "summary.json"
 COVERAGE = "coverage.json"
+RUNS = "runs.jsonl"
 README = "README.md"
 
 # Artifact paths the pipeline's own tools read (tools/research_tools.py); the
@@ -60,7 +64,7 @@ FINDING_FIELDS = (
     "lineage_id", "signature", "filepath", "line_numbers", "title", "severity",
     "priority", "cwe", "status", "description", "remediation", "triage_reasoning",
     "rca_summary", "code_paths", "mantis_risk_score", "impact_score",
-    "likelihood_score", "patch_status", "run_id", "timestamp",
+    "likelihood_score", "patch_status", "run_id", "model", "timestamp",
 )
 _TEXT_FIELDS = ("title", "description", "remediation", "triage_reasoning", "rca_summary")
 
@@ -82,6 +86,9 @@ repository so it is versioned and reviewable. One record per line, sorted, so
 a re-export diffs cleanly.
 
 - `findings.jsonl`: one finding per line with its lineage id and status.
+- `runs.jsonl`: which model each run used; findings, learnings and coverage
+  entries name their run, and so their model. Knowledge built by more than
+  one model keeps who found what and who covered what.
 - `threat_model.json` / `.md`, `architecture.md`, `summary.json`: the model's
   current map of the system.
 - `coverage.json`: what has been scanned, and at which snapshot.
@@ -188,9 +195,28 @@ def _parse_list(raw: Any, max_items: int = MAX_LIST_ITEMS) -> List[Any]:
 # --- export -----------------------------------------------------------------------
 
 
+def _run_models(conn: sqlite3.Connection) -> Dict[str, str]:
+    """{run_id: model} from the runs table; empty when there is none."""
+    try:
+        return {str(r[0]): str(r[1] or "") for r in conn.execute("SELECT run_id, model FROM runs").fetchall() if r[0]}
+    except sqlite3.Error:
+        return {}
+
+
+def _export_runs(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    try:
+        rows = conn.execute("SELECT run_id, model, started FROM runs ORDER BY started ASC, run_id ASC").fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"run_id": _scrub(r[0], MAX_SHORT_CHARS), "model": _scrub(r[1], MAX_SHORT_CHARS),
+             "started": _scrub(r[2], MAX_SHORT_CHARS)} for r in rows if r[0]]
+
+
 def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List[Dict[str, Any]]:
     """Latest row per lineage (or per signature, or per location+title when the
-    row predates both), as the export's view of each finding."""
+    row predates both), as the export's view of each finding. Each carries
+    the model of the run that wrote it, when the database knows it."""
+    models = _run_models(conn)
     try:
         rows = conn.execute("SELECT * FROM findings ORDER BY id ASC").fetchall()
     except sqlite3.Error:
@@ -210,7 +236,7 @@ def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List
         r = dict(row)
         rec: Dict[str, Any] = {}
         for f in FINDING_FIELDS:
-            v = r.get(f)
+            v = models.get(str(r.get("run_id") or ""), "") if f == "model" else r.get(f)
             if f == "filepath":
                 v = str(v or "")
                 if os.path.isabs(v):
@@ -234,6 +260,7 @@ def _export_findings(conn: sqlite3.Connection, repo_root: Optional[str]) -> List
 
 
 def _export_learnings(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    models = _run_models(conn)
     try:
         rows = conn.execute(
             "SELECT run_id, timestamp, category, learning, tags FROM learnings ORDER BY id ASC"
@@ -252,6 +279,7 @@ def _export_learnings(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             "learning": text,
             "tags": [_scrub(t, MAX_SHORT_CHARS) for t in _parse_list(r.get("tags")) if isinstance(t, str)],
             "run_id": _scrub(r.get("run_id"), MAX_SHORT_CHARS),
+            "model": models.get(str(r.get("run_id") or ""), ""),
             "timestamp": _scrub(r.get("timestamp"), MAX_SHORT_CHARS),
         }
     return sorted(seen.values(), key=lambda x: (x["category"], x["learning"]))
@@ -280,9 +308,11 @@ def _latest_artifact(conn: sqlite3.Connection, artifact_type: str = "",
 
 def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict[str, Any]:
     """Coverage as repository-relative paths: the ledger's examined areas per
-    run, and every target a completed campaign recorded spend for."""
+    run, and every target a completed campaign recorded spend for -- per
+    model, so a path one model covered is still open for another."""
     from core.memory import COVERAGE_ARTIFACT_TYPE
 
+    models = _run_models(conn)
     runs: List[Dict[str, Any]] = []
     try:
         rows = conn.execute(
@@ -307,6 +337,7 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
                 continue
             seen_runs.add(key)
             runs.append({"run_id": run_id,
+                         "model": models.get(run_id, ""),
                          "snapshot_id": _scrub(entry.get("snapshot_id"), MAX_SHORT_CHARS),
                          "examined": examined})
     scanned: Dict[str, Dict[str, Any]] = {}
@@ -320,8 +351,10 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
         rel = _relativize(str(r.get("target") or ""), repo_root)
         if not rel:
             continue
-        scanned[rel] = {"path": rel, "scan_mode": _scrub(r.get("scan_mode"), MAX_SHORT_CHARS),
-                        "last_run_id": _scrub(r.get("run_id"), MAX_SHORT_CHARS)}
+        run_id = _scrub(r.get("run_id"), MAX_SHORT_CHARS)
+        model = models.get(run_id, "")
+        scanned[(rel, model)] = {"path": rel, "scan_mode": _scrub(r.get("scan_mode"), MAX_SHORT_CHARS),
+                                 "last_run_id": run_id, "model": model}
     return {"schema_version": SCHEMA_VERSION, "runs": runs,
             "scanned": [scanned[k] for k in sorted(scanned)]}
 
@@ -377,6 +410,7 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
         arch_md = _latest_artifact(conn, filepaths=(_ART_ARCHITECTURE[1],))
         summary_json = _latest_artifact(conn, artifact_type=_ART_SUMMARY[0])
         coverage = _export_coverage(conn, repo_root)
+        runs = _export_runs(conn)
     finally:
         conn.close()
 
@@ -391,12 +425,14 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
         except ValueError:
             return None
 
+    models = sorted({r["model"] for r in runs if r.get("model")})
     counts = {"findings": len(findings), "learnings": len(learnings),
               "threat_model": bool(tm_json or tm_md), "architecture": bool(arch_md),
               "summary": bool(summary_json), "coverage_runs": len(coverage["runs"]),
-              "coverage_paths": len(coverage["scanned"])}
+              "coverage_paths": len(coverage["scanned"]), "runs": len(runs), "models": models}
     write(FINDINGS, "".join(_json_line(f) + "\n" for f in findings))
     write(LEARNINGS, "".join(_json_line(x) + "\n" for x in learnings))
+    write(RUNS, "".join(_json_line(r) + "\n" for r in runs))
     for name, text in ((THREAT_MODEL_JSON, pretty_json(_scrub(tm_json, 10**7) if tm_json else None)),
                        (THREAT_MODEL_MD, _scrub_markdown(tm_md, 10**6) if tm_md else None),
                        (ARCHITECTURE_MD, _scrub_markdown(arch_md, 10**6) if arch_md else None),
@@ -408,12 +444,12 @@ def export_knowledge(db_path: str, out_dir: str, repo_root: Optional[str] = None
     write(COVERAGE, json.dumps(coverage, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
     write(README, README_TEXT)
     digest = hashlib.sha256()
-    for name in (FINDINGS, LEARNINGS, THREAT_MODEL_JSON, THREAT_MODEL_MD, ARCHITECTURE_MD, SUMMARY_JSON, COVERAGE):
+    for name in (FINDINGS, LEARNINGS, THREAT_MODEL_JSON, THREAT_MODEL_MD, ARCHITECTURE_MD, SUMMARY_JSON, COVERAGE, RUNS):
         p = out / name
         if p.exists():
             digest.update(name.encode()); digest.update(p.read_bytes())
     manifest = {"schema_version": SCHEMA_VERSION, "generator": "mantis", "counts": counts,
-                "content_sha256": digest.hexdigest()}
+                "models": models, "content_sha256": digest.hexdigest()}
     head = head if head is not None else _git_head(repo_root)
     if head:
         manifest["head"] = head
@@ -557,6 +593,48 @@ def _import_artifact(db_path: str, run_id: str, path: Path, artifact_type: str,
     return True
 
 
+def _import_runs(db_path: str, runs_path: Path, *record_paths: Path) -> int:
+    """Rebuilds the runs table (run id -> model) from the export: runs.jsonl
+    when present, else whatever the records themselves say (a v2 export
+    without the file, or one edited by hand). A v1 export says nothing and
+    its runs stay of unknown model. Returns the number recorded."""
+    from core.database import record_run
+
+    pairs: Dict[str, str] = {}
+    if runs_path.exists():
+        for rec in _iter_jsonl(runs_path):
+            run_id = _short(rec.get("run_id"))
+            if run_id and _IDENT_RE.match(run_id):
+                pairs.setdefault(run_id, _short(rec.get("model")))
+    for path in record_paths:
+        if not path.exists():
+            continue
+        if path.suffix == ".jsonl":
+            for rec in _iter_jsonl(path):
+                run_id, model = _short(rec.get("run_id")), _short(rec.get("model"))
+                if run_id and model and _IDENT_RE.match(run_id):
+                    pairs.setdefault(run_id, model)
+        else:
+            raw = _read_bounded(path)
+            try:
+                data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except ValueError:
+                data = {}
+            if isinstance(data, dict):
+                for entry in list(data.get("runs") or []) + list(data.get("scanned") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    run_id = _short(entry.get("run_id") or entry.get("last_run_id"))
+                    model = _short(entry.get("model"))
+                    if run_id and model and _IDENT_RE.match(run_id):
+                        pairs.setdefault(run_id, model)
+    n = 0
+    for run_id, model in pairs.items():
+        if record_run(db_path, run_id, model, metadata={"imported": True}):
+            n += 1
+    return n
+
+
 def _import_coverage(db_path: str, path: Path, repo_root: str, targets: List[str]) -> Tuple[int, int]:
     """Replays the coverage ledger under each target the next run may use, and
     stamps every scanned path as covered in the spend ledger (zero tokens, so
@@ -604,12 +682,14 @@ def _import_coverage(db_path: str, path: Path, repo_root: str, targets: List[str
             present[target].add(key)
         runs += 1
     paths = 0
+    # One row per (path, run): a path two models covered has two rows, each
+    # under the run -- and so the model -- that covered it.
     already: set = set()
     try:
         conn = _connect(db_path)
         try:
-            already = {r[0] for r in conn.execute(
-                "SELECT DISTINCT target FROM campaign_spend WHERE target IS NOT NULL").fetchall()}
+            already = {(r[0], str(r[1] or "")) for r in conn.execute(
+                "SELECT DISTINCT target, run_id FROM campaign_spend WHERE target IS NOT NULL").fetchall()}
         finally:
             conn.close()
     except sqlite3.Error:
@@ -621,13 +701,14 @@ def _import_coverage(db_path: str, path: Path, repo_root: str, targets: List[str
         if not rel:
             continue
         abs_path = root if rel == "." else os.path.join(root, rel)
-        if abs_path in already:
+        run_id = _short(entry.get("last_run_id")) or "imported"
+        if (abs_path, run_id) in already:
             paths += 1
             continue
-        if record_spend(db_path, _short(entry.get("last_run_id")) or "imported", abs_path,
+        if record_spend(db_path, run_id, abs_path,
                         _short(entry.get("scan_mode")) or "whole", tokens=0,
                         metadata={"imported": True}):
-            already.add(abs_path)
+            already.add((abs_path, run_id))
             paths += 1
     return runs, paths
 
@@ -654,14 +735,15 @@ def import_knowledge(db_path: str, in_dir: str, run_id: str, repo_root: str,
     except ValueError:
         raise KnowledgeImportError(f"{MANIFEST} is not JSON")
     version = manifest.get("schema_version") if isinstance(manifest, dict) else None
-    if version != SCHEMA_VERSION:
+    if version not in READABLE_SCHEMA_VERSIONS:
         raise KnowledgeImportError(
-            f"knowledge schema_version {version!r} is not {SCHEMA_VERSION}; refusing to guess")
+            f"knowledge schema_version {version!r} is not one of {READABLE_SCHEMA_VERSIONS}; refusing to guess")
 
     from core.database import init_db
 
     init_db(db_path)
     counts: Dict[str, Any] = {}
+    counts["runs"] = _import_runs(db_path, src / RUNS, src / FINDINGS, src / LEARNINGS, src / COVERAGE)
     conn = _connect(db_path)
     try:
         with conn:

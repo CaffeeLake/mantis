@@ -28,6 +28,8 @@ class RunContext:
     # Operator exclusions (core.exclusions), relative to the target: what the
     # run does not scan and does not list. Empty means none (INV-6).
     exclude: tuple = ()
+    # The model this run uses (resolved id). Empty when unknown.
+    model: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

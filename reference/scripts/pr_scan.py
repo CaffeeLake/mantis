@@ -268,7 +268,7 @@ def _commit_present(repo: Path, rev: str) -> bool:
 # it. The scan uses the base's version; the pull request's edits to it are
 # reported as a change for a person to review.
 KNOWLEDGE_FILES = ("manifest.json", "findings.jsonl", "learnings.jsonl", "threat_model.json",
-                   "threat_model.md", "architecture.md", "summary.json", "coverage.json")
+                   "threat_model.md", "architecture.md", "summary.json", "coverage.json", "runs.jsonl")
 MAX_KNOWLEDGE_FILE_BYTES = 32 * 1024 * 1024
 
 
@@ -688,28 +688,50 @@ def caller_files(state: MantisState, changed: Dict[str, List[int]], diff: str) -
 
 
 def archive_rewritten(db_path: str, prior: List[Dict[str, Any]], changed: Dict[str, List[int]],
-                      examined: List[str], first_new_id: int, note: str) -> List[Dict[str, Any]]:
+                      examined: Any, first_new_id: int, note: str,
+                      kept: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Archives known findings whose cited lines this change rewrote and whose
-    lineage a completed rescan of the file did not report again.
+    lineage a completed rescan of the file, BY THE MODEL THAT FOUND IT, did
+    not report again.
 
     `prior` is the open findings as they stood before the scans; `first_new_id`
     the first row id this run could have written; `examined` the files whose
-    researcher pass completed. A finding is archived only when all of: its
-    file is in the change set, its lines sit within DIFF_LINE_PROXIMITY of a
-    changed line (a file changed elsewhere says nothing about them), the file
-    was examined, and no row for its lineage was written by this run. Returns
-    what was archived.
+    researcher pass completed -- a list of files (any model), or
+    {model: [files]} when the run knows which model examined what. A finding
+    is archived only when all of: its file is in the change set, its lines
+    sit within DIFF_LINE_PROXIMITY of a changed line (a file changed
+    elsewhere says nothing about them), the file was examined by the
+    finding's own model (or the finding's model is unknown and any model
+    examined it), and no row for its lineage was written by this run. A
+    weaker model's miss must not shelve a stronger model's finding; when a
+    different model examined the file and did not re-report the lineage,
+    the finding is left open and appended to `kept` with the model named.
+    Returns what was archived.
     """
-    from core.database import archive_finding, read_findings
+    from core.database import archive_finding, read_findings, run_models
     from scripts.mcp_server import DIFF_LINE_PROXIMITY
 
+    models_of_runs = run_models(db_path)
+    by_model: Dict[str, set] = {}
+    if isinstance(examined, dict):
+        by_model = {str(m): set(files or []) for m, files in examined.items()}
+    else:
+        by_model = {"": set(examined or [])}
+    examined_any = set().union(*by_model.values()) if by_model else set()
     seen_now = {str(r.get("lineage_id") or "") for r in read_findings(db_path)
                 if int(r.get("id") or 0) >= first_new_id and r.get("lineage_id")}
     archived: List[Dict[str, Any]] = []
     for f in prior:
         lineage = str(f.get("lineage_id") or "")
         fp = str(f.get("filepath") or "")
-        if not lineage or fp not in changed or fp not in examined or lineage in seen_now:
+        if not lineage or fp not in changed or fp not in examined_any or lineage in seen_now:
+            continue
+        finder = models_of_runs.get(str(f.get("run_id") or ""), "")
+        if finder and by_model and "" not in by_model and fp not in by_model.get(finder, set()):
+            if kept is not None:
+                kept.append({"lineage_id": lineage, "filepath": fp, "title": str(f.get("title") or ""),
+                             "found_by": finder,
+                             "not_refound_by": sorted(m for m, files in by_model.items() if fp in files)})
             continue
         diff_lines = changed.get(fp) or []
         f_lines = [int(x) for x in (f.get("line_numbers") or []) if isinstance(x, int) and not isinstance(x, bool)]
@@ -842,10 +864,17 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
               max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
               daily: Optional[Dict[str, Any]] = None,
               meter: Optional[Callable[[Dict[str, str]], int]] = None,
-              knowledge_dir: str = "") -> List[Dict[str, Any]]:
-    """Runs the pipeline over each file in turn, then restores the
-    repo-rooted index (the pipeline re-roots the shared catalog at the one
-    file it scanned, which would blind the gate's blast radius).
+              knowledge_dir: str = "", models: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Runs the pipeline over each file in turn -- under each model in turn
+    when `models` names more than one -- then restores the repo-rooted index
+    (the pipeline re-roots the shared catalog at the one file it scanned,
+    which would blind the gate's blast radius).
+
+    With several models every file is scanned by every model: the models
+    differ in what they find, and knowledge worth keeping is the union. The
+    run budget is shared over all the (model, file) jobs left, so one
+    model's spend narrows what the others get, not what the run spends.
+    Each result carries its model.
 
     Spend is bounded by the run: each scan is launched with an equal share
     of the tokens still unspent, told to count every token at full price,
@@ -872,6 +901,7 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     daily_budget = int(daily["budget"]) if daily else 0
     used_start = int(daily.get("used_before_run") or 0) if daily else 0
     read_meter = meter or tokens_served_today
+    jobs = [(m, rel) for m in (models or [model]) for rel in rels]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_env = subprocess_env(dict(os.environ if env is None else env))
     if max_input_tokens > 0:
@@ -882,7 +912,7 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
     spend_dir.mkdir(mode=0o700, exist_ok=True)
     spent = 0
     with _open_log(log_path) as log:
-        for i, rel_fp in enumerate(rels):
+        for i, (job_model, rel_fp) in enumerate(jobs):
             budget_now = max_tokens
             if daily_budget > 0 and i > 0:
                 try:
@@ -896,20 +926,20 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
                 else:
                     day_left = max(0, daily_budget - max(used_now, used_start + spent))
                     budget_now = min(max_tokens, spent + day_left) if max_tokens > 0 else spent + day_left
-            granted = allowance(budget_now, spent, len(rels) - i)
+            granted = allowance(budget_now, spent, len(jobs) - i)
             if budget_now > 0 and granted < MIN_SCAN_ALLOWANCE:
-                log.write(f"\n=== mantis scan {rel_fp}: not launched, {granted} of "
-                          f"{budget_now} run tokens left ===\n".encode())
-                results.append({"file": rel_fp, "returncode": None,
+                log.write(f"\n=== mantis scan {rel_fp} [{job_model or 'default model'}]: not launched, "
+                          f"{granted} of {budget_now} run tokens left ===\n".encode())
+                results.append({"file": rel_fp, "model": job_model, "returncode": None,
                                 "status": SCAN_OVER_BUDGET, "seconds": 0.0,
                                 "tokens": 0, "llm_calls": 0, "granted": granted,
                                 "pause_trigger": ""})
                 continue
             spend_path = spend_dir / f"{i}.json"
-            cmd = scan_command(state, rel_fp, max_llm_calls, model, api_base,
+            cmd = scan_command(state, rel_fp, max_llm_calls, job_model, api_base,
                                max_tokens=granted, spend_report=str(spend_path),
                                knowledge_dir=knowledge_dir)
-            log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
+            log.write(f"\n=== mantis scan {rel_fp} [{job_model or 'default model'}] ===\n".encode())
             log.flush()
             started = time.time()
             code: Optional[int]
@@ -932,6 +962,7 @@ def run_scans(state: MantisState, rels: List[str], max_llm_calls: int, model: st
             spent += cost
             results.append({
                 "file": rel_fp,
+                "model": job_model,
                 "returncode": code,
                 "status": _classify(code, account),
                 "seconds": round(time.time() - started, 1),
@@ -1336,10 +1367,13 @@ def render_summary(report: Dict[str, Any]) -> str:
     results = scan.get("results") or []
     lines += ["### Scan", ""]
     if results:
-        lines += ["| File | Result | Tokens | Calls | Seconds |", "| --- | --- | --- | --- | --- |"]
+        many = len({r.get("model") or "" for r in results}) > 1
+        lines += (["| File | Model | Result | Tokens | Calls | Seconds |", "| --- | --- | --- | --- | --- | --- |"]
+                  if many else ["| File | Result | Tokens | Calls | Seconds |", "| --- | --- | --- | --- | --- |"])
         for r in results:
             calls = r.get("llm_calls")
-            lines.append(f"| `{_md(r['file'])}` | {_md(r['status'])} | {int(r.get('tokens') or 0):,} "
+            model_cell = f" {_md(r.get('model') or '')} |" if many else ""
+            lines.append(f"| `{_md(r['file'])}` |{model_cell} {_md(r['status'])} | {int(r.get('tokens') or 0):,} "
                          f"| {calls if calls is not None else '?'} | {r.get('seconds', '')} |")
     else:
         lines.append("No files were scanned.")
@@ -1410,6 +1444,15 @@ def render_summary(report: Dict[str, Any]) -> str:
                 if a.get("line_numbers"):
                     where += ":" + ",".join(str(x) for x in a["line_numbers"][:6])
                 lines.append(f"- `{_md(where)}` {_md(a.get('title'))}")
+        if knowledge.get("kept_open"):
+            lines.append("")
+            lines.append(f"Left open ({len(knowledge['kept_open'])}): the cited lines changed and a "
+                         "rescan by a different model did not report them; only the model that found "
+                         "a finding may shelve it.")
+            for k in knowledge["kept_open"]:
+                lines.append(f"- `{_md(k.get('filepath'))}` {_md(k.get('title'))} (found by "
+                             f"{_md(k.get('found_by'))}; not re-found by "
+                             f"{_md(', '.join(k.get('not_refound_by') or []))})")
         exported = knowledge.get("exported")
         if exported:
             lines.append("")
@@ -1441,6 +1484,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--base", default="", help="Base commit of the pull request")
     p.add_argument("--head", default="HEAD", help="Head revision (default: HEAD)")
     p.add_argument("--model", default="", help="Model id; empty uses the workflow default")
+    p.add_argument("--models", default="",
+                   help="Comma-separated model ids: every changed file is scanned by every "
+                        "model, the run budget shared over all of it, and each finding and "
+                        "coverage row keeps its model. For building knowledge with more than "
+                        "one model; a pull-request check wants one. Overrides --model.")
     p.add_argument("--api-base", default="", help="Custom LLM API base URL")
     p.add_argument("--max-llm-calls", type=int, default=400,
                    help="LLM call ceiling per changed file: a loop guard, not the spend control "
@@ -1539,9 +1587,11 @@ def main(argv: Optional[List[str]] = None,
             raise InfraError(f"--repo '{args.repo}' is not a directory.")
         if _git(repo, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
             raise InfraError(f"--repo '{args.repo}' is not a git checkout.")
-        reason = credential_preflight(env_map, api_base=args.api_base, model=args.model)
-        if reason:
-            raise InfraError(reason)
+        models = [m.strip() for m in str(args.models or "").split(",") if m.strip()] or [args.model]
+        for m in models:
+            reason = credential_preflight(env_map, api_base=args.api_base, model=m)
+            if reason:
+                raise InfraError(reason)
         # The day's spend, from the platform, before anything is launched. A
         # configured daily budget that cannot be checked is a setup failure:
         # running without the check would make the number a decoration.
@@ -1638,7 +1688,8 @@ def main(argv: Optional[List[str]] = None,
                             max_tokens=run_budget,
                             max_input_tokens=args.max_input_tokens,
                             daily=daily,
-                            knowledge_dir=knowledge_dir) if rels else []
+                            knowledge_dir=knowledge_dir,
+                            models=models) if rels else []
     rejected = next((r for r in results if r["status"] == SCAN_AUTH_REJECTED), None)
     if rejected:
         return _not_run(
@@ -1661,13 +1712,24 @@ def main(argv: Optional[List[str]] = None,
             # even if the run paused afterwards: the pass's report is in.
             # A finished run counts regardless (older pipelines report no
             # nodes).
-            examined_files = [r["file"] for r in results
-                              if r.get("examined") or r["status"] == SCAN_DONE]
+            # Per model: a finding is shelved only by the model that found
+            # it. The scan's model id is what the pipeline recorded for its
+            # run, so the two are compared in the same spelling.
+            from core.config import normalize_model_id
+            examined_by: Dict[str, List[str]] = {}
+            for r in results:
+                if r.get("examined") or r["status"] == SCAN_DONE:
+                    examined_by.setdefault(normalize_model_id(r.get("model") or "") if r.get("model") else "",
+                                           []).append(r["file"])
+            kept: List[Dict[str, Any]] = []
             knowledge["archived"] = archive_rewritten(
-                state.db_path, prior_open, changed, examined_files, first_new_id,
+                state.db_path, prior_open, changed, examined_by, first_new_id,
                 note=(f"archived by knowledge refresh at {head_sha[:12]}: the cited lines changed "
                       f"between {args.base[:12]} and {head_sha[:12]} and a rescan of the file did "
-                      "not report this finding again. Not resolved, not dismissed: check again."))
+                      "not report this finding again. Not resolved, not dismissed: check again."),
+                kept=kept)
+            if kept:
+                knowledge["kept_open"] = kept
         try:
             from core.knowledge import export_knowledge
 

@@ -295,6 +295,20 @@ def init_db(db_path: str):
             if "code_paths" not in existing_cols:
                 cursor.execute("ALTER TABLE findings ADD COLUMN code_paths TEXT DEFAULT '[]'")
 
+        # Which model a run used. Every record the pipeline writes already
+        # carries its run id, so provenance is a join away without touching
+        # the findings, learnings or spend tables; knowledge built by more
+        # than one model keeps, per record, who found what and who covered
+        # what.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                model TEXT,
+                started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                metadata_json TEXT DEFAULT '{}'
+            )
+        """)
+
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_filepath ON findings(filepath)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_lineage ON findings(lineage_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_signature ON findings(signature)")
@@ -1851,6 +1865,44 @@ def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = 
         if row:
             return {"content": row["content"], "metadata_json": row["metadata_json"]}
         return None
+
+def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:
+    """Records which model a run used. Idempotent: a run that is recorded
+    again keeps its first model (a resumed run is the same run). Never
+    raises; this is bookkeeping (INV-6)."""
+    if not db_path or not run_id:
+        return False
+    try:
+        with _db(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id TEXT PRIMARY KEY,
+                    model TEXT,
+                    started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    metadata_json TEXT DEFAULT '{}'
+                )
+            """)
+            cursor.execute(
+                "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, ?, ?)",
+                (str(run_id), str(model or ""), json.dumps(metadata or {})))
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
+def run_models(db_path: str) -> Dict[str, str]:
+    """{run_id: model} for every run the database knows the model of.
+    Empty when there is no table yet. Never raises."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        with _db(db_path) as conn:
+            rows = conn.execute("SELECT run_id, model FROM runs").fetchall()
+        return {str(r[0]): str(r[1] or "") for r in rows if r[0]}
+    except (sqlite3.Error, OSError):
+        return {}
+
 
 def record_learning(db_path: str, run_id: str, category: str, learning: str, tags: Optional[list] = None):
     """Record a learning entry for cross-pass feedback."""

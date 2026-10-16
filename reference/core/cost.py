@@ -193,8 +193,17 @@ def _row_failed(metadata_json: Any) -> bool:
     return isinstance(meta, dict) and bool(meta.get("failed"))
 
 
-def uncovered_files(db_path: str, files) -> Optional[list]:
+def uncovered_files(db_path: str, files, model: str = "") -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
+
+    With `model` given, covered means covered BY THAT MODEL: a file another
+    model is known to have scanned is still uncovered for this one.
+    Knowledge built by more than one model needs each to see every file,
+    and the models differ in what they find. A campaign whose model is
+    unknown (recorded before runs were, or imported from an export that
+    did not say) counts as coverage for every model, as it always did:
+    turning on provenance must not make an existing knowledge base re-sweep
+    itself.
 
     A file counts as covered when some completed campaign's target was the
     file itself or an ancestor directory of it: scanning `repo/lib` covers
@@ -227,9 +236,20 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         conn = _connect(db_path)
         try:
             try:
-                rows = conn.execute(
-                    "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
-                ).fetchall()
+                has_runs = model and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+                if has_runs:
+                    # Rows of this model, and rows of no known model.
+                    rows = conn.execute(
+                        "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                        "LEFT JOIN runs r ON r.run_id = s.run_id "
+                        "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                        (str(model),)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
+                    ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such table" in str(exc).lower():
                     return all_files  # Ledger never written: genuine first run.

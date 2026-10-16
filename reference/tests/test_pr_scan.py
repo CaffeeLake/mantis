@@ -79,12 +79,17 @@ _FAKE_SCAN = """\
 import json, sys
 sys.path.insert(0, {ref_root!r})
 from core.cost import record_spend
-from core.database import write_findings
-record_spend({db!r}, "run-pr", {target!r}, "deep", tokens=5)
+from core.database import record_run, write_findings
+argv = sys.argv[1:]
+# The real _scan_cmd puts --model on the command line; this stand-in replaces
+# _scan_cmd, so the model arrives through the template instead.
+model = {model!r} or (argv[argv.index("--model") + 1] if "--model" in argv else "")
+run = "run-pr-" + model.replace("/", "_") if model else "run-pr"
+record_run({db!r}, run, model)
+record_spend({db!r}, run, {target!r}, "deep", tokens=5)
 finding = {finding!r}
 if finding:
-    write_findings({db!r}, {target!r}, [finding], run_id="run-pr", status="")
-argv = sys.argv[1:]
+    write_findings({db!r}, {target!r}, [finding], run_id=run, status="")
 if "--spend-report" in argv and not {no_report!r}:
     path = argv[argv.index("--spend-report") + 1]
     granted = int(argv[argv.index("--max-tokens") + 1]) if "--max-tokens" in argv else 0
@@ -112,7 +117,8 @@ def fake_scan(finding=None, code=0, tokens=None, cached=0, pause_trigger="",
         return [sys.executable, "-c", _FAKE_SCAN.format(
             ref_root=str(pr_scan._REF_ROOT), db=state.db_path, target=target,
             finding=finding, code=code, tokens=tokens, cached=cached,
-            pause_trigger=pause_trigger, no_report=no_report, nodes=list(nodes))]
+            pause_trigger=pause_trigger, no_report=no_report, nodes=list(nodes),
+            model=str(model or ""))]
     return _cmd
 
 
@@ -835,6 +841,52 @@ class TestActionDefinition(unittest.TestCase):
         self.assertIn("MANTIS_ACTION_FAIL_CLOSED", self.text)
 
 
+class TestManyModels(DriverCase):
+    def test_models_scan_every_file_under_every_model(self):
+        rc, out = self.run_main("--models", "vertex_ai/a-model, vertex_ai/b-model", scan=fake_scan())
+        rep = self.report()
+        jobs = sorted((r["file"], r["model"]) for r in rep["scan"]["results"])
+        self.assertEqual(jobs, [("app.py", "vertex_ai/a-model"), ("app.py", "vertex_ai/b-model"),
+                                ("new.py", "vertex_ai/a-model"), ("new.py", "vertex_ai/b-model")])
+        self.assertEqual(rep["coverage"]["status"], "complete")
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+        text = self.summary.read_text(encoding="utf-8")
+        self.assertIn("| File | Model | Result |", text)
+        self.assertIn("vertex_ai/b-model", text)
+        from core.database import run_models
+        self.assertEqual(sorted(set(run_models(Path(rep["state_dir"], "knowledge.db").as_posix()).values())),
+                         ["vertex_ai/a-model", "vertex_ai/b-model"])
+
+    def test_the_budget_is_shared_over_all_the_jobs(self):
+        floor = pr_scan.MIN_SCAN_ALLOWANCE
+        # Four jobs; each spends its share plus a little, so the last is not launched.
+        rc, out = self.run_main("--models", "m1,m2", "--max-tokens", str(4 * floor),
+                                scan=fake_scan(tokens=floor + 20_000))
+        rep = self.report()
+        statuses = [(r["file"], r["model"], r["status"]) for r in rep["scan"]["results"]]
+        # Carry-over shares: one job's overshoot narrows the next job's share
+        # below the floor, so some job is not launched, whichever model it
+        # belongs to, and the run as a whole stays inside its budget.
+        self.assertIn("over_budget", {st[2] for st in statuses}, statuses)
+        self.assertLessEqual(sum(int(r["tokens"]) for r in rep["scan"]["results"]), 4 * floor)
+        self.assertEqual(rep["coverage"]["status"], "partial")
+
+    def test_one_model_failing_is_a_gap_for_that_model_only(self):
+        calls = []
+
+        def flaky(state, target, max_llm_calls, model):
+            calls.append(model)
+            return fake_scan(code=1 if model == "bad" else 0)(state, target, max_llm_calls, model)
+
+        rc, out = self.run_main("--models", "good,bad", scan=flaky)
+        rep = self.report()
+        bad = [r for r in rep["scan"]["results"] if r["model"] == "bad"]
+        self.assertTrue(all(r["status"] == "finished_with_errors" for r in bad))
+        self.assertEqual(rep["coverage"]["status"], "partial")
+        self.assertEqual(sorted({u["file"] for u in rep["coverage"]["unaudited"]}), ["app.py", "new.py"])
+        self.assertEqual(rc, pr_scan.EXIT_OK)
+
+
 class TestSpendArithmetic(unittest.TestCase):
     """The pure functions the run budget is made of."""
 
@@ -1145,14 +1197,27 @@ def _knowledge_files(status="confirmed", severity="HIGH", line=2):
     }
 
 
+def _knowledge_files_with_model(model, **kw):
+    """The same export, version 2, with the finder's model on record."""
+    files = _knowledge_files(**kw)
+    manifest = json.loads(files[".mantis/knowledge/manifest.json"])
+    manifest["schema_version"] = 2
+    files[".mantis/knowledge/manifest.json"] = json.dumps(manifest)
+    files[".mantis/knowledge/runs.jsonl"] = json.dumps({"run_id": "full-scan-1", "model": model}) + "\n"
+    return files
+
+
 class KnowledgeCase(DriverCase):
     """The fixture's BASE commit carries a knowledge export; HEAD is the usual
     PR on top (app.py edited at line 2, new.py added)."""
 
+    knowledge_model = ""
+
     def setUp(self):
         super().setUp()
         # Rewrite history: knowledge in the base, then the same PR on top.
-        files = _knowledge_files()
+        files = (_knowledge_files_with_model(self.knowledge_model) if self.knowledge_model
+                 else _knowledge_files())
         _git(self.repo, "checkout", "-q", self.base)
         for rel, body in files.items():
             p = self.repo / rel
@@ -1489,6 +1554,67 @@ class TestDailyBudgetInTheRun(DriverCase):
         rep = self.report()
         self.assertEqual(rep["usage"]["max_tokens"], 100_000)
         self.assertEqual(rep["scan"]["results"][0]["granted"], 50_000)
+
+
+class TestArchivingByFinder(KnowledgeCase):
+    knowledge_model = "vertex_ai/finder"
+
+    def refresh(self, *extra, scan):
+        out_dir = Path(self.tmp) / "export"
+        rc, out = self.run_main("--export-knowledge", str(out_dir), *extra, scan=scan)
+        return rc, out, out_dir
+
+    def test_a_different_model_cannot_shelve_the_finding(self):
+        # The base finding was found by one model; the refresh runs a second
+        # only, which rescans the rewritten line and reports nothing. Left open.
+        rc, out, out_dir = self.refresh("--models", "vertex_ai/second", scan=fake_scan())
+        rep = self.report()
+        self.assertEqual(rep["knowledge"]["archived"], [])
+        kept = rep["knowledge"]["kept_open"]
+        self.assertEqual([k["lineage_id"] for k in kept], ["lin-app-1"])
+        self.assertEqual(kept[0]["found_by"], "vertex_ai/finder")
+        self.assertEqual(kept[0]["not_refound_by"], ["vertex_ai/second"])
+        self.assertIn("Left open (1)", self.summary.read_text(encoding="utf-8"))
+        recs = [json.loads(l) for l in (out_dir / "findings.jsonl").read_text().splitlines()]
+        row = next(r for r in recs if r["lineage_id"] == "lin-app-1")
+        self.assertEqual(row["status"], "confirmed")
+        self.assertEqual(row["model"], "vertex_ai/finder", "the export keeps the finder")
+        # And the gate still treats it as open: BLOCK under block.
+        self.assertEqual(rep["findings_verdict"], "BLOCK", rep["reasons"])
+
+    def test_the_finder_itself_shelves_it(self):
+        rc, out, out_dir = self.refresh("--models", "vertex_ai/second,vertex_ai/finder",
+                                        scan=fake_scan())
+        rep = self.report()
+        self.assertEqual([a["lineage_id"] for a in rep["knowledge"]["archived"]], ["lin-app-1"])
+        self.assertNotIn("kept_open", rep["knowledge"])
+        runs = {json.loads(l)["run_id"]: json.loads(l)["model"]
+                for l in (out_dir / "runs.jsonl").read_text().splitlines()}
+        self.assertEqual(runs["full-scan-1"], "vertex_ai/finder", "imported provenance survives the export")
+        self.assertIn("vertex_ai/second", runs.values())
+        cov = json.loads((out_dir / "coverage.json").read_text())
+        by_model = {}
+        for e in cov["scanned"]:
+            by_model.setdefault(e["model"], set()).add(e["path"])
+        self.assertIn("app.py", by_model["vertex_ai/second"])
+        self.assertIn("app.py", by_model["vertex_ai/finder"])
+
+    def test_a_finding_of_unknown_model_is_shelved_by_anyone(self):
+        # Version-1 knowledge names no model: the old rule applies.
+        files = _knowledge_files()
+        _git(self.repo, "checkout", "-q", self.base)
+        (self.repo / ".mantis/knowledge/runs.jsonl").unlink()
+        (self.repo / ".mantis/knowledge/manifest.json").write_text(files[".mantis/knowledge/manifest.json"])
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base v1")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "app.py").write_text(HEAD_APP, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "head")
+        _git(self.repo, "checkout", "-q", "-B", "main")
+        rc, out, out_dir = self.refresh("--models", "vertex_ai/second", scan=fake_scan())
+        self.assertEqual([a["lineage_id"] for a in self.report()["knowledge"]["archived"]], ["lin-app-1"])
+
 
 
 if __name__ == "__main__":

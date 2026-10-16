@@ -757,7 +757,13 @@ def resolve_scan_targets(
             try:
                 from core.cost import uncovered_files
 
-                uncovered = uncovered_files(db_path, discovered_files)
+                # Coverage is asked per model: the sweep is of what THIS
+                # model has not seen, so knowledge built by several models
+                # has each of them cover every file.
+                from core.config import normalize_model_id
+
+                run_model = normalize_model_id(str(config.get("default_model") or ""))
+                uncovered = uncovered_files(db_path, discovered_files, model=run_model)
             except Exception as exc:
                 print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             if uncovered:
@@ -1215,6 +1221,19 @@ async def pipeline(
 
     db_path = config.get("db_path", "knowledge.db")
     init_db(db_path)
+    # The model this run uses, written down once so every record the run
+    # leaves -- findings, learnings, coverage, spend, all keyed by run id --
+    # can say who produced it. Knowledge built by several models depends on
+    # this, and so does the per-model sweep below.
+    run_model = ""
+    try:
+        from core.config import normalize_model_id
+        from core.database import record_run
+
+        run_model = normalize_model_id(str(config.get("default_model") or ""))
+        record_run(db_path, run_id, run_model)
+    except Exception as exc:
+        print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
 
     # What not to scan: the workflow's `exclude` list plus any --exclude flags,
     # as patterns relative to the target (core.exclusions). Resolved once here
@@ -1834,6 +1853,7 @@ async def pipeline(
         scan_mode=scan_mode,
         path_root=resolved_path_root,
         exclude=exclude,
+        model=run_model,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")

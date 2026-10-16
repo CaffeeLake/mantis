@@ -448,7 +448,7 @@ SCENARIOS = {
     # ---- Campaign cost model / scan sizing ----
     "scan_revert_virgin_sweep": [
         ('main.py',
-         '                uncovered = uncovered_files(db_path, discovered_files)',
+         '                uncovered = uncovered_files(db_path, discovered_files, model=run_model)',
          '                uncovered = None  # NEUTERED: coverage gaps are silently skipped, never swept'),
     ],
     "cost_revert_coverage_failsafe": [

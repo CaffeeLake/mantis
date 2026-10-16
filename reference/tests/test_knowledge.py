@@ -76,7 +76,7 @@ class TestExport(unittest.TestCase):
         self.assertEqual(counts["learnings"], 1)
         self.assertTrue(counts["threat_model"] and counts["architecture"] and counts["summary"])
         names = sorted(os.listdir(self.out))
-        self.assertEqual(names, sorted([K.MANIFEST, K.FINDINGS, K.LEARNINGS, K.THREAT_MODEL_JSON, K.THREAT_MODEL_MD,
+        self.assertEqual(names, sorted([K.MANIFEST, K.FINDINGS, K.LEARNINGS, K.RUNS, K.THREAT_MODEL_JSON, K.THREAT_MODEL_MD,
                                         K.ARCHITECTURE_MD, K.SUMMARY_JSON, K.COVERAGE, K.README]))
         lines = Path(self.out, K.FINDINGS).read_text().splitlines()
         recs = [json.loads(l) for l in lines]
