@@ -26,6 +26,14 @@
 Mantis is a set of skills along with an ADK reference harness for building
 secure software in the new AI era of software development.
 
+- [`skills/`](skills/) -- the method: the skills an agent loads on demand, from
+  threat modelling through research, review, patching and reporting.
+- [`reference/`](reference/) -- an ADK harness that runs the method as a
+  pipeline, with its own two skills to configure and launch it. Meant to be
+  adapted; works as is.
+- [`action/`](action/) -- a GitHub Action that runs the harness over a pull
+  request (see the warning above).
+
 ## Getting Started
 
 First, install python3-venv such as with `sudo apt install python3-venv`, then

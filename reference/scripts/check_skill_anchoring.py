@@ -71,7 +71,7 @@ def main() -> int:
     else:
         repo_root = Path(__file__).resolve().parent.parent.parent
         target_files = sorted(
-            [Path(p) for p in glob.glob(str(repo_root / "mantis-*/SKILL.md"))]
+            [Path(p) for p in glob.glob(str(repo_root / "skills/*/SKILL.md"))]
             + [Path(p) for p in glob.glob(str(repo_root / "reference/skills/*/SKILL.md"))]
         )
 

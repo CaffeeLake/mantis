@@ -284,10 +284,10 @@ graph TD
   Validates the environment, performs preflight checks, and executes the
   pipeline with automatic sandbox downgrade fallback.
 - **`/mantis-advise` (Developer Security Advisor):**
-  ([`mantis-advise/SKILL.md`](mantis-advise/SKILL.md)) Queries threat models,
-  historical vulnerability lineages, verified patch diffs, triaged false
-  positives, and learned trajectory invariants from `knowledge.db` before and
-  during code edits.
+  ([`skills/mantis-advise/SKILL.md`](skills/mantis-advise/SKILL.md)) Queries
+  threat models, historical vulnerability lineages, verified patch diffs,
+  triaged false positives, and learned trajectory invariants from `knowledge.db`
+  before and during code edits.
 
 ### Running the Pipeline (Manual Mode)
 
@@ -510,8 +510,8 @@ from source code using capability-based per-partition backend selection
 supports content-addressed unit reuse, incremental overlays, and a bounded query
 interface. It runs immediately after the snapshot is pinned and before the first
 code-reading analysis stage. See
-[mantis-structural-index/SKILL.md](mantis-structural-index/SKILL.md) for the
-full specification.
+[skills/mantis-structural-index/SKILL.md](skills/mantis-structural-index/SKILL.md)
+for the full specification.
 
 The reference harness exposes the same capability as four researcher tools
 (`find_symbol`, `find_callers`, `find_callees`, `get_function_boundary`),

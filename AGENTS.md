@@ -43,9 +43,9 @@ locking, or ASCII block fences in skill prompts. All invariants are verified by
 ## Reference files
 
 Skills may split on-demand content into `references/` subdirectories (e.g.
-`mantis-calibrate/references/calibration_rules.md`). Before committing, verify
-that every `references/*.md` link target in a `SKILL.md` file exists on disk and
-is tracked by git (`git ls-files --error-unmatch <path>`).
+`skills/mantis-calibrate/references/calibration_rules.md`). Before committing,
+verify that every `references/*.md` link target in a `SKILL.md` file exists on
+disk and is tracked by git (`git ls-files --error-unmatch <path>`).
 
 ### Extraction criteria
 
@@ -62,12 +62,12 @@ Extract a block into a `references/` file only if ALL three hold:
    falls back to safe behavior without the reference (e.g. patch rebasing falls
    back to fresh patch generation, verified by re-attack verification).
 
-`mantis-patch/references/patch_rebasing.md` qualifies (pure mechanics, no
+`skills/mantis-patch/references/patch_rebasing.md` qualifies (pure mechanics, no
 invariant restated, fails safe to Phase-1). Do not extract content that restates
 a crown-jewel invariant — trim it inline instead.
 
 ## Structural index spec
 
 The structural index spec lives in **one canonical location**:
-`mantis-structural-index/SKILL.md`. Locator resolution instructions and semantic
-unit definitions appear only in this canonical skill.
+`skills/mantis-structural-index/SKILL.md`. Locator resolution instructions and
+semantic unit definitions appear only in this canonical skill.

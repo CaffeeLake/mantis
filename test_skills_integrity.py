@@ -15,7 +15,8 @@ import subprocess
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent
-SKILLS = sorted(REPO_ROOT.glob("mantis-*/SKILL.md"))
+SKILLS_DIR = REPO_ROOT / "skills"
+SKILLS = sorted(SKILLS_DIR.glob("*/SKILL.md"))
 _REF_LINK = re.compile(
     r"\]\(((?:\.\./)?[\w\-./]*references/[\w\-./]+\.md)(?:#[^)]*)?\)"
 )
@@ -39,6 +40,24 @@ class SkillFrontmatterTests(unittest.TestCase):
             with self.subTest(skill=skill.parent.name):
                 text = skill.read_text(encoding="utf-8")
                 self.assertIn(f"name: {skill.parent.name}", text)
+
+
+class SkillsIndexTests(unittest.TestCase):
+    """skills/README.md is what a reader sees first; it must name every skill
+    and nothing else. reference/scripts/gen_skills_index.py regenerates it."""
+
+    def test_index_lists_exactly_the_skills(self):
+        index = (SKILLS_DIR / "README.md").read_text(encoding="utf-8")
+        linked = set(re.findall(r"\]\(([\w\-]+)/SKILL\.md\)", index))
+        present = {s.parent.name for s in SKILLS}
+        self.assertEqual(linked, present,
+                         "run: python3 reference/scripts/gen_skills_index.py .")
+
+    def test_index_links_resolve(self):
+        index = (SKILLS_DIR / "README.md").read_text(encoding="utf-8")
+        for rel in re.findall(r"\]\(([^)]+)\)", index):
+            with self.subTest(link=rel):
+                self.assertTrue((SKILLS_DIR / rel).is_file(), rel)
 
 
 class ReferenceLinkTests(unittest.TestCase):

@@ -28,6 +28,6 @@ repos:
         name: Ensure skill bash code blocks anchor reference scripts
         entry: python3 reference/scripts/check_skill_anchoring.py
         language: system
-        files: ^(mantis-[^/]+/SKILL\.md|reference/skills/[^/]+/SKILL\.md)$
+        files: ^(skills/[^/]+/SKILL\.md|reference/skills/[^/]+/SKILL\.md)$
         pass_filenames: true
 

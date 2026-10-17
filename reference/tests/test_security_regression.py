@@ -1400,7 +1400,7 @@ class TestSkillsPathAnchoring(unittest.TestCase):
         from scripts.check_skill_anchoring import check_file
         repo_root = Path(__file__).resolve().parent.parent.parent
         skill_files = sorted(
-            list(repo_root.glob("mantis-*/SKILL.md"))
+            list(repo_root.glob("skills/*/SKILL.md"))
             + list(repo_root.glob("reference/skills/*/SKILL.md"))
         )
         if not skill_files:
