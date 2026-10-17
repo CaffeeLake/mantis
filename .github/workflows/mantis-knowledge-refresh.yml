@@ -209,7 +209,19 @@ jobs:
           git commit -q -m "Mantis: refresh knowledge ($stat)"
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           git -c "http.https://github.com/.extraheader=$auth" push -q -f origin "HEAD:refs/heads/$branch"
-          gh pr create --base main --head "$branch" \
-            --title "Mantis: refresh knowledge" \
-            --body "Automated refresh of \`.mantis/knowledge\` from the scan on main. Review archived and new findings as you would code." \
-            || gh pr edit "$branch" --title "Mantis: refresh knowledge" >/dev/null
+          # Opening the pull request is a courtesy, not the product: the
+          # branch is. A repository that forbids workflows from creating
+          # pull requests (the safer setting) refuses this call, and then a
+          # person opens it from the link below.
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            gh pr edit "$branch" --title "Mantis: refresh knowledge" >/dev/null && echo "Pull request updated."
+          elif gh pr create --base main --head "$branch" \
+              --title "Mantis: refresh knowledge" \
+              --body "Automated refresh of \`.mantis/knowledge\` from the scan on main. Review archived and new findings as you would code."; then
+            echo "Pull request opened."
+          else
+            echo "::notice title=Mantis knowledge refresh::Branch $branch is pushed; this repository does not let workflows open pull requests. Open one at https://github.com/$GITHUB_REPOSITORY/compare/main...$branch?expand=1"
+            echo "## Mantis knowledge refresh" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Knowledge changed ($stat). The branch \`$branch\` is pushed; workflows may not open pull requests here, so open one: https://github.com/$GITHUB_REPOSITORY/compare/main...$branch?expand=1" >> "$GITHUB_STEP_SUMMARY"
+          fi

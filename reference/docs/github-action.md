@@ -257,6 +257,40 @@ day, and the action's own limits are for the one that lasts a run.
    its credentials. The `if` skips drafts until they are marked ready and skips
    bot-authored pull requests; both are runs nobody reads (see Spend).
 
+### Repository settings
+
+Settings only a repository administrator can make, and the action's design
+assumes them, in any repository that installs it:
+
+- **Rulesets on `main`**: require a pull request with at least one approval,
+  require status checks, block force pushes, restrict deletions, and keep the
+  bypass list to break-glass actors.
+- **CODEOWNERS** naming a security owner for `.github/workflows/`, `action/`
+  (when dogfooding), and `.mantis/knowledge/`, with "require review from code
+  owners" on. The workflow file is what a pull request can rewrite; the
+  knowledge directory is what later scans believe.
+- **Actions permissions**: default `GITHUB_TOKEN` permissions set to read, and
+  "Allow GitHub Actions to create and approve pull requests" left **off**. The
+  refresh workflow copes: it pushes its branch and prints the link to open the
+  pull request by hand when it may not open one itself.
+- **Allowed actions**: if the organisation restricts actions, allow
+  `google/mantis/action@*` and `google-github-actions/auth@*`; everything else
+  this uses is under `actions/`, `github/` or `ossf/scorecard-action` and is
+  pinned to a commit.
+- **Dependabot** alerts and security updates on; secret scanning on. Version
+  updates (the scheduled pin bumps) are a separate choice: a
+  `.github/dependabot.yml` with a cooldown, or whatever else keeps your pins
+  moving.
+- **Scheduled workflows stop after 60 days without repository activity**, the
+  refresh included; a repository that idles needs a push, or a manual dispatch,
+  to wake it.
+
+If the project the action authenticates to is inside Google's own cloud
+organisation, note that workload identity federation from GitHub is denied by
+policy there and needs an exception before the provider can be created; a
+project outside that organisation does not. External users of this action are
+not affected.
+
 ### First run
 
 Run the workflow by hand (Actions, Mantis PR scan, Run workflow) with `base-sha`
