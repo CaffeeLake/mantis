@@ -311,6 +311,13 @@ async def execute_sub_task(
                                             record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
                                     except Exception:
                                         pass
+                                elif current_active_node == "reflector" and not is_partial and db_path and run_id:
+                                    try:
+                                        from core.memory import record_reflection_output
+
+                                        record_reflection_output(db_path, run_id, part.text)
+                                    except Exception:
+                                        pass
                             elif hasattr(part, 'function_call') and part.function_call:
                                 call = part.function_call
                                 call_name = getattr(call, "name", "unknown_tool")

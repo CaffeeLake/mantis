@@ -773,3 +773,42 @@ def describe(counts: Dict[str, Any]) -> str:
         parts.append("summary")
     parts.append(f"coverage for {counts.get('coverage_paths', 0)} path(s)")
     return ", ".join(parts)
+
+
+def export_to_context_tree(
+    db_path: str,
+    out_root: str | Path,
+    task_description: str = "",
+    repo_root: Optional[str] = None,
+    task_id: str = "mantis_audit",
+):
+    """Materializes a Harness²-compatible ContextTree from a Mantis SQLite knowledge DB."""
+    from core.harness_context import build_context_tree
+
+    conn = _connect(db_path)
+    try:
+        findings = _export_findings(conn, repo_root)
+        learnings = _export_learnings(conn)
+    finally:
+        conn.close()
+
+    deliverables: Dict[str, List[Dict[str, Any]]] = {}
+    for item in findings:
+        raw_rid = str(item.get("run_id") or "default")
+        rid = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_rid).strip("._") or "default"
+        deliverables.setdefault(rid, []).append(item)
+
+    decisions: List[str] = []
+    for item in learnings:
+        decisions.append(
+            f"# [{item.get('category', 'learning')}] (run: {item.get('run_id', '')})\n\n"
+            f"{item.get('learning', '')}\n"
+        )
+
+    return build_context_tree(
+        out_root=out_root,
+        task_id=task_id,
+        task_description=task_description or "Mantis security audit rollout evidence.",
+        deliverables=deliverables,
+        decisions=decisions,
+    )

@@ -484,15 +484,32 @@ def recall(
     dismissed.sort(key=lambda item: item["timestamp"], reverse=True)
     archived.sort(key=lambda item: item["timestamp"], reverse=True)
 
-    learnings = [
-        {
-            "category": str(row.get("category") or ""),
-            "learning": _clip(row.get("learning")),
-            "run_id": str(row.get("run_id") or ""),
-        }
-        for row in learning_rows
-        if isinstance(row, dict) and _is_str(row.get("learning"))
-    ]
+    learnings: List[Dict[str, Any]] = []
+    for row in learning_rows:
+        if not isinstance(row, dict) or not _is_str(row.get("learning")):
+            continue
+        raw_tags = row.get("tags") or []
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+        tags = [str(t).strip() for t in (raw_tags if isinstance(raw_tags, list) else []) if _is_str(t)]
+        target_stage = str(row.get("target_stage") or "").strip()
+        if not target_stage:
+            for tag in tags:
+                if tag.startswith("stage:") and len(tag) > 6:
+                    target_stage = tag[6:].strip()
+                    break
+        learnings.append(
+            {
+                "category": str(row.get("category") or ""),
+                "learning": _clip(row.get("learning")),
+                "run_id": str(row.get("run_id") or ""),
+                "tags": tags,
+                "target_stage": target_stage,
+            }
+        )
 
     truncated = (
         len(confirmed) > max_findings
@@ -616,3 +633,86 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         "re-establish anything you intend to rely on. A previous dismissal is a "
         "reason to look more carefully, not a reason to skip."
     )
+
+
+def recall_for_stage(
+    db_path: str,
+    stage: str,
+    target: str = "",
+    include_general: bool = True,
+    max_learnings: int = _MAX_LEARNINGS,
+) -> List[Dict[str, Any]]:
+    """Recalls prior learnings filtered to those targeting `stage`.
+
+    Stage-targeted lessons recorded by Harness²-style `<experience>` blocks carry
+    `target_stage` (or a `stage:<node_id>` tag). Specific stage matches are
+    returned first, followed by untargeted general learnings when
+    `include_general` is True.
+    """
+    stage_norm = str(stage or "").strip().lower()
+    mem = recall(db_path, target=target, max_learnings=max_learnings * 4)
+    all_learnings = mem.get("learnings") or []
+    targeted: List[Dict[str, Any]] = []
+    general: List[Dict[str, Any]] = []
+    for item in all_learnings:
+        item_stage = str(item.get("target_stage") or "").strip().lower()
+        if item_stage == stage_norm:
+            targeted.append(item)
+        elif item_stage in ("", "global") and include_general:
+            general.append(item)
+    return (targeted + general)[:max_learnings]
+
+
+def record_reflection_output(
+    db_path: str,
+    run_id: str,
+    raw_text: str,
+) -> Dict[str, int]:
+    """Parses Harness² `<edits>` and `<experience>` blocks and persists them to SQLite.
+
+    Returns counts `{"edits": int, "experiences": int}` of persisted entries.
+    Never raises (INV-6).
+    """
+    counts = {"edits": 0, "experiences": 0}
+    try:
+        from core.database import record_learning
+        from core.harness_context import parse_reflection_blocks
+
+        parsed = parse_reflection_blocks(raw_text)
+        for edit in parsed.get("edits") or []:
+            verdict = str(edit.get("verdict") or "").strip()
+            target_edit = str(edit.get("edit") or "").strip()
+            evidence = str(edit.get("evidence") or "").strip()
+            if not target_edit or not verdict:
+                continue
+            text = f"[EDIT:{verdict}] {target_edit}" + (f" — {evidence}" if evidence else "")
+            record_learning(
+                db_path,
+                run_id,
+                "causal_edit",
+                text,
+                tags=[f"verdict:{verdict.replace(' ', '_')}"],
+            )
+            counts["edits"] += 1
+
+        for exp in parsed.get("experiences") or []:
+            cue = str(exp.get("cue") or "").strip()
+            lesson = str(exp.get("lesson") or "").strip()
+            evidence = str(exp.get("evidence") or "").strip()
+            confidence = str(exp.get("confidence") or "medium").strip().lower()
+            target_stage = str(exp.get("target_stage") or "researcher").strip().lower()
+            if not cue or not lesson:
+                continue
+            tags = [f"stage:{target_stage}", f"confidence:{confidence}"]
+            text = f"When {cue}: {lesson}" + (f" (evidence: {evidence})" if evidence else "")
+            record_learning(
+                db_path,
+                run_id,
+                f"experience:{target_stage}",
+                text,
+                tags=tags,
+            )
+            counts["experiences"] += 1
+    except Exception as exc:
+        logger.warning("Could not record reflection output: %s", exc)
+    return counts

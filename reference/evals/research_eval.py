@@ -366,6 +366,10 @@ def _copy_target(src: Path, jail_dir: Path) -> Path:
     copied_gt = app_dir / GROUND_TRUTH_BASENAME
     if copied_gt.exists():  # pragma: no cover - belt and braces
         raise RuntimeError("ground truth leaked into the eval jail")
+    from core.harness_context import assert_no_grader_verdicts, assert_no_leak_paths
+
+    assert_no_leak_paths(app_dir)
+    assert_no_grader_verdicts(app_dir)
     return app_dir
 
 

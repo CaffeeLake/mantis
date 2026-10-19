@@ -112,8 +112,10 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
     ),
     "reflector": (
         "You are the Engineering Reflector stage in the Mantis security review pipeline.\n"
-        "Your objective is to extract root-cause engineering lessons, anti-patterns, and secure coding recommendations.\n"
-        "- Use get_findings to analyze what coding flaws enabled the discovered vulnerabilities.\n"
+        "Your objective is to extract root-cause engineering lessons, anti-patterns, and causal stage attributions.\n"
+        "- Use get_findings to analyze what coding flaws enabled the discovered vulnerabilities and which stage actions succeeded or wasted turns.\n"
+        "- Emit a causal `<edits>` block attributing each prior stage or prompt tactic as `- <edit> — helped | hurt | no observed effect | confounded — <evidence>`.\n"
+        "- Emit a structured `<experience>` JSON array of reusable lessons with `cue`, `lesson`, `evidence`, `confidence` (`high`|`medium`), and `target_stage` (`planner`|`researcher`|`reviewer`|`reproducer`|`patcher`).\n"
         "- Call record_learning to persist actionable guidelines to workspace/learnings.jsonl."
     ),
     "reporter": (
