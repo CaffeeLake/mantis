@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -171,6 +172,162 @@ class WiringPinTest(unittest.TestCase):
         for node in workflow["nodes"]:
             if node["id"] in _PREFIX_REUSE_ARTIFACTS:
                 self.assertNotIn("on_enter_status", node)
+
+
+class ContentAddressedPrefixAndToolLoopGuardTest(unittest.TestCase):
+    """Tests for Harness² content-addressed prefix reuse (runmark) and tool-loop guards (c8)."""
+
+    def test_compute_prefix_fingerprint_changes_on_prompt_or_tools_or_model(self):
+        from core.graph_loader import compute_prefix_fingerprint
+
+        fp_base = compute_prefix_fingerprint(
+            "architect",
+            instruction="Map architecture",
+            tools=["list_files", "read_file"],
+            model="gemini-3.8-flash",
+            snapshot_id="snap-1",
+        )
+        fp_reordered = compute_prefix_fingerprint(
+            "architect",
+            instruction="Map architecture",
+            tools=["read_file", "list_files"],
+            model="gemini-3.8-flash",
+            snapshot_id="snap-1",
+        )
+        self.assertEqual(fp_base, fp_reordered)
+        fp_changed_prompt = compute_prefix_fingerprint(
+            "architect",
+            instruction="Map architecture v2",
+            tools=["list_files", "read_file"],
+            model="gemini-3.8-flash",
+            snapshot_id="snap-1",
+        )
+        self.assertNotEqual(fp_base, fp_changed_prompt)
+
+    def test_prefix_reuse_invalidates_when_snapshot_or_fingerprint_changes(self):
+        before, after = _make_prefix_reuse_callbacks("architect")
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            init_db(db)
+            record_artifact(db, "run-1", "summary", "summary.md", "Architecture summary")
+            ctx1 = RunContext(
+                jail_dir=tmp,
+                db_path=db,
+                run_id="run-1",
+                scan_mode="cross-functional",
+                snapshot_id="snap-1",
+                model="gemini-3.8-flash",
+                prefix_fingerprints={"architect": "fp-v1"},
+            )
+            tok = current_run_context.set(ctx1)
+            try:
+                self.assertIsNone(before())
+                after()
+                self.assertIsNotNone(before())
+            finally:
+                current_run_context.reset(tok)
+
+            # Mutated fingerprint invalidates reuse even under the same run_id.
+            ctx2 = RunContext(
+                jail_dir=tmp,
+                db_path=db,
+                run_id="run-1",
+                scan_mode="cross-functional",
+                snapshot_id="snap-1",
+                model="gemini-3.8-flash",
+                prefix_fingerprints={"architect": "fp-v2"},
+            )
+            tok2 = current_run_context.set(ctx2)
+            try:
+                self.assertIsNone(before())
+            finally:
+                current_run_context.reset(tok2)
+
+    def test_after_tool_guard_steers_after_repeated_unbounded_read_file(self):
+        from core.graph_loader import _make_after_tool_guard_callback
+
+        guard = _make_after_tool_guard_callback(
+            "researcher",
+            ["read_file", "get_function_boundary", "find_symbol"],
+        )
+
+        class _DummyTool:
+            name = "read_file"
+
+        tool = _DummyTool()
+        ctx = RunContext(jail_dir="/tmp", db_path="/tmp/db.sqlite", run_id="r1")
+        tok = current_run_context.set(ctx)
+        try:
+            # First unbounded read returns None (keep original output).
+            self.assertIsNone(guard(tool, {"filepath": "app/auth.py"}, None, "line1\nline2"))
+            # Echoed defaults (0 = whole file) are an unbounded read too.
+            self.assertIsNone(
+                guard(
+                    tool,
+                    {"filepath": "app/auth.py", "start_line": 0, "end_line": 0},
+                    None,
+                    "line1\nline2",
+                )
+            )
+            # Bounded read does not increment counter or trigger hint.
+            self.assertIsNone(
+                guard(
+                    tool,
+                    {"filepath": "app/auth.py", "start_line": 1, "end_line": 20},
+                    None,
+                    "line1\nline2",
+                )
+            )
+            # Third unbounded read appends steering hint.
+            res = guard(tool, {"filepath": "app/auth.py"}, None, "line1\nline2")
+            self.assertIsInstance(res, str)
+            self.assertIn("HARNESS STEERING HINT", res)
+            self.assertIn("get_function_boundary", res)
+        finally:
+            current_run_context.reset(tok)
+
+    def test_after_tool_guard_hint_matches_real_tool_signatures(self):
+        """Every tool call the hint suggests must be one the tools accept.
+
+        The hint reaches a model that is already looping; a parameter name the
+        tool does not have turns the nudge into a validation error.
+        """
+        from core.graph_loader import _make_after_tool_guard_callback
+        from tools import structural_tools
+
+        guard = _make_after_tool_guard_callback(
+            "researcher", ["read_file", "get_function_boundary", "find_symbol"]
+        )
+
+        class _DummyTool:
+            name = "read_file"
+
+        res = None
+        for _ in range(3):
+            res = guard(_DummyTool(), {"filepath": "app/auth.py"}, None, "body")
+        self.assertIsInstance(res, str)
+
+        gfb_params = set(inspect.signature(structural_tools.get_function_boundary).parameters)
+        fs_params = set(inspect.signature(structural_tools.find_symbol).parameters)
+        for call in re.finditer(r"(get_function_boundary|find_symbol)\(([^)]*)\)", res):
+            tool_name, arg_text = call.group(1), call.group(2)
+            named = set(re.findall(r"(\w+)=", arg_text))
+            allowed = gfb_params if tool_name == "get_function_boundary" else fs_params
+            self.assertTrue(
+                named and named <= allowed,
+                f"hint suggests {tool_name}({arg_text}) but it accepts {sorted(allowed)}",
+            )
+
+    def test_load_workflow_exports_computed_prefix_fingerprints(self):
+        from core.graph_loader import load_workflow_from_json
+
+        wf_path = str(Path(_REF_ROOT) / "workflow.json")
+        _, cfg = load_workflow_from_json(wf_path)
+        fps = cfg.get("prefix_fingerprints") or {}
+        self.assertIn("architect", fps)
+        self.assertIn("threat_modeler", fps)
+        self.assertEqual(len(fps["architect"]), 16)
+        self.assertEqual(len(fps["threat_modeler"]), 16)
 
 
 if __name__ == "__main__":

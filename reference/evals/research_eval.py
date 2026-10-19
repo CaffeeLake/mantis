@@ -231,69 +231,69 @@ def extract_event_tokens(event: Any) -> int:
 
 # --- Abort guard ----------------------------------------------------------------------
 
-# A text-only reply with no tool call ends an ADK run. On the first turn of
-# a campaign that reads as a silent abort: zero findings, nothing attempted,
-# full prompt cost paid. The guard re-arms such a run exactly once with a
-# deterministic nudge; a run that aborts twice is a result, not an accident
-# to paper over.
-
-ABORT_GUARD_MIN_TOOL_CALLS = 8
-
-ABORT_GUARD_PROMPT = (
-    "Your previous reply ended the run without doing the audit: no findings "
-    "were reported and no tools were called. Do not answer with prose only. "
-    "Tool calls must go through the function-calling interface -- writing "
-    "one out as text, like 'call:api:read_file{...}', does nothing. "
-    "Resume now: call list_files('app'), read the source, and report every "
-    "confirmed vulnerability via report_findings before you finish."
-)
-
-
-def count_event_tool_calls(event: Any) -> int:
-    """Function calls carried by one ADK event. Never raises."""
-    try:
-        parts = getattr(getattr(event, "content", None), "parts", None) or []
-        return sum(1 for part in parts if getattr(part, "function_call", None))
-    except Exception:
-        return 0
-
-
-# Observed crash shape behind some silent aborts: the model writes the tool
-# call out as TEXT -- "call:default_api:read_file{...}" -- instead of
-# emitting a function_call part. ADK sees a text-only turn and ends the run
-# while the model believed it was mid-audit. Indistinguishable from a
-# deliberate stop by tool count alone, so it is detected directly.
-PSEUDO_TOOL_CALL_RE = re.compile(r"\bcall:\w+:\w+\s*\{")
-
-
-def event_has_pseudo_tool_call(event: Any) -> bool:
-    """True when a text part spells out a tool call instead of making one. Never raises."""
-    try:
-        parts = getattr(getattr(event, "content", None), "parts", None) or []
-        return any(
-            PSEUDO_TOOL_CALL_RE.search(getattr(part, "text", None) or "")
-            for part in parts
-        )
-    except Exception:
-        return False
-
-
-def should_rearm_run(
-    findings_count: int,
-    tool_calls: int,
-    rearms_used: int,
-    pseudo_tool_call: bool = False,
-) -> bool:
-    """True only for the first run that ends with nothing reported and
-    nearly nothing attempted -- or that ended on a tool call written as
-    text, which no tool-count threshold can tell from a deliberate stop.
-    A run that reported anything, or genuinely worked and came up empty,
-    is scored as it stands."""
-    return (
-        rearms_used == 0
-        and findings_count == 0
-        and (tool_calls < ABORT_GUARD_MIN_TOOL_CALLS or pseudo_tool_call)
+# Shared with production execution (core.graph_loader / main.py) so both
+# benchmark and production campaigns apply the same Harness²-inspired (c8)
+# turn-1 silent-abort and pseudo-tool-call re-arm guard.
+try:
+    from core.graph_loader import (
+        ABORT_GUARD_MIN_TOOL_CALLS,
+        ABORT_GUARD_PROMPT,
+        PSEUDO_TOOL_CALL_RE,
+        count_event_tool_calls,
+        event_has_pseudo_tool_call,
+        should_rearm_run,
     )
+except ImportError:  # pragma: no cover - minimal stdlib-only test environments
+    ABORT_GUARD_MIN_TOOL_CALLS = 8
+    ABORT_GUARD_PROMPT = (
+        "Your previous reply ended the run without doing the audit: no findings "
+        "were reported and no tools were called. Do not answer with prose only. "
+        "Tool calls must go through the function-calling interface -- writing "
+        "one out as text, like 'call:api:read_file{...}', does nothing. "
+        "Resume now: call list_files('app'), read the source, and report every "
+        "confirmed vulnerability via report_findings before you finish."
+    )
+    PSEUDO_TOOL_CALL_RE = re.compile(
+        r"(?:\bcall:\w+:\w+\s*\{|<tool_call>|<function=|<minimax:tool_call|```tool_call)",
+        re.IGNORECASE,
+    )
+
+    def count_event_tool_calls(event: Any) -> int:
+        """Function calls carried by one ADK event. Never raises."""
+        try:
+            parts = getattr(getattr(event, "content", None), "parts", None) or []
+            return sum(1 for part in parts if getattr(part, "function_call", None))
+        except Exception:
+            return 0
+
+    def event_has_pseudo_tool_call(event: Any) -> bool:
+        """True when a text part spells out a tool call instead of making one. Never raises."""
+        try:
+            parts = getattr(getattr(event, "content", None), "parts", None) or []
+            if any(
+                PSEUDO_TOOL_CALL_RE.search(getattr(part, "text", None) or "")
+                for part in parts
+            ):
+                return True
+            output = getattr(event, "output", None)
+            return bool(isinstance(output, str) and PSEUDO_TOOL_CALL_RE.search(output))
+        except Exception:
+            return False
+
+    def should_rearm_run(
+        findings_count: int,
+        tool_calls: int,
+        rearms_used: int = 0,
+        pseudo_tool_call: bool = False,
+    ) -> bool:
+        """True only for the first run that ends with nothing reported and
+        nearly nothing attempted -- or that ended on a tool call written as
+        text, which no tool-count threshold can tell from a deliberate stop."""
+        return (
+            rearms_used == 0
+            and findings_count == 0
+            and (tool_calls < ABORT_GUARD_MIN_TOOL_CALLS or pseudo_tool_call)
+        )
 
 
 # --- Transcript capture ---------------------------------------------------------------

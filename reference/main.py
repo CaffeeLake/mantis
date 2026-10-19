@@ -33,7 +33,14 @@ from core.budget import (
 )
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
-from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
+from core.graph_loader import (
+    ABORT_GUARD_PROMPT,
+    DEFAULT_SEED_PROMPT,
+    count_event_tool_calls,
+    event_has_pseudo_tool_call,
+    load_workflow_from_json,
+    should_rearm_run,
+)
 from core.context import RunContext, current_run_context
 from core.paths import resolve_db_path
 from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
@@ -181,6 +188,8 @@ async def execute_sub_task(
     last_banner: tuple[str | None, str | None] = (None, None)
     current_active_node: str | None = None
     streamed_partial_text: bool = False
+    total_tool_calls: int = 0
+    saw_pseudo_tool_call: bool = False
 
     max_calls = 0
     if budget_controller and budget_controller.config.max_llm_calls > 0:
@@ -191,154 +200,182 @@ async def execute_sub_task(
     )
 
     try:
-        async for event in runner.run_async(
-            user_id=USER_ID,
-            session_id=session_id,
-            invocation_id=resumed_invocation_id,
-            new_message=new_message,
-            run_config=run_cfg,
-        ):
-            node_path = getattr(getattr(event, "node_info", None), "path", None)
-            route = getattr(getattr(event, "actions", None), "route", None)
+        pass_msg = new_message
+        pass_inv_id = resumed_invocation_id
+        for _rearm_pass in range(2):
+            async for event in runner.run_async(
+                user_id=USER_ID,
+                session_id=session_id,
+                invocation_id=pass_inv_id,
+                new_message=pass_msg,
+                run_config=run_cfg,
+            ):
+                total_tool_calls += count_event_tool_calls(event)
+                if event_has_pseudo_tool_call(event):
+                    saw_pseudo_tool_call = True
+                node_path = getattr(getattr(event, "node_info", None), "path", None)
+                route = getattr(getattr(event, "actions", None), "route", None)
 
-            if node_path:
-                node_name = node_path.split("/")[-1].split("@")[0]
-                if node_name != current_active_node:
-                    current_active_node = node_name
-                    streamed_partial_text = False
-                    ctx = current_run_context.get()
-                    if ctx:
-                        ctx.active_node = node_name
-                    if budget_controller:
-                        budget_controller.record_step(node_name)
-                    # Which nodes this process reached, in order, for the spend
-                    # report: a driver can tell "the researcher finished and the
-                    # run paused in review" from "the run paused before anyone
-                    # looked", which a bare exit code cannot.
-                    nodes = _SPEND_REPORT.setdefault("nodes", [])
-                    if node_name not in nodes:
-                        nodes.append(node_name)
+                if node_path:
+                    node_name = node_path.split("/")[-1].split("@")[0]
+                    if node_name != current_active_node:
+                        current_active_node = node_name
+                        streamed_partial_text = False
+                        ctx = current_run_context.get()
+                        if ctx:
+                            ctx.active_node = node_name
+                        if budget_controller:
+                            budget_controller.record_step(node_name)
+                        # Which nodes this process reached, in order, for the spend
+                        # report: a driver can tell "the researcher finished and the
+                        # run paused in review" from "the run paused before anyone
+                        # looked", which a bare exit code cannot.
+                        nodes = _SPEND_REPORT.setdefault("nodes", [])
+                        if node_name not in nodes:
+                            nodes.append(node_name)
 
-                if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
-                    stamped_nodes.add(node_name)
-                    new_status = status_map[node_name]
-                    ctx = current_run_context.get()
-                    if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
-                        pass
-                    else:
-                        update_status(db_path, filepath, run_id, new_status)
+                    if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
+                        stamped_nodes.add(node_name)
+                        new_status = status_map[node_name]
+                        ctx = current_run_context.get()
+                        if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
+                            pass
+                        else:
+                            update_status(db_path, filepath, run_id, new_status)
 
-            banner = (node_path, route)
-            if (node_path or route) and banner != last_banner:
-                if node_path and route:
-                    print(f"\n-- {node_path} -> {route}")
-                elif node_path:
-                    print(f"\n-- {node_path}")
-                elif route:
-                    print(f"\n-- {last_banner[0] or ''} -> {route}")
-                last_banner = banner
+                banner = (node_path, route)
+                if (node_path or route) and banner != last_banner:
+                    if node_path and route:
+                        print(f"\n-- {node_path} -> {route}")
+                    elif node_path:
+                        print(f"\n-- {node_path}")
+                    elif route:
+                        print(f"\n-- {last_banner[0] or ''} -> {route}")
+                    last_banner = banner
 
-            if getattr(event, "error_code", None):
-                node_key = node_path or "unknown"
-                errored.add(node_key)
-                err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
-                # Decided from the error CODE, which names an exception class
-                # or a provider status, never from the message: ADK copies
-                # model-authored text (a malformed call's finish message) into
-                # error_message, and a scanned file can put "unauthenticated"
-                # in that text. The code is not the model's to write.
-                if str(event.error_code) in _AUTH_ERROR_CODES:
-                    raise MantisAuthError(err_msg)
-                if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
-                    limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
-                    raise BudgetExceededError(
-                        trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
-                        current_value="limit exceeded",
-                        limit_value=limit_val,
-                        run_id=run_id,
-                        details=str(err_msg),
-                    )
-                print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
-            else:
-                usage = getattr(event, "usage_metadata", None)
-                if budget_controller and usage and getattr(usage, "total_token_count", None):
-                    total_tokens = int(usage.total_token_count)
-                    cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
-                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens)
+                if getattr(event, "error_code", None):
+                    node_key = node_path or "unknown"
+                    errored.add(node_key)
+                    err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
+                    # Decided from the error CODE, which names an exception class
+                    # or a provider status, never from the message: ADK copies
+                    # model-authored text (a malformed call's finish message) into
+                    # error_message, and a scanned file can put "unauthenticated"
+                    # in that text. The code is not the model's to write.
+                    if str(event.error_code) in _AUTH_ERROR_CODES:
+                        raise MantisAuthError(err_msg)
+                    if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
+                        limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
+                        raise BudgetExceededError(
+                            trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
+                            current_value="limit exceeded",
+                            limit_value=limit_val,
+                            run_id=run_id,
+                            details=str(err_msg),
+                        )
+                    print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
+                else:
+                    usage = getattr(event, "usage_metadata", None)
+                    if budget_controller and usage and getattr(usage, "total_token_count", None):
+                        total_tokens = int(usage.total_token_count)
+                        cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
+                        budget_controller.record_tokens(total_tokens, cached_count=cached_tokens)
 
-                if hasattr(event, 'content') and event.content:
-                    is_partial = getattr(event, "partial", False)
-                    for part in getattr(event.content, "parts", []) or []:
-                        if hasattr(part, 'text') and part.text:
-                            # In streaming mode, print partial chunks incrementally.
-                            # Skip final aggregated non-partial text only if partial text was already streamed.
-                            if is_partial:
-                                cprint(part.text, end="", flush=True)
-                                streamed_partial_text = True
-                            elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
-                                cprint(part.text, end="", flush=True)
-                            if not is_partial:
-                                streamed_partial_text = False
-                                if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
-                                    budget_controller.record_tokens(len(part.text) // 4)
-                            if current_active_node == "reporter" and db_path and run_id:
-                                try:
-                                    from core.schemas import ExecutiveReport
-                                    from core.database import record_artifact
-                                    rpt_text = part.text.strip()
-                                    if "```json" in rpt_text:
-                                        rpt_text = rpt_text.split("```json", 1)[1].split("```", 1)[0].strip()
-                                    elif "```" in rpt_text:
-                                        rpt_text = rpt_text.split("```", 1)[1].split("```", 1)[0].strip()
-                                    if rpt_text.startswith("{") and rpt_text.endswith("}"):
-                                        rpt_data = json.loads(rpt_text)
-                                        rpt_obj = ExecutiveReport.model_validate(rpt_data)
-                                        record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
-                                except Exception:
-                                    pass
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            call = part.function_call
-                            call_name = getattr(call, "name", "unknown_tool")
-                            call_args = getattr(call, "args", {})
-                            cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
-                            if budget_controller:
-                                budget_controller.record_tool_call(current_active_node or "unknown", call_name)
-                        elif hasattr(part, 'function_response') and part.function_response:
-                            fn_resp = part.function_response
-                            fn_name = getattr(fn_resp, "name", "unknown_tool")
-                            raw_resp = getattr(fn_resp, "response", {})
-                            if isinstance(raw_resp, dict):
-                                resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
-                            else:
-                                resp_text = str(raw_resp)
-                            
-                            is_untrusted_data = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
-                            is_sandbox_error = fn_name in ("run_sandbox", "run_sandbox_with_evidence") and (
-                                "SANDBOX-ERROR:" in resp_text and not resp_text.startswith("exit=0")
-                            )
-                            is_fatal = not is_untrusted_data and (
-                                resp_text.startswith("SANDBOX-ERROR")
-                                or resp_text.startswith("ERROR SAVING DB")
-                                or resp_text.startswith("FATAL ERROR")
-                                or is_sandbox_error
-                            )
-                            is_validation_feedback = (
-                                not is_untrusted_data
-                                and not is_fatal
-                                and (
-                                    resp_text.startswith("Error")
-                                    or resp_text.startswith("ERROR")
+                    if hasattr(event, 'content') and event.content:
+                        is_partial = getattr(event, "partial", False)
+                        for part in getattr(event.content, "parts", []) or []:
+                            if hasattr(part, 'text') and part.text:
+                                # In streaming mode, print partial chunks incrementally.
+                                # Skip final aggregated non-partial text only if partial text was already streamed.
+                                if is_partial:
+                                    cprint(part.text, end="", flush=True)
+                                    streamed_partial_text = True
+                                elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
+                                    cprint(part.text, end="", flush=True)
+                                if not is_partial:
+                                    streamed_partial_text = False
+                                    if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
+                                        budget_controller.record_tokens(len(part.text) // 4)
+                                if current_active_node == "reporter" and db_path and run_id:
+                                    try:
+                                        from core.schemas import ExecutiveReport
+                                        from core.database import record_artifact
+                                        rpt_text = part.text.strip()
+                                        if "```json" in rpt_text:
+                                            rpt_text = rpt_text.split("```json", 1)[1].split("```", 1)[0].strip()
+                                        elif "```" in rpt_text:
+                                            rpt_text = rpt_text.split("```", 1)[1].split("```", 1)[0].strip()
+                                        if rpt_text.startswith("{") and rpt_text.endswith("}"):
+                                            rpt_data = json.loads(rpt_text)
+                                            rpt_obj = ExecutiveReport.model_validate(rpt_data)
+                                            record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
+                                    except Exception:
+                                        pass
+                            elif hasattr(part, 'function_call') and part.function_call:
+                                call = part.function_call
+                                call_name = getattr(call, "name", "unknown_tool")
+                                call_args = getattr(call, "args", {})
+                                cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
+                                if budget_controller:
+                                    budget_controller.record_tool_call(current_active_node or "unknown", call_name)
+                            elif hasattr(part, 'function_response') and part.function_response:
+                                fn_resp = part.function_response
+                                fn_name = getattr(fn_resp, "name", "unknown_tool")
+                                raw_resp = getattr(fn_resp, "response", {})
+                                if isinstance(raw_resp, dict):
+                                    resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
+                                else:
+                                    resp_text = str(raw_resp)
+                                
+                                is_untrusted_data = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
+                                is_sandbox_error = fn_name in ("run_sandbox", "run_sandbox_with_evidence") and (
+                                    "SANDBOX-ERROR:" in resp_text and not resp_text.startswith("exit=0")
                                 )
-                                and "SANDBOX-UNAVAILABLE" not in resp_text
-                            )
+                                is_fatal = not is_untrusted_data and (
+                                    resp_text.startswith("SANDBOX-ERROR")
+                                    or resp_text.startswith("ERROR SAVING DB")
+                                    or resp_text.startswith("FATAL ERROR")
+                                    or is_sandbox_error
+                                )
+                                is_validation_feedback = (
+                                    not is_untrusted_data
+                                    and not is_fatal
+                                    and (
+                                        resp_text.startswith("Error")
+                                        or resp_text.startswith("ERROR")
+                                    )
+                                    and "SANDBOX-UNAVAILABLE" not in resp_text
+                                )
 
-                            if is_fatal:
-                                errored.add(f"tool:{fn_name}")
-                                cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
-                            elif is_validation_feedback:
-                                cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
-                            else:
-                                cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+                                if is_fatal:
+                                    errored.add(f"tool:{fn_name}")
+                                    cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
+                                elif is_validation_feedback:
+                                    cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
+                                else:
+                                    cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+
+            if _rearm_pass > 0 or errored or not saw_pseudo_tool_call or total_tool_calls > 0:
+                break
+            findings_count = 0
+            if db_path and os.path.exists(db_path):
+                try:
+                    findings_count = len(read_findings(db_path, run_id=run_id, scope_path=filepath))
+                except Exception:
+                    findings_count = 0
+            if not should_rearm_run(
+                findings_count,
+                total_tool_calls,
+                rearms_used=0,
+                pseudo_tool_call=saw_pseudo_tool_call,
+            ):
+                break
+            print("\n[ABORT GUARD] Re-arming run once after pseudo-tool-call turn.", flush=True)
+            pass_inv_id = None
+            pass_msg = types.Content(
+                parts=[types.Part.from_text(text=ABORT_GUARD_PROMPT)],
+                role="user",
+            )
     except LlmCallsLimitExceededError as le:
         limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
         raise BudgetExceededError(
@@ -1854,6 +1891,7 @@ async def pipeline(
         path_root=resolved_path_root,
         exclude=exclude,
         model=run_model,
+        prefix_fingerprints=dict(config.get("prefix_fingerprints") or {}),
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
