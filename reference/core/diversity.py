@@ -251,3 +251,304 @@ def render_metrics(metrics: Dict[str, Any]) -> List[str]:
         )
 
     return lines
+
+
+# --- Pre-rollout harness diversity and blind candidate selection (Harness²) ---
+
+from collections import Counter
+from collections.abc import Mapping, Sequence
+import hashlib
+import json
+import random
+import re
+from typing import Any
+
+
+BLIND_IDS: tuple[str, ...] = (
+    "c_alpha",
+    "c_beta",
+    "c_gamma",
+    "c_delta",
+    "c_epsilon",
+    "c_zeta",
+    "c_eta",
+    "c_theta",
+)
+
+_PICK_RE = re.compile(r"<pick>\s*([A-Za-z0-9_.-]+)\s*</pick>", re.IGNORECASE)
+_WHY_RE = re.compile(r"<why>(.*?)</why>", re.DOTALL | re.IGNORECASE)
+
+
+def workflow_to_surface_tree(spec: Any) -> dict[str, str]:
+    """Converts a `WorkflowSpec` or raw workflow dict into a surface file tree.
+
+    Args:
+        spec: A `WorkflowSpec` instance, a raw workflow dict, or an existing
+            surface `dict[str, str]`.
+
+    Returns:
+        Mapping of virtual surface paths (`topology.txt`,
+        `nodes/<id>/tools.txt`, `nodes/<id>/prompt.txt`, `config/sandbox.txt`)
+        to normalized text content.
+    """
+    if hasattr(spec, "model_dump"):
+        data = spec.model_dump(by_alias=True, exclude_none=True)
+    elif isinstance(spec, Mapping):
+        if "nodes" not in spec and all(isinstance(v, str) for v in spec.values()):
+            return {str(k): str(v) for k, v in spec.items()}
+        data = dict(spec)
+    else:
+        raise TypeError(f"Unsupported workflow spec type: {type(spec)!r}")
+
+    surface: dict[str, str] = {}
+    cfg = data.get("config") or {}
+    sb = (cfg.get("sandbox") or {}).get("type", "static-only")
+    surface["config/sandbox.txt"] = f"sandbox={sb}\nmodel={cfg.get('default_model', '')}\n"
+
+    edge_lines: list[str] = []
+    for edge in data.get("edges") or []:
+        if not isinstance(edge, Mapping):
+            continue
+        src = str(edge.get("from") or edge.get("from_node") or "")
+        dst = str(edge.get("to") or edge.get("to_node") or "")
+        route = edge.get("on")
+        if route is not None:
+            edge_lines.append(f"{src} -> {dst} [on={route}]")
+        else:
+            edge_lines.append(f"{src} -> {dst}")
+    surface["topology.txt"] = "\n".join(sorted(edge_lines)) + "\n"
+
+    for node in data.get("nodes") or []:
+        if not isinstance(node, Mapping):
+            continue
+        nid = str(node.get("id") or "unknown")
+        ntype = str(node.get("type") or "agent")
+        if ntype == "classifier":
+            routes = sorted(str(r) for r in (node.get("routes") or []))
+            mv = node.get("max_visits", 1)
+            surface[f"nodes/{nid}/classifier.txt"] = (
+                f"routes={','.join(routes)}\nmax_visits={mv}\n"
+            )
+        else:
+            tools = sorted(str(t) for t in (node.get("tools") or []))
+            surface[f"nodes/{nid}/tools.txt"] = "\n".join(tools) + "\n"
+            prompt = str(node.get("system_prompt") or node.get("skill") or "")
+            surface[f"nodes/{nid}/prompt.txt"] = prompt.strip() + "\n"
+
+    return surface
+
+
+def structure_signature(tree: Mapping[str, str]) -> str:
+    """Computes a structural hash over virtual surface filenames and topology."""
+    topo = tree.get("topology.txt", "")
+    keys = sorted(tree.keys())
+    payload = json.dumps({"keys": keys, "topology": topo}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _line_set(tree: Mapping[str, str]) -> set[tuple[str, str]]:
+    """Returns `(path, stripped_line)` pairs for non-blank lines across `tree`."""
+    return {
+        (rel, line.strip())
+        for rel, body in tree.items()
+        for line in str(body).splitlines()
+        if line.strip()
+    }
+
+
+def _jaccard(a: set[Any], b: set[Any]) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def harness_diversity(
+    harnesses: Mapping[str, Any],
+    baseline: Any | None = None,
+) -> dict[str, Any]:
+    """Quantifies how much a pool of candidate workflows actually differ.
+
+    Ported from `harness2/core/tree.py:diversity`. Computes pairwise line-level
+    Jaccard similarity (`1.0` = identical, `0.0` = disjoint), structural
+    uniqueness, and per-candidate distance from `baseline`.
+    """
+    trees: dict[str, dict[str, str]] = {
+        label: workflow_to_surface_tree(spec)
+        for label, spec in harnesses.items()
+    }
+    labels = sorted(trees.keys())
+    line_sets = {label: _line_set(trees[label]) for label in labels}
+
+    pairwise: dict[str, float] = {}
+    for i, l1 in enumerate(labels):
+        for l2 in labels[i + 1 :]:
+            pairwise[f"{l1}..{l2}"] = round(
+                _jaccard(line_sets[l1], line_sets[l2]), 3
+            )
+
+    vals = list(pairwise.values())
+    mean_jaccard = round(sum(vals) / len(vals), 3) if vals else 1.0
+
+    vs_base: dict[str, dict[str, Any]] = {}
+    if baseline is not None:
+        base_tree = workflow_to_surface_tree(baseline)
+        base_lines = _line_set(base_tree)
+        for label in labels:
+            cand_tree = trees[label]
+            cand_lines = line_sets[label]
+            touched = [
+                p
+                for p in sorted(set(cand_tree) | set(base_tree))
+                if cand_tree.get(p) != base_tree.get(p)
+            ]
+            vs_base[label] = {
+                "files_touched": touched,
+                "n_files_touched": len(touched),
+                "lines_added": len(cand_lines - base_lines),
+                "lines_removed": len(base_lines - cand_lines),
+                "jaccard_to_baseline": round(
+                    _jaccard(cand_lines, base_lines), 3
+                ),
+            }
+
+    all_paths = sorted({p for t in trees.values() for p in t})
+    only_one: list[str] = []
+    some: list[str] = []
+    all_same: list[str] = []
+    for path in all_paths:
+        variants = {trees[label].get(path, "") for label in labels}
+        if len(variants) == 1:
+            all_same.append(path)
+        elif len(labels) > 2 and Counter(
+            trees[label].get(path, "") for label in labels
+        ).most_common(1)[0][1] == len(labels) - 1:
+            only_one.append(path)
+        else:
+            some.append(path)
+
+    sigs = {label: structure_signature(trees[label]) for label in labels}
+    return {
+        "n_candidates": len(labels),
+        "pairwise_jaccard": pairwise,
+        "mean_pairwise_jaccard": mean_jaccard,
+        "min_pairwise_jaccard": min(vals) if vals else 1.0,
+        "max_pairwise_jaccard": max(vals) if vals else 1.0,
+        "unique_structures": len(set(sigs.values())),
+        "structure_signatures": sigs,
+        "vs_baseline": vs_base,
+        "surface_spread": {
+            "only_one": only_one,
+            "some": some,
+            "all_same": all_same,
+        },
+    }
+
+
+def assign_blind_ids(
+    labels: Sequence[str],
+    seed: str | int = "mantis_blind_select",
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Assigns shuffled blind IDs (`c_alpha`, `c_beta`, ...) to candidate labels.
+
+    Ported from `harness2/core/selection.py` so LLM candidate judges cannot
+    anchor on provenance names (`baseline`, `inv`, `dom`, `composed`) or
+    presentation order.
+
+    Returns:
+        Tuple `(blind_to_real, real_to_blind)`.
+    """
+    unique_labels = list(dict.fromkeys(str(label) for label in labels))
+    rng = random.Random(str(seed))
+    shuffled = list(unique_labels)
+    rng.shuffle(shuffled)
+
+    blind_to_real: dict[str, str] = {}
+    real_to_blind: dict[str, str] = {}
+    for idx, real_label in enumerate(shuffled):
+        blind_id = (
+            BLIND_IDS[idx] if idx < len(BLIND_IDS) else f"c_cand_{idx + 1}"
+        )
+        blind_to_real[blind_id] = real_label
+        real_to_blind[real_label] = blind_id
+    return blind_to_real, real_to_blind
+
+
+def format_blind_candidates(
+    candidates: Mapping[str, Any],
+    blind_to_real: Mapping[str, str],
+) -> str:
+    """Formats candidate summaries under their blind IDs (`c_alpha`, `c_beta`, ...)."""
+    blocks: list[str] = []
+    for blind_id, real_label in blind_to_real.items():
+        payload = candidates.get(real_label, "")
+        if hasattr(payload, "model_dump"):
+            body = json.dumps(
+                payload.model_dump(by_alias=True, exclude_none=True),
+                indent=2,
+                sort_keys=True,
+            )
+        elif isinstance(payload, (dict, list)):
+            body = json.dumps(payload, indent=2, sort_keys=True)
+        else:
+            body = str(payload)
+        blocks.append(f"### Candidate `{blind_id}`\n```json\n{body}\n```")
+    return "\n\n".join(blocks)
+
+
+def resolve_blind_pick(
+    judge_text: str,
+    blind_to_real: Mapping[str, str],
+    fallback_label: str | None = None,
+) -> dict[str, str]:
+    """Resolves `<pick>c_...</pick>` and `<why>...</why>` back to the real label.
+
+    A reply that names no candidate -- no `<pick>` block and no unambiguous
+    mention of exactly one blind id -- is a selection failure, not a choice.
+    Following `harness2/core/selection.py`, such a failure must never be
+    laundered into an arbitrary winner: when `fallback_label` (a real label,
+    normally the baseline) is supplied the result carries it with
+    `resolved_by="fallback"`; otherwise a `ValueError` is raised so the caller
+    decides. The blind ids are shuffled, so "the first entry" is a random
+    candidate and is never used.
+
+    Returns:
+        `{"blind_id", "selected", "why", "resolved_by"}` where `resolved_by` is
+        one of `"pick"`, `"mention"`, or `"fallback"`.
+    """
+    if not blind_to_real:
+        raise ValueError("blind_to_real mapping cannot be empty")
+    why_match = _WHY_RE.search(judge_text or "")
+    why = why_match.group(1).strip() if why_match else ""
+    pick_match = _PICK_RE.search(judge_text or "")
+    picked_blind = pick_match.group(1).strip().lower() if pick_match else ""
+    resolved_by = "pick"
+    if picked_blind not in blind_to_real:
+        lower_text = (judge_text or "").lower()
+        hits = [
+            blind_id
+            for blind_id in blind_to_real
+            if re.search(rf"\b{re.escape(blind_id.lower())}\b", lower_text)
+        ]
+        if len(hits) == 1:
+            picked_blind = hits[0]
+            resolved_by = "mention"
+    if picked_blind not in blind_to_real:
+        if fallback_label is None:
+            raise ValueError(
+                "judge reply names no candidate: no <pick> block and no "
+                f"unambiguous blind id among {sorted(blind_to_real)}"
+            )
+        real_to_blind = {real: blind for blind, real in blind_to_real.items()}
+        if fallback_label not in real_to_blind:
+            raise ValueError(
+                f"fallback_label {fallback_label!r} is not one of the candidates "
+                f"{sorted(real_to_blind)}"
+            )
+        picked_blind = real_to_blind[fallback_label]
+        resolved_by = "fallback"
+    return {
+        "blind_id": picked_blind,
+        "selected": blind_to_real[picked_blind],
+        "why": why,
+        "resolved_by": resolved_by,
+    }

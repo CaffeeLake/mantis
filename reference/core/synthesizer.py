@@ -502,28 +502,31 @@ class ResearchGraphSynthesizer:
         target_root: str = ".",
         sandbox_type: Optional[str] = None,
         astm: Optional[dict] = None,
+        parallel_researchers: bool = False,
     ) -> WorkflowSpec:
         """Synthesizes a complete, runnable WorkflowSpec tailored to the detected archetype.
 
         `astm` is the Surveyor's map of the target. It supplies the archetype when the
         objective names no domain, and it never expands sandbox capability (section 5.4).
+        When `parallel_researchers` is True, emits two complementary parallel researcher
+        arms (`researcher_structural` and `researcher_domain`) converging at `dedupe`.
         """
         domain_slug = slugify(objective)
         archetype, archetype_source = self.detect_domain_archetype_with_provenance(objective, astm)
         cfg_archetype = DOMAIN_ARCHETYPES.get(archetype, {})
 
-        researcher_tools = cfg_archetype.get(
+        researcher_tools = list(cfg_archetype.get(
             "researcher_tools",
             ["read_file", "list_files", "report_findings", "get_findings", "get_threat_model", "record_threat_model"],
-        )
-        reproducer_tools = cfg_archetype.get(
+        ))
+        reproducer_tools = list(cfg_archetype.get(
             "reproducer_tools",
             ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
-        )
-        patcher_tools = cfg_archetype.get(
+        ))
+        patcher_tools = list(cfg_archetype.get(
             "patcher_tools",
             ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
-        )
+        ))
         # Sandbox selection, per section 5.4. An explicit operator choice is honoured
         # unchanged. Otherwise the archetype's preferred backend is a REQUEST, and what
         # it is clamped against depends on where the archetype came from:
@@ -566,6 +569,61 @@ class ResearchGraphSynthesizer:
 
         budget_dict = dataclasses.asdict(budget_config) if budget_config else dataclasses.asdict(BudgetConfig())
 
+        if parallel_researchers:
+            from core.prompts import get_stage_prompt
+
+            base_researcher_prompt = get_stage_prompt("researcher", "mantis-researcher")
+            structural_nav = ["find_symbol", "find_callers", "find_callees", "get_function_boundary"]
+            struct_tools = list(dict.fromkeys(researcher_tools + [t for t in structural_nav if t in VALID_TOOLS]))
+            domain_tools = list(dict.fromkeys(
+                researcher_tools + (["get_security_guidance"] if "get_security_guidance" in VALID_TOOLS else [])
+            ))
+            researcher_nodes: List[Dict[str, Any]] = [
+                {
+                    "id": "researcher_structural",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "system_prompt": (
+                        f"{base_researcher_prompt}\n\n"
+                        "You are the Structural Call-Graph Researcher arm. Use find_symbol, "
+                        "find_callers, find_callees, and get_function_boundary to trace "
+                        "cross-file source-to-sink data flows and report verified findings via report_findings."
+                    ),
+                    "tools": struct_tools,
+                },
+                {
+                    "id": "researcher_domain",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "system_prompt": (
+                        f"{base_researcher_prompt}\n\n"
+                        f"You are the Domain & Business-Logic Researcher arm for {archetype} ({objective}). "
+                        "Audit authentication/authorization invariants, state transitions, and trust boundary "
+                        "violations, and report verified findings via report_findings."
+                    ),
+                    "tools": domain_tools,
+                },
+            ]
+            researcher_edges: List[Dict[str, Any]] = [
+                {"from": "threat_model", "to": "researcher_structural"},
+                {"from": "threat_model", "to": "researcher_domain"},
+                {"from": "researcher_structural", "to": "dedupe"},
+                {"from": "researcher_domain", "to": "dedupe"},
+            ]
+        else:
+            researcher_nodes = [
+                {
+                    "id": "researcher",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "tools": researcher_tools,
+                },
+            ]
+            researcher_edges = [
+                {"from": "threat_model", "to": "researcher"},
+                {"from": "researcher", "to": "dedupe"},
+            ]
+
         # Build declarative nodes
         nodes: List[Dict[str, Any]] = [
             {
@@ -574,12 +632,7 @@ class ResearchGraphSynthesizer:
                 "skill": "mantis-threat-model",
                 "tools": ["read_file", "list_files", "record_threat_model", "get_threat_model"],
             },
-            {
-                "id": "researcher",
-                "type": "agent",
-                "skill": "mantis-researcher",
-                "tools": researcher_tools,
-            },
+            *researcher_nodes,
             {
                 "id": "dedupe",
                 "type": "agent",
@@ -653,8 +706,7 @@ class ResearchGraphSynthesizer:
         # Connect the edges
         edges: List[Dict[str, Any]] = [
             {"from": "START", "to": "threat_model"},
-            {"from": "threat_model", "to": "researcher"},
-            {"from": "researcher", "to": "dedupe"},
+            *researcher_edges,
             {"from": "dedupe", "to": "reviewer"},
             {"from": "reviewer", "to": "critic"},
             {"from": "critic", "to": "review_decision"},
@@ -1231,6 +1283,7 @@ class ResearchGraphSynthesizer:
         model: Optional[str] = None,
         timeout: Optional[float] = None,
         astm: Optional[dict] = None,
+        parallel_researchers: bool = False,
     ) -> WorkflowSpec:
         """Synthesizes a complete, runnable WorkflowSpec tailored to the given objective."""
         if use_llm:
@@ -1249,7 +1302,144 @@ class ResearchGraphSynthesizer:
             target_root=target_root,
             sandbox_type=sandbox_type,
             astm=astm,
+            parallel_researchers=parallel_researchers,
         )
+
+    def propose_probe_compose(
+        self,
+        objective: str,
+        budget_config: Optional[BudgetConfig] = None,
+        target_root: str = ".",
+        sandbox_type: Optional[str] = None,
+        astm: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """Harness²-style Propose–Probe–Compose (INV + DOM -> COMP) workflow synthesis.
+
+        Generates two orthogonal candidate modifications over the baseline workflow:
+          1. `inv` (Operational/Investigation proposer): enriches researcher,
+             reviewer, and patcher stages with structural call-graph navigation
+             tools (`find_symbol`, `find_callers`, `find_callees`,
+             `get_function_boundary`) and reachability verification instructions.
+          2. `dom` (Domain/Topology proposer): introduces parallel complementary
+             researcher arms (`researcher_structural` + `researcher_domain`) and
+             domain-tailored threat-model instructions.
+        Validates both candidates through `sanitize_and_validate_spec`, computes
+        pre-rollout `harness_diversity`, and composes (`composed`) the operational
+        and domain improvements into a unified, compiler-verified `WorkflowSpec`.
+        """
+        from core.diversity import harness_diversity
+        from core.prompts import get_stage_prompt
+
+        base_spec = self.synthesize_archetype(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+            parallel_researchers=False,
+        )
+
+        structural_nav = [
+            t
+            for t in ("find_symbol", "find_callers", "find_callees", "get_function_boundary")
+            if t in VALID_TOOLS
+        ]
+
+        # 1. Operational proposer (INV): structural navigation & call-graph verification
+        inv_raw = base_spec.model_dump(by_alias=True, exclude_none=True)
+        inv_raw["name"] = f"{base_spec.name}_inv"
+        for node in inv_raw.get("nodes", []):
+            nid = node.get("id", "")
+            if nid in ("researcher", "reviewer", "critic", "patcher"):
+                existing_tools = list(node.get("tools") or [])
+                node["tools"] = list(dict.fromkeys(existing_tools + structural_nav))
+            if nid == "researcher":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Investigation Focus: Use find_symbol, find_callers, "
+                    "find_callees, and get_function_boundary to verify cross-file "
+                    "source-to-sink reachability before calling report_findings."
+                )
+            elif nid == "reviewer":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Review Focus: Re-read enclosing functions with "
+                    "get_function_boundary and verify caller reachability with "
+                    "find_callers before emitting a ReviewVerdict."
+                )
+        inv_spec = self.sanitize_and_validate_spec(
+            raw_dict=inv_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        # 2. Domain/Topology proposer (DOM): parallel researcher arms + domain threat model
+        dom_spec = self.synthesize_archetype(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+            parallel_researchers=True,
+        )
+        dom_raw = dom_spec.model_dump(by_alias=True, exclude_none=True)
+        dom_raw["name"] = f"{base_spec.name}_dom"
+        for node in dom_raw.get("nodes", []):
+            if node.get("id") == "threat_model":
+                base_prompt = get_stage_prompt("threat_model", str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    f"Domain Threat Model Focus ({objective}): Enumerate trust boundaries, "
+                    "untrusted entrypoints, and privilege transitions before parallel "
+                    "researcher dispatch."
+                )
+        dom_spec = self.sanitize_and_validate_spec(
+            raw_dict=dom_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        # 3. Compose (COMP): merge DOM's parallel topology with INV's reviewer/critic/patcher tools
+        comp_raw = dom_spec.model_dump(by_alias=True, exclude_none=True)
+        comp_raw["name"] = f"{base_spec.name}_composed"
+        for node in comp_raw.get("nodes", []):
+            nid = node.get("id", "")
+            if nid in ("reviewer", "critic", "patcher"):
+                existing_tools = list(node.get("tools") or [])
+                node["tools"] = list(dict.fromkeys(existing_tools + structural_nav))
+            if nid == "reviewer":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Review Focus: Re-read enclosing functions with "
+                    "get_function_boundary and verify caller reachability with "
+                    "find_callers before emitting a ReviewVerdict."
+                )
+        comp_spec = self.sanitize_and_validate_spec(
+            raw_dict=comp_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        div_metrics = harness_diversity(
+            {"inv": inv_spec, "dom": dom_spec, "composed": comp_spec},
+            baseline=base_spec,
+        )
+        return {
+            "baseline": base_spec,
+            "inv": inv_spec,
+            "dom": dom_spec,
+            "composed": comp_spec,
+            "diversity": div_metrics,
+        }
 
     @staticmethod
     def persist_recipe(

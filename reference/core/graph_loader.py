@@ -1237,6 +1237,29 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
     return raw_json, base_dir
 
 
+class _BarrierAgent(adk.Agent):
+    """An agent node that waits for ALL of its predecessors before running.
+
+    ADK's Workflow consults the private ``_requires_all_predecessors`` property
+    (the same one ``google.adk.workflow.JoinNode`` sets) to decide whether a
+    node fires on the first incoming trigger or buffers until every
+    predecessor has COMPLETED. Fan-in nodes that are reached only by
+    unconditional edges (two parallel researcher arms converging at dedupe)
+    use this class so the join happens once instead of once per arm.
+
+    Known consequence: if any predecessor fails, the barrier never fires and
+    nothing downstream of it runs. That matches ADK's JoinNode semantics.
+
+    Defined at module level on purpose: tests spy on ``adk.Agent`` by swapping
+    it for a plain function, and a class statement inside the loader would
+    then try to use that function as a metaclass.
+    """
+
+    @property
+    def _requires_all_predecessors(self) -> bool:
+        return True
+
+
 def load_workflow_from_json(
     json_path: str,
     model_override: Optional[str] = None,
@@ -1303,6 +1326,17 @@ def load_workflow_from_json(
     resolvable_tools = {**TOOLS, **custom_tools}
 
     prefix_fingerprints: dict[str, str] = {}
+    unconditional_in_edges: dict[str, int] = {}
+    conditional_in_edges: dict[str, int] = {}
+    for edge_cfg in spec.edges:
+        if edge_cfg.on is None:
+            unconditional_in_edges[edge_cfg.to_node] = (
+                unconditional_in_edges.get(edge_cfg.to_node, 0) + 1
+            )
+        else:
+            conditional_in_edges[edge_cfg.to_node] = (
+                conditional_in_edges.get(edge_cfg.to_node, 0) + 1
+            )
 
     nodes = {}
     node_specs = {}
@@ -1559,7 +1593,13 @@ def load_workflow_from_json(
                     node_id, node_cfg.tools
                 )
 
-            agent = adk.Agent(**agent_kwargs)
+            agent_cls = (
+                _BarrierAgent
+                if unconditional_in_edges.get(node_id, 0) > 1
+                and conditional_in_edges.get(node_id, 0) == 0
+                else adk.Agent
+            )
+            agent = agent_cls(**agent_kwargs)
             node_retry = (
                 RetryConfig(
                     max_attempts=spec.config.retry_attempts,

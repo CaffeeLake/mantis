@@ -657,12 +657,23 @@ CODE_READ_TOOLS = ("read_file", "get_function_boundary")
 # architect, threat_modeler, planner, reporter, ...) call read_file on
 # workspace artifacts and orientation slices in EVERY campaign, so counting
 # them would hand a researcher that aborted on a prose-only first turn a
-# passing read delta every time. The names match workflow.json; the stages
-# listed after researcher only run once findings exist, so they can never
-# create credit on their own. A custom workflow whose audit nodes are named
-# differently fails CLOSED: reads count zero, credit is withheld with a
-# visible warning, and the slice is rescanned -- never silently stamped.
-AUDIT_NODES = ("researcher", "reviewer", "critic", "reproducer", "patcher")
+# passing read delta every time. The names match workflow.json plus the two
+# parallel researcher arms the synthesizer emits with parallel_researchers
+# (researcher_structural / researcher_domain, which replace "researcher" in
+# that topology); the stages listed after them only run once findings exist,
+# so they can never create credit on their own. A custom workflow whose audit
+# nodes are named differently fails CLOSED: reads count zero, credit is
+# withheld with a visible warning, and the slice is rescanned -- never
+# silently stamped.
+AUDIT_NODES = (
+    "researcher",
+    "researcher_structural",
+    "researcher_domain",
+    "reviewer",
+    "critic",
+    "reproducer",
+    "patcher",
+)
 
 
 def should_credit_coverage(task_failed: bool, code_read_calls: int) -> bool:

@@ -547,6 +547,129 @@ class TestResearchGraphSynthesis(unittest.TestCase):
         self.assertEqual(dedupe_node.model, "vertex_ai/gemini-3.5-flash-lite")
         self.assertEqual(dedupe_node.reasoning_effort, "medium")
 
+    def test_parallel_researchers_and_propose_probe_compose(self):
+        """Verifies Harness² parallel researcher arms, Propose-Probe-Compose, and diversity metrics."""
+        from core.diversity import assign_blind_ids, format_blind_candidates, resolve_blind_pick
+
+        synth = ResearchGraphSynthesizer(default_model="vertex_ai/gemini-3.8-flash")
+        ppc = synth.propose_probe_compose(
+            objective="Web REST API authentication and SQL injection audit"
+        )
+        self.assertIn("baseline", ppc)
+        self.assertIn("inv", ppc)
+        self.assertIn("dom", ppc)
+        self.assertIn("composed", ppc)
+
+        comp = ppc["composed"]
+        node_ids = {n.id for n in comp.nodes}
+        self.assertIn("researcher_structural", node_ids)
+        self.assertIn("researcher_domain", node_ids)
+        self.assertNotIn("researcher", node_ids)
+
+        # Verify composed graph loads cleanly into an executable ADK workflow
+        recipe_path = ResearchGraphSynthesizer.persist_recipe(comp, self.workspace_dir)
+        wf, _ = load_workflow_from_json(str(recipe_path))
+        self.assertIsNotNone(wf)
+        sub_agents = {
+            e.to_node.name: e.to_node
+            for e in getattr(wf, "edges", [])
+            if hasattr(e.to_node, "name")
+        }
+        self.assertIn("dedupe", sub_agents)
+        self.assertTrue(
+            getattr(sub_agents["dedupe"], "_requires_all_predecessors", False),
+            "dedupe fan-in node must act as a barrier waiting for both parallel researcher arms",
+        )
+        self.assertIn(
+            "Vulnerability Researcher stage",
+            getattr(sub_agents["researcher_structural"], "instruction", ""),
+        )
+        self.assertIn(
+            "Reviewer stage",
+            getattr(sub_agents["reviewer"], "instruction", ""),
+        )
+
+        # Verify diversity metrics confirm non-trivial divergence from baseline
+        div = ppc["diversity"]
+        self.assertEqual(div["n_candidates"], 3)
+        self.assertGreaterEqual(div["unique_structures"], 2)
+        self.assertLess(div["mean_pairwise_jaccard"], 1.0)
+        self.assertGreater(div["vs_baseline"]["composed"]["n_files_touched"], 0)
+
+        # Verify blind shuffled candidate selection strips provenance labels
+        b2r, r2b = assign_blind_ids(["baseline", "inv", "dom", "composed"], seed=42)
+        self.assertEqual(set(b2r.values()), {"baseline", "inv", "dom", "composed"})
+        formatted = format_blind_candidates({"baseline": "A", "inv": "B", "dom": "C", "composed": "D"}, b2r)
+        self.assertIn("c_alpha", formatted)
+        target_blind = r2b["composed"]
+        picked = resolve_blind_pick(
+            f"<why>Best coverage across structural and domain arms.</why><pick>{target_blind}</pick>",
+            b2r,
+        )
+        self.assertEqual(picked["selected"], "composed")
+        self.assertEqual(picked["resolved_by"], "pick")
+        self.assertIn("Best coverage", picked["why"])
+
+        # A reply that names no candidate is a selection failure, never a
+        # silent win for whichever blind id happens to come first.
+        with self.assertRaises(ValueError):
+            resolve_blind_pick("I cannot decide between these.", b2r)
+        fell_back = resolve_blind_pick(
+            "I cannot decide between these.", b2r, fallback_label="baseline"
+        )
+        self.assertEqual(fell_back["selected"], "baseline")
+        self.assertEqual(fell_back["resolved_by"], "fallback")
+        with self.assertRaises(ValueError):
+            resolve_blind_pick("no idea", b2r, fallback_label="not-a-candidate")
+
+    def test_parallel_researcher_arms_earn_coverage_credit(self):
+        """The arm node ids must be audit nodes, or a no-finding campaign is never credited.
+
+        core.budget.AUDIT_NODES fails closed on unknown names: a campaign whose
+        only code reads come from nodes outside it earns no examined-area
+        credit and is rescanned on every later run.
+        """
+        from core.budget import AUDIT_NODES
+
+        synth = ResearchGraphSynthesizer(default_model="vertex_ai/gemini-3.8-flash")
+        spec = synth.synthesize_archetype(
+            objective="Web REST API authentication audit", parallel_researchers=True
+        )
+        arm_ids = [n.id for n in spec.nodes if n.id.startswith("researcher")]
+        self.assertEqual(len(arm_ids), 2)
+        for node_id in arm_ids:
+            self.assertIn(node_id, AUDIT_NODES)
+
+    def test_barrier_agent_is_module_level_and_survives_agent_spy(self):
+        """Loading a fan-in workflow must work while adk.Agent is swapped for a function.
+
+        test_security_regression spies on the loader this way. A class statement
+        inside load_workflow_from_json would try to use the spy as a metaclass.
+        """
+        import core.graph_loader as gl
+
+        self.assertTrue(hasattr(gl, "_BarrierAgent"))
+        synth = ResearchGraphSynthesizer(default_model="vertex_ai/gemini-3.8-flash")
+        spec = synth.synthesize_archetype(
+            objective="Web REST API authentication audit", parallel_researchers=True
+        )
+        recipe_path = ResearchGraphSynthesizer.persist_recipe(spec, self.workspace_dir)
+
+        seen: list[str] = []
+        orig_agent = gl.adk.Agent
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("name", ""))
+            return orig_agent(*args, **kwargs)
+
+        gl.adk.Agent = spy
+        try:
+            wf, _ = load_workflow_from_json(str(recipe_path))
+        finally:
+            gl.adk.Agent = orig_agent
+        self.assertIsNotNone(wf)
+        self.assertIn("researcher_structural", seen)
+
 
 if __name__ == "__main__":
     unittest.main()
