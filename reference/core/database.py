@@ -1866,6 +1866,49 @@ def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = 
             return {"content": row["content"], "metadata_json": row["metadata_json"]}
         return None
 
+
+def update_artifact_metadata(
+    db_path: str,
+    run_id: str,
+    artifact_type: str = "",
+    filepath: str = "",
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Merges `metadata` into the latest matching campaign_artifacts row's metadata_json."""
+    if not db_path or not run_id or not metadata:
+        return False
+    try:
+        with _db(db_path) as conn:
+            cursor = conn.cursor()
+            query = "SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ?"
+            params: List[Any] = [run_id]
+            if filepath:
+                query += " AND filepath = ?"
+                params.append(filepath)
+            elif artifact_type:
+                query += " AND artifact_type = ?"
+                params.append(artifact_type)
+            query += " ORDER BY id DESC LIMIT 1"
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            if not row:
+                return False
+            try:
+                existing = json.loads(row["metadata_json"] or "{}")
+                if not isinstance(existing, dict):
+                    existing = {}
+            except ValueError:
+                existing = {}
+            existing.update(metadata)
+            cursor.execute(
+                "UPDATE campaign_artifacts SET metadata_json = ? WHERE id = ?",
+                (json.dumps(existing), row["id"]),
+            )
+            return cursor.rowcount > 0
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
 def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:
     """Records which model a run used. Idempotent: a run that is recorded
     again keeps its first model (a resumed run is the same run). Never
@@ -1905,10 +1948,22 @@ def run_models(db_path: str) -> Dict[str, str]:
 
 
 def record_learning(db_path: str, run_id: str, category: str, learning: str, tags: Optional[list] = None):
-    """Record a learning entry for cross-pass feedback."""
+    """Record a learning entry for cross-pass feedback, deduplicating within a run."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         tags_str = json.dumps(tags or [])
+        cursor.execute(
+            "SELECT id FROM learnings WHERE run_id = ? AND category = ? AND learning = ? LIMIT 1",
+            (run_id, category, learning),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            if tags:
+                cursor.execute(
+                    "UPDATE learnings SET tags = ? WHERE id = ?",
+                    (tags_str, existing["id"]),
+                )
+            return
         cursor.execute("""
             INSERT INTO learnings (run_id, category, learning, tags)
             VALUES (?, ?, ?, ?)

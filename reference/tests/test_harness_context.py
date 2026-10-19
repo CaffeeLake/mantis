@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 _REF_ROOT = Path(__file__).resolve().parent.parent
 if str(_REF_ROOT) not in sys.path:
@@ -197,6 +198,91 @@ class HarnessContextTreeTest(unittest.TestCase):
             tree = export_to_context_tree(db, Path(tmp) / "ctx", repo_root=tmp)
             self.assertIn("run-1", tree.deliverables)
             self.assertEqual(tree.decisions, 1)
+
+    def test_record_learning_deduplication_and_stage_model_callbacks(self):
+        from core.context import RunContext, current_run_context
+        from core.database import read_learnings
+        from core.graph_loader import (
+            _make_reflector_after_model_callback,
+            _make_stage_experience_before_model_callback,
+        )
+        from core.memory import recall, render_stage_learnings_for_agent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "knowledge.db")
+            init_db(db)
+            ctx = RunContext(jail_dir=tmp, db_path=db, run_id="run-dedup")
+            tok = current_run_context.set(ctx)
+            try:
+                after_model = _make_reflector_after_model_callback("reflector")
+
+                class _Part:
+                    text = (
+                        "<edits>\n- `find_callers` — helped — found sink\n</edits>\n"
+                        "<experience>\n"
+                        "cue: checking SQL sinks\n"
+                        "lesson: run get_function_boundary before dismissing\n"
+                        "evidence: turn 3\n"
+                        "target_stage: reviewer\n"
+                        "</experience>"
+                    )
+                    thought = False
+
+                class _Content:
+                    parts = [_Part()]
+
+                class _Resp:
+                    content = _Content()
+
+                # Calling twice must deduplicate within the same run_id
+                after_model(None, _Resp())
+                after_model(None, _Resp())
+                rows = read_learnings(db, run_id="run-dedup")
+                self.assertEqual(len(rows), 2)
+
+                # General recall excludes causal_edit by default
+                mem_default = recall(db)
+                self.assertTrue(
+                    all(item["category"] != "causal_edit" for item in mem_default["learnings"])
+                )
+                mem_with_edits = recall(db, include_causal_edits=True)
+                self.assertTrue(
+                    any(item["category"] == "causal_edit" for item in mem_with_edits["learnings"])
+                )
+
+                # Stage experience rendering wraps in CP-4 delimiters and injects via before_model_callback
+                rendered = render_stage_learnings_for_agent(db, "reviewer")
+                self.assertIn("[STAGE EXPERIENCE - REVIEWER]", rendered)
+                self.assertIn("get_function_boundary", rendered)
+                self.assertEqual(render_stage_learnings_for_agent(db, "patcher"), "")
+
+                class _Cfg:
+                    system_instruction = "Base reviewer prompt."
+
+                class _Req:
+                    config = _Cfg()
+
+                    def append_instructions(self, items):
+                        self.config.system_instruction += "\n\n" + "\n\n".join(items)
+
+                req = _Req()
+                before_model = _make_stage_experience_before_model_callback("reviewer")
+                with unittest.mock.patch(
+                    "core.memory.render_stage_learnings_for_agent",
+                    wraps=render_stage_learnings_for_agent,
+                ) as spy_render:
+                    before_model(None, req)
+                    self.assertIn("[STAGE EXPERIENCE - REVIEWER]", req.config.system_instruction)
+                    # Second turn with a fresh LlmRequest uses the closure cache
+                    # instead of re-querying SQLite.
+                    req2 = _Req()
+                    req2.config = _Cfg()
+                    before_model(None, req2)
+                    self.assertIn("[STAGE EXPERIENCE - REVIEWER]", req2.config.system_instruction)
+                    self.assertEqual(spy_render.call_count, 1)
+            finally:
+                current_run_context.reset(tok)
+
 
 
 if __name__ == "__main__":

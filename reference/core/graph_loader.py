@@ -670,18 +670,38 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
                 return None
             if ctx.run_id not in completed_runs:
                 return None
-            if _run_key(ctx) not in completed_keys:
+            key = _run_key(ctx)
+            if key not in completed_keys:
                 return None
-            from core.database import read_artifact
+            from core.database import read_artifact, read_artifact_record
             from core.paths import resolve_db_path
 
+            resolved_db = resolve_db_path(ctx.db_path)
             artifact = read_artifact(
-                resolve_db_path(ctx.db_path),
+                resolved_db,
                 artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
                 run_id=ctx.run_id,
             )
             if not artifact:
                 return None
+            rec = read_artifact_record(
+                resolved_db,
+                artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
+                run_id=ctx.run_id,
+            )
+            if rec and rec.get("metadata_json"):
+                try:
+                    meta = json.loads(rec["metadata_json"])
+                except ValueError:
+                    meta = {}
+                if isinstance(meta, dict) and meta.get("prefix_fingerprint"):
+                    stored_mark = (
+                        str(meta.get("snapshot_id", "")),
+                        str(meta.get("model", "")),
+                        str(meta.get("prefix_fingerprint", "")),
+                    )
+                    if stored_mark != (key[1], key[2], key[3]):
+                        return None
             return types.Content(
                 role="model",
                 parts=[types.Part(text=(
@@ -708,12 +728,110 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
                 and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
             ):
                 completed_runs.add(ctx.run_id)
-                completed_keys.add(_run_key(ctx))
+                key = _run_key(ctx)
+                completed_keys.add(key)
+                if ctx.db_path:
+                    from core.database import update_artifact_metadata
+                    from core.paths import resolve_db_path
+
+                    update_artifact_metadata(
+                        resolve_db_path(ctx.db_path),
+                        ctx.run_id,
+                        artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
+                        metadata={
+                            "snapshot_id": key[1],
+                            "model": key[2],
+                            "prefix_fingerprint": key[3],
+                        },
+                    )
         except Exception:
             pass
         return None
 
     return _before, _after
+
+
+def _make_stage_experience_before_model_callback(node_id: str):
+    """Injects stage-targeted <experience> lessons into the agent's LlmRequest."""
+    stage_key = "researcher" if node_id.startswith("researcher") else node_id
+    cached_blocks: dict[tuple[str, str, str], str] = {}
+
+    def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
+        try:
+            if llm_request is None:
+                return None
+            sys_inst = str(
+                getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
+            )
+            if "[STAGE EXPERIENCE" in sys_inst:
+                return None
+            from core.context import current_run_context
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.db_path:
+                return None
+            resolved_db = resolve_db_path(ctx.db_path)
+            if not os.path.exists(resolved_db):
+                return None
+            target_file = str(getattr(ctx, "target_file", "") or "")
+            cache_key = (
+                resolved_db,
+                str(getattr(ctx, "run_id", "") or ""),
+                target_file,
+            )
+            if cache_key not in cached_blocks:
+                from core.memory import render_stage_learnings_for_agent
+
+                cached_blocks[cache_key] = render_stage_learnings_for_agent(
+                    resolved_db,
+                    stage_key,
+                    target=target_file,
+                )
+            block = cached_blocks[cache_key]
+            if not block:
+                return None
+            if hasattr(llm_request, "append_instructions"):
+                llm_request.append_instructions([block])
+        except Exception:
+            pass
+        return None
+
+    return _before_model
+
+
+def _make_reflector_after_model_callback(node_id: str):
+    """Parses and persists <edits> and <experience> blocks emitted by reflector."""
+
+    def _after_model(callback_context: Any = None, llm_response: Any = None) -> None:
+        try:
+            if llm_response is None:
+                return None
+            parts = getattr(getattr(llm_response, "content", None), "parts", None) or []
+            text = "\n".join(
+                str(getattr(p, "text", "") or "")
+                for p in parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            )
+            if not text or ("<edits>" not in text.lower() and "<experience>" not in text.lower()):
+                return None
+            from core.context import current_run_context
+            from core.memory import record_reflection_output
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.db_path or not ctx.run_id:
+                return None
+            record_reflection_output(
+                resolve_db_path(ctx.db_path),
+                ctx.run_id,
+                text,
+            )
+        except Exception:
+            pass
+        return None
+
+    return _after_model
 
 
 def create_findings_gate(node_id: str):
@@ -1591,6 +1709,16 @@ def load_workflow_from_json(
             ):
                 agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
                     node_id, node_cfg.tools
+                )
+
+            agent_kwargs["before_model_callback"] = (
+                _make_stage_experience_before_model_callback(node_id)
+            )
+            if node_id == "reflector" or (
+                node_cfg.skill and "mantis-reflect" in node_cfg.skill
+            ):
+                agent_kwargs["after_model_callback"] = (
+                    _make_reflector_after_model_callback(node_id)
                 )
 
             agent_cls = (

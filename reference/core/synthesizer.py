@@ -1464,6 +1464,220 @@ class ResearchGraphSynthesizer:
 
         return recipe_path
 
+    def evolve_iteration(
+        self,
+        objective: str,
+        workspace_root: Path | str,
+        *,
+        budget_config: Optional[BudgetConfig] = None,
+        target_root: str = ".",
+        sandbox_type: Optional[str] = None,
+        astm: Optional[dict] = None,
+        db_path: Optional[str] = None,
+        run_id: str = "meta-evolve",
+        baseline_rollout: Any = None,
+        baseline_deliverable: Any = None,
+        probe_runner: Optional[Any] = None,
+        selector_fn: Optional[Any] = None,
+        reflector_fn: Optional[Any] = None,
+        seed: str = "mantis-blind-select",
+    ) -> Dict[str, Any]:
+        """Executes one complete Harness² Propose–Probe–Select–Reflect iteration.
+
+        1. Materializes an on-disk `ContextTree` (via `export_to_context_tree` and
+           `build_context_tree`) and builds the proposer prompt via `mission`.
+        2. Synthesizes `baseline`, `inv`, `dom`, and `composed` candidates via
+           `propose_probe_compose` and checks `harness_diversity`.
+        3. Runs candidate probes (via `probe_runner` or structural summaries),
+           anonymizes summaries (`assign_blind_ids`, `format_blind_candidates`),
+           resolves the winning candidate (`resolve_blind_pick` with non-regression
+           fallback to `"baseline"`), and persists the winning recipe via
+           `persist_recipe`.
+        4. Materializes the multi-candidate `ContextTree`, runs counterfactual
+           causal reflection (`parse_reflection_blocks`), and persists `<edits>`
+           and stage-targeted `<experience>` lessons via `record_reflection_output`.
+        """
+        from core.diversity import (
+            assign_blind_ids,
+            format_blind_candidates,
+            resolve_blind_pick,
+        )
+        from core.harness_context import (
+            build_context_tree,
+            mission,
+            parse_reflection_blocks,
+        )
+        from core.knowledge import export_to_context_tree
+        from core.memory import record_reflection_output
+
+        work_root = Path(workspace_root)
+        tree_dir = work_root / "context"
+        active_db = db_path or self.db_path
+        task_slug = slugify(objective)
+
+        prior_decisions: List[str] = []
+        if active_db and os.path.exists(active_db):
+            exported = export_to_context_tree(
+                active_db,
+                tree_dir,
+                task_description=objective,
+                repo_root=target_root,
+                task_id=task_slug,
+            )
+            dec_dir = exported.root / "decisions"
+            if dec_dir.is_dir():
+                for dec_file in sorted(dec_dir.glob("*.md")):
+                    prior_decisions.append(dec_file.read_text(encoding="utf-8"))
+
+        ppc = self.propose_probe_compose(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+        )
+        candidates: Dict[str, WorkflowSpec] = {
+            "baseline": ppc["baseline"],
+            "inv": ppc["inv"],
+            "dom": ppc["dom"],
+            "composed": ppc["composed"],
+        }
+        diversity = ppc["diversity"]
+
+        rollouts: Dict[str, Any] = {}
+        if baseline_rollout is not None:
+            rollouts["baseline"] = baseline_rollout
+        deliverables: Dict[str, Any] = {}
+        if baseline_deliverable is not None:
+            deliverables["baseline"] = baseline_deliverable
+        harness_files: Dict[str, str] = {
+            "baseline/workflow.json": json.dumps(
+                candidates["baseline"].model_dump(by_alias=True, exclude_none=True),
+                indent=2,
+                sort_keys=True,
+            )
+        }
+
+        proposer_tree = build_context_tree(
+            dest=tree_dir,
+            task_id=task_slug,
+            task_prompt=objective,
+            rollouts=rollouts,
+            deliverables=deliverables,
+            harness_files=harness_files,
+            decisions=prior_decisions,
+        )
+        proposer_mission = mission(
+            proposer_tree,
+            role="You are the Harness² Workflow Proposer.",
+            focus="Inspect context/rollouts/ and context/deliverables/ to diagnose bottlenecks.",
+            output="Return a compiler-valid WorkflowSpec JSON.",
+        )
+
+        summaries: Dict[str, Any] = {}
+        for label, spec in candidates.items():
+            harness_files[f"{label}/workflow.json"] = json.dumps(
+                spec.model_dump(by_alias=True, exclude_none=True),
+                indent=2,
+                sort_keys=True,
+            )
+            if callable(probe_runner):
+                probe_out = dict(probe_runner(label, spec) or {})
+                if probe_out.get("rollout") is not None:
+                    rollouts[label] = probe_out["rollout"]
+                if probe_out.get("deliverable") is not None:
+                    deliverables[label] = probe_out["deliverable"]
+                if probe_out.get("summary") is not None:
+                    summaries[label] = probe_out["summary"]
+                elif probe_out.get("deliverable") is not None:
+                    summaries[label] = probe_out["deliverable"]
+
+        blind_to_real, real_to_blind = assign_blind_ids(
+            list(candidates.keys()), seed=seed
+        )
+        blind_packet = (
+            format_blind_candidates(summaries, blind_to_real) if summaries else ""
+        )
+
+        if callable(probe_runner) and callable(selector_fn):
+            raw_pick = str(selector_fn(blind_packet, blind_to_real) or "")
+            try:
+                pick_resolution = resolve_blind_pick(
+                    raw_pick, blind_to_real, fallback_label="baseline"
+                )
+            except ValueError:
+                pick_resolution = {
+                    "blind_id": real_to_blind.get("baseline", ""),
+                    "selected": "baseline",
+                    "why": "Fallback to baseline on unparseable selector response.",
+                    "resolved_by": "fallback",
+                }
+        else:
+            pick_resolution = {
+                "blind_id": real_to_blind.get("baseline", ""),
+                "selected": "baseline",
+                "why": "No probe runner or blind selector supplied; retaining baseline.",
+                "resolved_by": "unprobed",
+            }
+        winning_label = pick_resolution["selected"]
+
+        winning_spec = candidates[winning_label]
+        recipe_path = self.persist_recipe(winning_spec, work_root)
+
+        reflection_tree = build_context_tree(
+            dest=tree_dir,
+            task_id=task_slug,
+            task_prompt=objective,
+            rollouts=rollouts,
+            deliverables=deliverables,
+            harness_files=harness_files,
+            decisions=prior_decisions,
+        )
+        reflection_mission = mission(
+            reflection_tree,
+            role="You are the Counterfactual Causal Reflector.",
+            focus=(
+                f"Compare winning candidate '{winning_label}' against baseline "
+                "and sibling arms in context/rollouts/ and context/deliverables/."
+            ),
+            output="Emit <edits> and <experience> blocks.",
+        )
+
+        reflection_text = ""
+        if callable(reflector_fn):
+            reflection_text = str(
+                reflector_fn(reflection_mission, reflection_tree) or ""
+            )
+
+        parsed_reflection = parse_reflection_blocks(reflection_text)
+        reflection_counts = {"edits": 0, "experiences": 0}
+        if (
+            callable(reflector_fn)
+            and reflection_text
+            and active_db
+            and os.path.exists(active_db)
+        ):
+            reflection_counts = record_reflection_output(
+                active_db, run_id, reflection_text
+            )
+
+        return {
+            "winning_label": winning_label,
+            "winning_spec": winning_spec,
+            "pick_resolution": pick_resolution,
+            "recipe_path": str(recipe_path),
+            "candidates": candidates,
+            "diversity": diversity,
+            "blind_mapping": blind_to_real,
+            "blind_packet": blind_packet,
+            "proposer_mission": proposer_mission,
+            "reflection_mission": reflection_mission,
+            "reflection": parsed_reflection,
+            "reflection_counts": reflection_counts,
+            "context_tree_root": str(reflection_tree.root),
+        }
+
+
 
 # Backwards compatibility alias
 WorkflowSynthesizer = ResearchGraphSynthesizer

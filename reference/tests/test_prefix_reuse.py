@@ -329,6 +329,57 @@ class ContentAddressedPrefixAndToolLoopGuardTest(unittest.TestCase):
         self.assertEqual(len(fps["architect"]), 16)
         self.assertEqual(len(fps["threat_modeler"]), 16)
 
+    def test_prefix_reuse_persists_and_verifies_db_runmark_metadata(self):
+        """After-callback stamps runmark metadata into campaign_artifacts and before-callback verifies it."""
+        import json as _json
+        from core.database import read_artifact_record, update_artifact_metadata
+        from core.graph_loader import _make_prefix_reuse_callbacks
+
+        before, after = _make_prefix_reuse_callbacks("architect", fingerprint="fp-v1")
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "knowledge.db")
+            init_db(db)
+            record_artifact(
+                db,
+                "run-mark",
+                "summary",
+                "workspace/.structured/summary.json",
+                '{"components": []}',
+            )
+            ctx = RunContext(
+                jail_dir=tmp,
+                db_path=db,
+                run_id="run-mark",
+                scan_mode="cross-functional",
+                snapshot_id="snap-abc",
+                model="vertex_ai/gemini-3.8-flash",
+                prefix_fingerprints={"architect": "fp-v1"},
+            )
+            tok = current_run_context.set(ctx)
+            try:
+                after()
+                rec = read_artifact_record(db, artifact_type="summary", run_id="run-mark")
+                self.assertIsNotNone(rec)
+                meta = _json.loads(rec["metadata_json"] or "{}")
+                self.assertEqual(meta.get("prefix_fingerprint"), "fp-v1")
+                self.assertEqual(meta.get("snapshot_id"), "snap-abc")
+                self.assertEqual(meta.get("model"), "vertex_ai/gemini-3.8-flash")
+
+                # Matching runmark reuses artifact
+                self.assertIsNotNone(before())
+
+                # Tampered/stale DB runmark metadata invalidates reuse
+                update_artifact_metadata(
+                    db,
+                    "run-mark",
+                    artifact_type="summary",
+                    metadata={"prefix_fingerprint": "fp-stale"},
+                )
+                self.assertIsNone(before())
+            finally:
+                current_run_context.reset(tok)
+
+
 
 if __name__ == "__main__":
     unittest.main()

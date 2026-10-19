@@ -670,6 +670,116 @@ class TestResearchGraphSynthesis(unittest.TestCase):
         self.assertIsNotNone(wf)
         self.assertIn("researcher_structural", seen)
 
+    def test_evolve_iteration_runs_propose_probe_select_reflect_loop(self):
+        """End-to-end verification of ResearchGraphSynthesizer.evolve_iteration."""
+        from core.database import init_db, read_learnings
+        from core.memory import render_stage_learnings_for_agent
+
+        db_path = str(self.workspace_dir / "evolve.db")
+        init_db(db_path)
+        synth = ResearchGraphSynthesizer(
+            default_model="vertex_ai/gemini-3.8-flash", db_path=db_path
+        )
+
+        # 1. Fail-safe defaults (no probe_runner, no selector_fn, no reflector_fn):
+        #    returns winning_label="baseline" with resolved_by="unprobed", writes
+        #    nothing to rollouts/ for unprobed candidates, and persists no reflection.
+        unprobed = synth.evolve_iteration(
+            objective="Web REST API authentication and SQLi audit",
+            workspace_root=self.workspace_dir / "unprobed",
+            db_path=db_path,
+            run_id="evolve-unprobed",
+        )
+        self.assertEqual(unprobed["winning_label"], "baseline")
+        self.assertEqual(unprobed["pick_resolution"]["resolved_by"], "unprobed")
+        self.assertFalse((Path(unprobed["context_tree_root"]) / "rollouts").exists())
+        self.assertEqual(unprobed["reflection_counts"], {"edits": 0, "experiences": 0})
+        self.assertEqual(read_learnings(db_path), [])
+
+        # 2. Full Propose-Probe-Select-Reflect iteration with real probe_runner,
+        #    selector_fn, and reflector_fn:
+        probed_labels: list[str] = []
+
+        def fake_probe_runner(label, spec):
+            probed_labels.append(label)
+            return {
+                "summary": f"Probe summary for {label}: {len(spec.nodes)} nodes",
+                "rollout": [
+                    {
+                        "author": "researcher",
+                        "type": "tool_call",
+                        "name": "find_callers",
+                        "args": '{"symbol": "redeem"}',
+                    }
+                ],
+                "deliverable": [{"title": f"Finding from {label}"}],
+            }
+
+        def fake_selector(blind_packet, blind_to_real):
+            real_to_blind = {real: blind for blind, real in blind_to_real.items()}
+            return (
+                "<why>Composed candidate combined parallel arms with reviewer nav tools.</why>"
+                f"<pick>{real_to_blind['composed']}</pick>"
+            )
+
+        def fake_reflector(reflection_mission, reflection_tree):
+            self.assertIn("context/rollouts/", reflection_mission)
+            self.assertIn("context/deliverables/", reflection_mission)
+            return (
+                "<edits>\n"
+                "- `composed` parallel researcher arms — helped — traced cross-file flow\n"
+                "</edits>\n"
+                "<experience>\n"
+                "[\n"
+                "  {\n"
+                '    "cue": "auditing Web REST API authentication",\n'
+                '    "lesson": "use find_callers and get_function_boundary before reporting",\n'
+                '    "evidence": "turn 1 find_callers(redeem) in composed rollout",\n'
+                '    "confidence": "high",\n'
+                '    "target_stage": "researcher"\n'
+                "  }\n"
+                "]\n"
+                "</experience>"
+            )
+
+        out = synth.evolve_iteration(
+            objective="Web REST API authentication and SQLi audit",
+            workspace_root=self.workspace_dir,
+            db_path=db_path,
+            run_id="evolve-run-1",
+            probe_runner=fake_probe_runner,
+            selector_fn=fake_selector,
+            reflector_fn=fake_reflector,
+        )
+        self.assertEqual(set(probed_labels), {"baseline", "inv", "dom", "composed"})
+        self.assertEqual(out["winning_label"], "composed")
+        self.assertEqual(out["pick_resolution"]["resolved_by"], "pick")
+        self.assertTrue(Path(out["recipe_path"]).is_file())
+        self.assertTrue((Path(out["context_tree_root"]) / "task.md").is_file())
+        self.assertTrue(
+            (Path(out["context_tree_root"]) / "rollouts" / "composed.md").is_file()
+        )
+        self.assertIn("context/rollouts/", out["reflection_mission"])
+        self.assertIn("context/deliverables/", out["reflection_mission"])
+        self.assertEqual(out["reflection_counts"], {"edits": 1, "experiences": 1})
+
+        # Stage-targeted lesson from the reflection is immediately recallable for researcher
+        stage_block = render_stage_learnings_for_agent(db_path, "researcher")
+        self.assertIn("find_callers", stage_block)
+
+        # 3. Unparseable selector reply falls back safely to baseline (non-regression)
+        out_fallback = synth.evolve_iteration(
+            objective="Web REST API authentication and SQLi audit",
+            workspace_root=self.workspace_dir / "fb",
+            db_path=db_path,
+            run_id="evolve-run-2",
+            probe_runner=fake_probe_runner,
+            selector_fn=lambda packet, mapping: "I cannot decide which candidate is better.",
+        )
+        self.assertEqual(out_fallback["winning_label"], "baseline")
+        self.assertEqual(out_fallback["pick_resolution"]["resolved_by"], "fallback")
+
+
 
 if __name__ == "__main__":
     unittest.main()
