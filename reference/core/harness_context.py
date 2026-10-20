@@ -21,7 +21,9 @@ Adapted from open-source google-research/harness2 (Apache-2.0):
   - `parse_reflection_blocks`: extracts structured `<experience>` lessons
     (`cue`, `lesson`, `evidence`, `confidence`, `target_stage`) from reflector
     output. Lessons without evidence are dropped: an invented attribution
-    poisons memory for every later run.
+    poisons memory for every later run. A bare `NO_ENTRY` line is the
+    reflector's explicit "nothing citable this run" and is reported as such
+    rather than as a parse that found nothing.
 """
 
 from __future__ import annotations
@@ -78,6 +80,27 @@ _MARKER_SCAN_SUFFIXES: frozenset[str] = frozenset({
 _EXP_RE = re.compile(
     r"<experience>(.*?)</experience>", re.DOTALL | re.IGNORECASE
 )
+
+# The reflector's explicit "this run taught nothing citable" answer: the token
+# alone on a line, case-insensitive, tolerating the backticks or emphasis a
+# model tends to wrap a bare keyword in. `NO_ENTRY for the patcher` is prose,
+# not the token, and does not match.
+_NO_ENTRY_RE = re.compile(r"^\s*[`*_]*\s*NO_ENTRY\s*[`*_]*\s*\.?\s*$", re.IGNORECASE | re.MULTILINE)
+
+# The confidence vocabulary memory ranks by. Anything else a model writes
+# ("very high", "certain", "0.9") is not a rank and collapses to the middle.
+EXPERIENCE_CONFIDENCE_LEVELS: tuple[str, ...] = ("high", "medium", "low")
+_DEFAULT_CONFIDENCE = "medium"
+
+
+def normalize_experience_confidence(value: Any) -> str:
+    """Maps a reflector-written confidence to one of EXPERIENCE_CONFIDENCE_LEVELS.
+
+    Unknown or empty values become `medium`: a lesson whose confidence cannot be
+    read is neither promoted above well-evidenced ones nor buried below them.
+    """
+    token = str(value or "").strip().lower()
+    return token if token in EXPERIENCE_CONFIDENCE_LEVELS else _DEFAULT_CONFIDENCE
 
 
 def assert_no_leak_paths(
@@ -207,22 +230,32 @@ def parse_reflection_blocks(text: str) -> dict[str, Any]:
     Accepts both key-value blocks (`cue: ...`, `lesson: ...`, `evidence: ...`)
     and JSON array/object blocks. A lesson is kept only when `cue`, `lesson`
     and `evidence` are all present -- the same gate Harness² applies before
-    anything enters its library. `confidence` defaults to `medium` and
-    `target_stage` to `global`.
+    anything enters its library. `confidence` is normalised to
+    `high` | `medium` | `low` (anything else reads as `medium`) and
+    `target_stage` defaults to `global`.
 
-    Returns `{"experiences": [...]}`; never raises on malformed input, but
-    raises `ValueError` if the parsed output would carry a grader verdict.
+    A bare `NO_ENTRY` line is the reflector saying, explicitly, that this run
+    produced nothing citable. It returns `{"experiences": [], "no_entry": True}`
+    and wins over any `<experience>` block in the same text: a lesson emitted
+    alongside a declaration that there is none is a contradiction, and the
+    fail-safe reading of a contradiction is that nothing enters memory.
+
+    Returns `{"experiences": [...]}` otherwise; never raises on malformed
+    input, but raises `ValueError` if the parsed output would carry a grader
+    verdict.
     """
     experiences: list[dict[str, str]] = []
     if not text or not isinstance(text, str):
         return {"experiences": experiences}
+    if _NO_ENTRY_RE.search(text):
+        return {"experiences": [], "no_entry": True}
 
     allowed_keys = ("cue", "lesson", "evidence", "confidence", "target_stage")
     required = ("cue", "lesson", "evidence")
 
     def _accept(entry: dict[str, str]) -> None:
         if all(entry.get(req) for req in required):
-            entry.setdefault("confidence", "medium")
+            entry["confidence"] = normalize_experience_confidence(entry.get("confidence"))
             entry.setdefault("target_stage", "global")
             experiences.append(entry)
 

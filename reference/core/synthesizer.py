@@ -47,6 +47,7 @@ from core.config import (
     format_auth_error_message,
 )
 from core.graph_loader import (
+    MAX_NODE_SYSTEM_PROMPT_CHARS,
     NODE_STAMP_STATUSES,
     ClassifierNode,
     EdgeSpec,
@@ -120,7 +121,7 @@ A valid workflow JSON has the following top-level structure:
 1. Agent Nodes ("type": "agent"):
    - "id": Unique Python identifier string (e.g. "threat_model", "concurrency_auditor", "reproducer").
    - "skill": Name of a standard skill from the Known Skills list (e.g. "mantis-researcher", "mantis-reproduce") OR omit if using custom inline "system_prompt".
-   - "system_prompt": (Optional) Direct inline string instruction for specialized agents (e.g. "Audit async Rust channels for deadlock hazards.").
+   - "system_prompt": (Optional) Direct inline string instruction for specialized agents (e.g. "Audit async Rust channels for deadlock hazards."). Keep it short: it is always-on text on every turn and a long one is rejected.
    - "tools": Array of tool names chosen STRICTLY from the Registered Tools Whitelist below.
    - "output_schema": (Optional) Pydantic structured output model for classifier routing:
      * "ReviewVerdict": emits {"route": "confirmed" | "false_positive", "reason": "..."}
@@ -783,6 +784,8 @@ class ResearchGraphSynthesizer:
         4. Sandbox Policy Gate: Strictly respects operator sandbox overrides without silent downgrades.
         5. Invariant Gate: Associates output schemas (ReviewVerdict, CriticVerdict, ReproVerdict) and
            verifies final Pydantic model validation.
+        6. Prompt Cap Gate: Rejects (does not truncate) a node system_prompt longer than
+           MAX_NODE_SYSTEM_PROMPT_CHARS, so the repair loop can ask for a shorter one.
         """
         domain_slug = slugify(objective)
         archetype = self.detect_domain_archetype(objective)
@@ -911,8 +914,17 @@ class ResearchGraphSynthesizer:
                     # Refuse filesystem paths or traversal attempts
                     if sp_clean.startswith(("/", "./", "../")) or (len(sp_clean) < 100 and sp_clean.endswith((".md", ".txt", ".py", ".json", ".sh"))):
                         system_prompt = None
-                    elif len(sp_clean) > 8192:
-                        system_prompt = sp_clean[:8192]
+                    elif len(sp_clean) > MAX_NODE_SYSTEM_PROMPT_CHARS:
+                        # A validation error, not a truncation: this gate runs
+                        # inside the synthesis repair loop, so the model is told
+                        # and shortens it, whereas a prompt cut at an arbitrary
+                        # character is a different instruction nobody reviewed.
+                        raise ValueError(
+                            f"[SYNTHESIZER COMPILER GATE] Node '{clean_id}': system_prompt is "
+                            f"{len(sp_clean)} chars, over the {MAX_NODE_SYSTEM_PROMPT_CHARS}-char cap. "
+                            f"Shorten it; a system prompt is always-on text that competes with the "
+                            f"agent's output budget on every turn."
+                        )
                     else:
                         system_prompt = sp_clean
                 else:

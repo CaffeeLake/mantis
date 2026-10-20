@@ -59,6 +59,32 @@ _SEED_FIELD_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)[^{}]*\}")
 _SEED_ALLOWED_FIELDS = frozenset({"filepath", "run_id"})
 _MAX_SEED_PROMPT_CHARS = 20000
 
+# Caps on always-on prompt text. Every token that rides in the system
+# instruction on every turn competes with the agent's output budget, and the
+# costliest failure a stage can have is to reason until the budget is gone and
+# produce nothing. Two seams add text to a node's instruction and each is
+# bounded at its seam:
+#
+# - MAX_APPENDED_INSTRUCTION_CHARS bounds the stage-experience block that
+#   _make_stage_experience_before_model_callback appends at request time. It
+#   is TRUNCATED, never refused: recall is advisory, so a long memory costs the
+#   agent its least-ranked lessons, not the run. The cut is announced by a
+#   trailing marker line; nothing is dropped silently.
+# - MAX_NODE_SYSTEM_PROMPT_CHARS bounds a synthesizer-authored node
+#   `system_prompt`. There it is a VALIDATION error (core.synthesizer), because
+#   the synthesizer runs inside a repair loop that can feed the error back to
+#   the model, and a truncated instruction is a different instruction. The
+#   shipped workflow.json carries no inline prompts (its stage prompts are
+#   ~1 KB) and synthesize_archetype's longest is ~1.3 KB, so 12000 leaves
+#   roughly 9x headroom for a specialised prompt without admitting a
+#   skill-file-sized one.
+MAX_APPENDED_INSTRUCTION_CHARS = 4000
+MAX_NODE_SYSTEM_PROMPT_CHARS = 12000
+_APPENDED_TRUNCATION_MARKER = (
+    "[STAGE EXPERIENCE truncated: {omitted} chars omitted; "
+    "fewer, better-evidenced lessons are worth more than more]"
+)
+
 
 class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -713,12 +739,83 @@ def _make_prefix_reuse_callbacks(node_id: str):
     return _before, _after
 
 
+def bound_appended_instruction(
+    block: str, cap: int = MAX_APPENDED_INSTRUCTION_CHARS
+) -> tuple[str, int]:
+    """Bounds a stage-experience block to `cap` characters without breaking its fence.
+
+    Returns `(bounded, omitted)`; `omitted` is 0 and `bounded is block` when
+    nothing had to go. Otherwise whole lesson lines are dropped from the
+    BOTTOM of the CP-4 fenced body -- render_stage_learnings_for_agent emits
+    them best-ranked first, so the bottom is the least-evidenced, oldest
+    lesson -- the closing delimiter is kept so the fence never stays open
+    over whatever instruction follows, and a trailing marker line states how
+    many characters were cut. The marker sits OUTSIDE the fence: it is
+    harness text about the block, not prior-run prose.
+
+    The result is never longer than `cap`, including the marker.
+    """
+    if len(block) <= cap:
+        return block, 0
+
+    from core.llm_gateway import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START
+
+    # Reserve the marker's room at its widest: the omitted count can never
+    # exceed the block's own length.
+    budget = max(0, cap - 1 - len(_APPENDED_TRUNCATION_MARKER.format(omitted=len(block))))
+
+    def _whole_lines(candidates: list[str]) -> str:
+        kept_text = ""
+        for line in candidates:
+            trial = f"{kept_text}\n{line}" if kept_text else line
+            if len(trial) > budget:
+                break
+            kept_text = trial
+        return kept_text
+
+    lines = block.split("\n")
+    open_i = next((i for i, line in enumerate(lines) if line.startswith(UNTRUSTED_DATA_START)), -1)
+    close_i = next(
+        (i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith(UNTRUSTED_DATA_END)),
+        -1,
+    )
+    if open_i != -1 and close_i > open_i:
+        head, tail = lines[: open_i + 1], lines[close_i:]
+        body: list[str] = []
+        for line in lines[open_i + 1 : close_i]:
+            if len("\n".join(head + body + [line] + tail)) > budget:
+                break
+            body.append(line)
+        kept = "\n".join(head + body + tail)
+        if len(kept) > budget:
+            # Not even an empty fence fits (a cap far below the module
+            # constant). Keep whatever header fits and no fence at all, so no
+            # delimiter is ever left half-written or unmatched.
+            kept = _whole_lines(lines[:open_i])
+    else:
+        # Not fenced (nothing renders such a block today; defensive). Cut at a
+        # line boundary so no lesson is left half-said.
+        kept = _whole_lines(lines)
+
+    omitted = len(block) - len(kept)
+    return f"{kept}\n{_APPENDED_TRUNCATION_MARKER.format(omitted=omitted)}", omitted
+
+
 def _make_stage_experience_before_model_callback(node_id: str):
-    """Injects stage-targeted <experience> lessons into the agent's LlmRequest."""
+    """Injects stage-targeted <experience> lessons into the agent's LlmRequest.
+
+    The block is rendered once per campaign (cached by database, run and
+    target) and bounded to MAX_APPENDED_INSTRUCTION_CHARS before it is
+    appended; a cut is reported once per node on stderr and always in the
+    block itself, so an operator reading the prompt can see memory was
+    shortened rather than wonder why a lesson is missing.
+    """
     stage_key = "researcher" if node_id.startswith("researcher") else node_id
     cached_blocks: dict[tuple[str, str, str], str] = {}
+    truncation_logged = False
 
     def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
+        nonlocal truncation_logged
         try:
             if llm_request is None:
                 return None
@@ -745,11 +842,22 @@ def _make_stage_experience_before_model_callback(node_id: str):
             if cache_key not in cached_blocks:
                 from core.memory import render_stage_learnings_for_agent
 
-                cached_blocks[cache_key] = render_stage_learnings_for_agent(
+                rendered = render_stage_learnings_for_agent(
                     resolved_db,
                     stage_key,
                     target=target_file,
                 )
+                bounded, omitted = bound_appended_instruction(rendered)
+                if omitted and not truncation_logged:
+                    truncation_logged = True
+                    print(
+                        f"[{node_id}] stage experience for '{stage_key}' rendered to "
+                        f"{len(rendered)} chars; appended {len(bounded)} "
+                        f"(cap {MAX_APPENDED_INSTRUCTION_CHARS}), {omitted} omitted. "
+                        f"The block carries a truncation marker.",
+                        file=sys.stderr,
+                    )
+                cached_blocks[cache_key] = bounded
             block = cached_blocks[cache_key]
             if not block:
                 return None
@@ -763,7 +871,12 @@ def _make_stage_experience_before_model_callback(node_id: str):
 
 
 def _make_reflector_after_model_callback(node_id: str):
-    """Parses and persists <edits> and <experience> blocks emitted by reflector."""
+    """Parses and persists the <experience> blocks emitted by the reflector.
+
+    A reply that carries no block -- including the explicit `NO_ENTRY`
+    answer -- touches nothing; memory is written only through
+    core.memory.record_reflection_output's evidence gate.
+    """
 
     def _after_model(callback_context: Any = None, llm_response: Any = None) -> None:
         try:
@@ -775,7 +888,7 @@ def _make_reflector_after_model_callback(node_id: str):
                 for p in parts
                 if getattr(p, "text", None) and not getattr(p, "thought", False)
             )
-            if not text or ("<edits>" not in text.lower() and "<experience>" not in text.lower()):
+            if not text or "<experience>" not in text.lower():
                 return None
             from core.context import current_run_context
             from core.memory import record_reflection_output

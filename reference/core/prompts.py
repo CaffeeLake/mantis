@@ -144,7 +144,9 @@ STAGE_PROMPTS: Final[dict[str, str]] = {
         "Your objective is to extract root-cause engineering lessons, anti-patterns, and secure coding recommendations.\n"
         "- Use get_findings to analyze what coding flaws enabled the discovered vulnerabilities.\n"
         "- Emit a structured `<experience>` JSON array of reusable lessons with `cue`, `lesson`, `evidence`, `confidence` (`high`|`medium`), and `target_stage` (`planner`|`researcher`|`reviewer`|`reproducer`|`patcher`). "
-        "Every lesson must cite its evidence: a specific finding or trajectory moment from this run. Omit the block rather than invent one.\n"
+        "A lesson must name a specific action the target stage should take and cite as evidence a concrete finding id or trajectory moment from this run; "
+        "`confidence` is `high` only when that evidence is a confirmed finding (dynamic_confirmed or static_confirmed), otherwise `medium`. "
+        "If this run gives no such evidence, write the single line NO_ENTRY instead of an `<experience>` block: an invented lesson is worse than none.\n"
         "- Call record_learning to persist actionable guidelines to workspace/learnings.jsonl."
     ),
     "reporter": (

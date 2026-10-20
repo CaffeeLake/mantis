@@ -303,6 +303,21 @@ changed since"), and reopen on any later report of the same lineage. The name is
 the hint: to a person or an agent reading the knowledge, an archived entry is
 the place most worth a second look.
 
+Lessons are the one kind of knowledge the pipeline writes about *itself*. At the
+end of a run the `reflector` may record `<experience>` lessons addressed to a
+later stage — "when auditing coupon state transitions, call `find_callers` on
+the DAO mutation before reading the route handler" — and each must cite a
+finding id or trajectory moment from the run it came from. A lesson without
+evidence is dropped before it is stored, and a reflector with nothing citable
+answers `NO_ENTRY` rather than inventing one. Lessons are prose from an earlier
+model, so a stage receives them fenced as evidence, never as instructions:
+ranked `high` (the evidence was a confirmed finding) before `medium` before
+`low`, newest first within a rank, and bounded — the injected block is capped at
+a few thousand characters, cut from its least-evidenced end, and states in its
+last line how much it left out. Every always-on token competes with the agent's
+output budget, and a run that reasons until the budget is gone and produces
+nothing is the costliest failure there is.
+
 ## Evidence Sources
 
 Every fact carries the tier of the source it came from, and a tier states what a

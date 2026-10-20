@@ -94,6 +94,36 @@ _STATUSES_DISMISSED = ("false_positive", "non_viable", "sample_or_test")
 # evidence is old, the place moved, and nobody has said the bug is gone.
 _STATUSES_ARCHIVED = ("archived",)
 
+# How stage-targeted lessons are ordered when more exist than the cap admits.
+# Confidence is a validated token (core.harness_context normalises it to this
+# vocabulary before anything is written), so it can be ranked; an unknown or
+# missing value sits in the middle rather than being promoted or buried.
+_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def _recency_key(item: Dict[str, Any]) -> tuple:
+    """Sort key for write order; sort with reverse=True for newest first.
+
+    `timestamp` is the learnings table's write time at second resolution; `id`
+    breaks ties among rows a single reflector turn wrote in the same second.
+    """
+    return (str(item.get("timestamp") or ""), int(item.get("id") or 0))
+
+
+def _rank_learnings(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Orders lessons high > medium > low, newest first within a rank.
+
+    Two stable sorts: recency first, then confidence, so the confidence pass
+    preserves the recency order among equals.
+    """
+    ranked = sorted(items, key=_recency_key, reverse=True)
+    ranked.sort(
+        key=lambda item: _CONFIDENCE_RANK.get(
+            str(item.get("confidence") or ""), _CONFIDENCE_RANK["medium"]
+        )
+    )
+    return ranked
+
 
 def _clip(text: Any, limit: int = _MAX_PROSE_CHARS) -> str:
     """Bounds a prose field. Never raises on non-string input."""
@@ -516,11 +546,15 @@ def recall(
                 raw_tags = []
         tags = [str(t).strip() for t in (raw_tags if isinstance(raw_tags, list) else []) if _is_str(t)]
         target_stage = str(row.get("target_stage") or "").strip()
-        if not target_stage:
-            for tag in tags:
-                if tag.startswith("stage:") and len(tag) > 6:
-                    target_stage = tag[6:].strip()
-                    break
+        confidence = ""
+        for tag in tags:
+            if not target_stage and tag.startswith("stage:") and len(tag) > 6:
+                target_stage = tag[6:].strip()
+            elif not confidence and tag.startswith("confidence:"):
+                confidence = tag[len("confidence:"):].strip().lower()
+        # The `id` is the only strictly monotonic write-order key: `timestamp` has
+        # second resolution and a reflector records several lessons in one second.
+        row_id = row.get("id")
         learnings.append(
             {
                 "category": category,
@@ -528,8 +562,20 @@ def recall(
                 "run_id": str(row.get("run_id") or ""),
                 "tags": tags,
                 "target_stage": target_stage,
+                # Ranking keys, not prose. `confidence` is a tag the reflector
+                # wrote through record_reflection_output, normalised there to the
+                # high/medium/low vocabulary; `timestamp` and `id` order recency.
+                "confidence": confidence if confidence in _CONFIDENCE_RANK else "medium",
+                "timestamp": str(row.get("timestamp") or ""),
+                "id": row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else 0,
             }
         )
+
+    # Newest first, as for findings: when the cap below cuts the list, what
+    # survives is the lesson most recently learned about this code, not the
+    # oldest row in the table. Confidence ranking is a stage-recall concern
+    # (recall_for_stage); general recall keeps plain recency.
+    learnings.sort(key=_recency_key, reverse=True)
 
     truncated = (
         len(confirmed) > max_findings
@@ -668,6 +714,11 @@ def recall_for_stage(
     `target_stage` (or a `stage:<node_id>` tag). Specific stage matches are
     returned first, followed by untargeted general learnings when
     `include_general` is True.
+
+    Within each group the order is confidence (high > medium > low), then
+    newest first. The cap is `max_learnings`, so when a knowledge base holds
+    more lessons than a prompt should carry, what is dropped is the oldest of
+    the least-evidenced -- the lesson a reader would have weighted least.
     """
     stage_norm = str(stage or "").strip().lower()
     mem = recall(db_path, target=target, max_learnings=max_learnings * 4)
@@ -680,7 +731,7 @@ def recall_for_stage(
             targeted.append(item)
         elif item_stage in ("", "global") and include_general:
             general.append(item)
-    return (targeted + general)[:max_learnings]
+    return (_rank_learnings(targeted) + _rank_learnings(general))[:max_learnings]
 
 
 def render_stage_learnings_for_agent(
@@ -690,6 +741,12 @@ def render_stage_learnings_for_agent(
     max_learnings: int = _MAX_LEARNINGS,
 ) -> str:
     """Renders stage-targeted `<experience>` lessons for `stage` with CP-4 fencing.
+
+    Each line carries the lesson's confidence rank in front of its prose, e.g.
+    `- [high] When <cue>: <lesson> (evidence: ...)`, so a reader can weight it
+    without parsing the fenced text. Lines arrive in recall_for_stage order
+    (high > medium > low, newest first), which is also the order a caller that
+    must shorten the block should cut from the bottom.
 
     Returns "" when no lessons target `stage`, so callers can skip injection cleanly.
     """
@@ -706,7 +763,7 @@ def render_stage_learnings_for_agent(
     if not items:
         return ""
     lines = [
-        f"  - [{item.get('category') or stage_norm}] {item.get('learning')}"
+        f"  - [{item.get('confidence') or 'medium'}] {item.get('learning')}"
         for item in items
         if item.get("learning")
     ]
@@ -736,21 +793,28 @@ def record_reflection_output(
     Only lessons that carry `cue`, `lesson` AND `evidence` survive
     `parse_reflection_blocks`; nothing without evidence enters memory. Each
     lesson is stored under category `experience:<target_stage>` with
-    `stage:` and `confidence:` tags so `recall_for_stage` can route it.
+    `stage:` and `confidence:` tags so `recall_for_stage` can route and rank
+    it. A reflector that answered `NO_ENTRY` writes nothing, by design.
 
     Returns `{"experiences": int}`. Never raises (INV-6).
     """
     counts = {"experiences": 0}
     try:
         from core.database import record_learning
-        from core.harness_context import parse_reflection_blocks
+        from core.harness_context import (
+            normalize_experience_confidence,
+            parse_reflection_blocks,
+        )
 
         parsed = parse_reflection_blocks(raw_text)
+        if parsed.get("no_entry"):
+            logger.info("Reflector for run %s declared NO_ENTRY; nothing recorded.", run_id)
+            return counts
         for exp in parsed.get("experiences") or []:
             cue = str(exp.get("cue") or "").strip()
             lesson = str(exp.get("lesson") or "").strip()
             evidence = str(exp.get("evidence") or "").strip()
-            confidence = str(exp.get("confidence") or "medium").strip().lower()
+            confidence = normalize_experience_confidence(exp.get("confidence"))
             target_stage = str(exp.get("target_stage") or "global").strip().lower()
             if not cue or not lesson or not evidence:
                 continue
