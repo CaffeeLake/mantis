@@ -31,3 +31,10 @@ repos:
         files: ^(skills/[^/]+/SKILL\.md|reference/skills/[^/]+/SKILL\.md)$
         pass_filenames: true
 
+      - id: check-license-headers
+        name: Ensure every code file (.py, .sh) carries the Apache-2.0 header
+        entry: python3 reference/scripts/check_license_headers.py
+        language: system
+        files: \.(py|sh)$
+        pass_filenames: false
+

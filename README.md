@@ -136,6 +136,13 @@ example sandboxes for testing, but if you use the most advanced frontier models
 you should go beyond this and additionally set up an additional sandboxing layer
 that itself contains very strong monitoring to look for escape attempts.
 
+## License
+
+Mantis is licensed under the [Apache License, Version 2.0](LICENSE). Every
+Python and shell file carries the license header;
+`reference/scripts/check_license_headers.py` (run by `pre-commit` and the test
+suite) keeps it that way.
+
 ## Disclaimers
 
 This is not an officially supported Google product. This project is not eligible
