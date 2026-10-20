@@ -143,9 +143,20 @@ def load_research_ground_truth(path: Path) -> List[Dict[str, Any]]:
                 "cross_file": bool(entry.get("cross_file")),
                 "class": str(entry.get("class") or ""),
                 "cwe": str(entry.get("cwe") or ""),
+                # "seeded" entries are what recall counts. "decoy_*" entries
+                # are places that look like the bug but are not one; a report
+                # that matches one is a certain false positive. Absent = seeded.
+                "kind": str(entry.get("kind") or "seeded"),
             }
         )
     return out
+
+
+DECOY_KIND_PREFIX = "decoy_"
+
+
+def is_decoy(gt_entry: Dict[str, Any]) -> bool:
+    return str(gt_entry.get("kind") or "seeded").startswith(DECOY_KIND_PREFIX)
 
 
 def _norm_path(path: Any) -> str:
@@ -181,17 +192,37 @@ def score_research_findings(
 ) -> Dict[str, Any]:
     """Scores reported findings against ground truth. Pure function.
 
-    Returns recall, cross_file_recall, precision, and per-entry placement.
-    Precision is computed over unique results -- detected entries vs unmatched
-    reports -- so duplicate reports of a matched entry neither help nor hurt.
+    Ground truth has two kinds of entry. *Seeded* entries are the bugs: recall
+    is the share of them detected. *Decoy* entries (``kind`` starting with
+    ``decoy_``) are places that look like a bug and are not -- the same sink
+    behind a sanitiser, the same code with no caller, the same pattern in a
+    test or vendored file. A report that matches a decoy is a certain false
+    positive, and ``decoy_fp_rate`` is the share of decoys reported.
+
+    Precision is computed over unique results so duplicate reports of a
+    matched entry neither help nor hurt. It is reported two ways because an
+    unmatched report may be a hallucination or a real bug nobody seeded:
+    ``precision`` (strict) counts every unmatched report as wrong;
+    ``precision_lenient`` counts only decoy hits as wrong. A large gap
+    between the two is a prompt to adjudicate the unmatched reports by hand.
     """
+    seeded = [gt for gt in gt_entries if not is_decoy(gt)]
+    decoys = [gt for gt in gt_entries if is_decoy(gt)]
     matched: Dict[str, List[int]] = {gt["id"]: [] for gt in gt_entries}
     unmatched_findings: List[Dict[str, Any]] = []
+    decoy_finding_idx: set[int] = set()
     for idx, finding in enumerate(findings):
-        hits = [gt["id"] for gt in gt_entries if match_finding(finding, gt)]
-        if hits:
-            for gt_id in hits:
+        seeded_hits = [gt["id"] for gt in seeded if match_finding(finding, gt)]
+        decoy_hits = [gt["id"] for gt in decoys if match_finding(finding, gt)]
+        if seeded_hits:
+            # A report that names a real bug is a true report even if its
+            # phrasing also brushes a decoy's file.
+            for gt_id in seeded_hits:
                 matched[gt_id].append(idx)
+        elif decoy_hits:
+            for gt_id in decoy_hits:
+                matched[gt_id].append(idx)
+            decoy_finding_idx.add(idx)
         else:
             unmatched_findings.append(
                 {
@@ -201,32 +232,43 @@ def score_research_findings(
                 }
             )
 
-    detected = [gt for gt in gt_entries if matched[gt["id"]]]
-    cross = [gt for gt in gt_entries if gt["cross_file"]]
+    detected = [gt for gt in seeded if matched[gt["id"]]]
+    cross = [gt for gt in seeded if gt["cross_file"]]
     cross_detected = [gt for gt in cross if matched[gt["id"]]]
-    true_findings = len(findings) - len(unmatched_findings)
-    unique_results = len(detected) + len(unmatched_findings)
+    decoys_hit = [gt for gt in decoys if matched[gt["id"]]]
+    true_findings = len(findings) - len(unmatched_findings) - len(decoy_finding_idx)
+    unique_results = len(detected) + len(decoys_hit) + len(unmatched_findings)
+    unique_results_lenient = len(detected) + len(decoys_hit)
 
     return {
-        "ground_truth_total": len(gt_entries),
+        "ground_truth_total": len(seeded),
         "detected": len(detected),
-        "recall": round(len(detected) / len(gt_entries), 4) if gt_entries else 0.0,
+        "recall": round(len(detected) / len(seeded), 4) if seeded else 0.0,
         "cross_file_total": len(cross),
         "cross_file_detected": len(cross_detected),
         "cross_file_recall": round(len(cross_detected) / len(cross), 4) if cross else 0.0,
         "findings_reported": len(findings),
         "findings_true": true_findings,
+        "findings_decoy": len(decoy_finding_idx),
+        "decoys_total": len(decoys),
+        "decoys_hit": len(decoys_hit),
+        "decoy_fp_rate": round(len(decoys_hit) / len(decoys), 4) if decoys else 0.0,
         "precision": (
             round(len(detected) / unique_results, 4) if unique_results else 0.0
+        ),
+        "precision_lenient": (
+            round(len(detected) / unique_results_lenient, 4)
+            if unique_results_lenient else 0.0
         ),
         "duplicates": sum(max(0, len(v) - 1) for v in matched.values()),
         "per_entry": [
             {
                 "id": gt["id"],
+                "kind": gt.get("kind", "seeded"),
                 "class": gt["class"],
                 "cross_file": gt["cross_file"],
                 "detected": bool(matched[gt["id"]]),
-                "finding_indexes": matched[gt["id"]],
+                "matched_findings": matched[gt["id"]],
             }
             for gt in gt_entries
         ],

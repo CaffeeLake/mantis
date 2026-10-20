@@ -112,6 +112,36 @@ the number is a measurement at all:
   runs that differ in either are averaged together. A toolset whose tools are
   not all registered fails to run rather than quietly becoming the other arm.
 
+### Generated targets (`research_targets/gen.py`)
+
+The hand-written corpus is one sample, and it fits in a context window. For any
+claim that a change *improves* the researcher, use generated targets:
+
+```bash
+python3 evals/research_targets/gen.py --seed 1001 --size medium --out /tmp/t1001
+python3 evals/research_eval.py --target /tmp/t1001 --toolset structural --max-tokens 1500000 ...
+python3 evals/research_targets/gen.py --list dev        # 1000-1099
+python3 evals/research_targets/gen.py --list holdout    # 9000-9099 (needs --allow-holdout to write)
+```
+
+- `generate(seed, size)` is deterministic. Each target carries ~11 **seeded**
+  bugs across ten classes (most of them 2–3 hop route → service → store flows)
+  and ~7 **decoys**: the same sink behind a real mitigation (`decoy_sanitized`),
+  the same code with no caller (`decoy_dead`), and the same pattern under
+  `tests/` or `vendor/` (`decoy_vendor`). A report that matches a decoy is
+  scored as a certain false positive (`decoy_fp_rate`, `precision` strict vs
+  `precision_lenient`).
+- `--size small|medium|large` pads the tree with benign modules (≈70 / 220 / 700
+  files) so that reading everything stops fitting in context — the condition
+  under which navigation is supposed to matter.
+- **Holdout is by construction.** Seeds 9000–9099 are for one-shot confirmation
+  after a change passes on dev seeds; `assert_not_holdout` refuses to build a
+  proposer, reflector, or tuning context on them, and one bug class (`xss`)
+  never appears in dev targets. Burned holdout seeds should be retired to dev.
+- The generated tree must read like ordinary code;
+  `tests/test_research_targets.py` greps every file for words that would name a
+  flaw.
+
 ### Field evidence: toolset A/B on an external target
 
 The seeded corpus measures recall; it cannot say whether the structural toolset
