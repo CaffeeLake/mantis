@@ -36,18 +36,25 @@ from evals.research_eval import (
     ABORT_GUARD_PROMPT,
     DEFAULT_TARGET,
     GROUND_TRUTH_BASENAME,
+    STRUCTURAL_NAV_TOOLS,
     TOOLSETS,
     TRANSCRIPT_PAYLOAD_LIMIT,
+    ToolTelemetry,
     _clip,
     _copy_target,
+    cap_exceeded,
+    config_fingerprint,
     count_event_tool_calls,
     event_has_pseudo_tool_call,
     event_transcript_rows,
     extract_event_tokens,
+    ground_truth_version,
     load_research_ground_truth,
     match_finding,
+    read_is_windowed,
     score_research_findings,
     should_rearm_run,
+    summarize_research_runs,
 )
 
 
@@ -272,6 +279,22 @@ class ToolsetContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_toolset("nonexistent")
 
+    def test_missing_tool_fails_the_arm_instead_of_degrading_it(self):
+        try:
+            import evals.research_eval as re_mod
+            from evals.research_eval import resolve_toolset
+        except ImportError as exc:  # pragma: no cover - minimal environments
+            self.skipTest(f"tool registry unavailable: {exc}")
+        saved = dict(re_mod.TOOLSETS)
+        re_mod.TOOLSETS["degraded"] = TOOLSETS["baseline"] + ["tool_that_does_not_exist"]
+        try:
+            with self.assertRaises(ValueError) as cm:
+                resolve_toolset("degraded")
+            self.assertIn("tool_that_does_not_exist", str(cm.exception))
+        finally:
+            re_mod.TOOLSETS.clear()
+            re_mod.TOOLSETS.update(saved)
+
 
 class AbortGuardTest(unittest.TestCase):
     """The silent-abort re-arm: once, and only for runs that did nothing."""
@@ -363,6 +386,145 @@ class TranscriptRowsTest(unittest.TestCase):
     def test_malformed_event_yields_no_rows(self):
         self.assertEqual(event_transcript_rows(None), [])
         self.assertEqual(event_transcript_rows(types.SimpleNamespace()), [])
+
+
+def _call_event(name, args=None):
+    part = types.SimpleNamespace(
+        text=None,
+        function_call=types.SimpleNamespace(name=name, args=args or {}),
+        function_response=None,
+    )
+    return types.SimpleNamespace(content=types.SimpleNamespace(parts=[part]))
+
+
+def _response_event(name, response):
+    part = types.SimpleNamespace(
+        text=None,
+        function_call=None,
+        function_response=types.SimpleNamespace(name=name, response=response),
+    )
+    return types.SimpleNamespace(content=types.SimpleNamespace(parts=[part]))
+
+
+class ToolTelemetryTest(unittest.TestCase):
+    """How a run read is measured from the same events the score is."""
+
+    def test_windowed_rule_matches_the_production_guard(self):
+        self.assertFalse(read_is_windowed({"filepath": "a.py"}))
+        self.assertFalse(read_is_windowed({"filepath": "a.py", "start_line": 0, "end_line": 0}))
+        self.assertTrue(read_is_windowed({"filepath": "a.py", "start_line": 10, "end_line": 40}))
+        self.assertTrue(read_is_windowed({"filepath": "a.py", "end_line": 40}))
+        self.assertFalse(read_is_windowed(None))
+
+    def test_counts_reads_navigation_hints_and_report_marks(self):
+        t = ToolTelemetry()
+        t.observe(_call_event("list_files", {"directory": "app"}), 1_000)
+        t.observe(_call_event("read_file", {"filepath": "app/a.py"}), 2_000)
+        t.observe(_call_event("read_file", {"filepath": "app/a.py", "start_line": 0, "end_line": 0}), 3_000)
+        t.observe(_call_event("read_file", {"filepath": "app/b.py", "start_line": 5, "end_line": 50}), 4_000)
+        t.observe(_call_event("find_callers", {"name": "redeem"}), 5_000)
+        t.observe(_call_event("get_function_boundary", {"filepath": "app/a.py", "line": 12}), 6_000)
+        t.observe(_response_event("read_file", "src...\n\n[HARNESS STEERING HINT: ...]"), 6_000)
+        t.observe(_response_event("read_file", {"result": "plain"}), 6_000)
+        t.observe(_call_event("report_findings", {"findings": []}), 7_500)
+        t.observe(_call_event("report_findings", {"findings": []}), 9_000)
+        d = t.as_dict()
+        self.assertEqual(d["unwindowed_reads"], 2)
+        self.assertEqual(d["windowed_reads"], 1)
+        self.assertEqual(d["structural_nav_calls"], 2)
+        self.assertEqual(d["list_files_calls"], 1)
+        self.assertEqual(d["report_findings_calls"], 2)
+        self.assertEqual(d["steering_hints_fired"], 1)
+        self.assertEqual(d["unique_files_read"], 2)
+        self.assertEqual(d["repeat_unwindowed_files"], 1)
+        self.assertEqual(d["report_token_marks"], [7_500, 9_000])
+        self.assertEqual(d["tool_counts"]["read_file"], 3)
+        self.assertTrue(STRUCTURAL_NAV_TOOLS <= set(TOOLSETS["structural"]))
+
+    def test_malformed_events_are_ignored(self):
+        t = ToolTelemetry()
+        t.observe(None, 0)
+        t.observe(types.SimpleNamespace(), 0)
+        t.observe(types.SimpleNamespace(content=types.SimpleNamespace(parts=[object()])), 0)
+        self.assertEqual(t.as_dict()["tool_counts"], {})
+
+
+class CapAndIdentityTest(unittest.TestCase):
+    def test_caps_are_inclusive_and_none_means_uncapped(self):
+        self.assertFalse(cap_exceeded(10**9, 10**6))
+        self.assertFalse(cap_exceeded(999, 5, max_tokens=1000))
+        self.assertTrue(cap_exceeded(1000, 5, max_tokens=1000))
+        self.assertTrue(cap_exceeded(5, 20, max_tool_calls=20))
+        self.assertFalse(cap_exceeded(5, 19, max_tokens=0, max_tool_calls=20))
+
+    def test_fingerprint_changes_with_prompt_tools_model_and_answer_key(self):
+        base = config_fingerprint("m", "low", ["read_file", "list_files"], "prompt", "gt1")
+        self.assertEqual(len(base), 16)
+        self.assertEqual(base, config_fingerprint("m", "low", ["list_files", "read_file"], "prompt", "gt1"))
+        for changed in (
+            config_fingerprint("m2", "low", ["read_file", "list_files"], "prompt", "gt1"),
+            config_fingerprint("m", "high", ["read_file", "list_files"], "prompt", "gt1"),
+            config_fingerprint("m", "low", ["read_file"], "prompt", "gt1"),
+            config_fingerprint("m", "low", ["read_file", "list_files"], "prompt v2", "gt1"),
+            config_fingerprint("m", "low", ["read_file", "list_files"], "prompt", "gt2"),
+        ):
+            self.assertNotEqual(base, changed)
+
+    def test_ground_truth_version_tracks_file_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "ground_truth.json"
+            p.write_text('{"findings": [1]}', encoding="utf-8")
+            v1 = ground_truth_version(p)
+            self.assertEqual(v1, ground_truth_version(p))
+            p.write_text('{"findings": [1, 2]}', encoding="utf-8")
+            self.assertNotEqual(v1, ground_truth_version(p))
+        self.assertEqual(len(ground_truth_version(DEFAULT_TARGET / GROUND_TRUTH_BASENAME)), 12)
+
+
+class SummarizeRunsTest(unittest.TestCase):
+    """Crashed runs are missing measurements, not low scores."""
+
+    def test_ungraded_runs_leave_every_mean(self):
+        runs = [
+            {"graded": True, "recall": 0.5, "cross_file_recall": 0.4, "precision": 1.0,
+             "total_tokens": 100, "tokens_per_detected": 10, "zero_findings_complete": False,
+             "telemetry": {"unwindowed_reads": 4, "structural_nav_calls": 2},
+             "ground_truth_version": "gt1", "config_fingerprint": "cfg1"},
+            {"graded": False, "status": "ungraded", "recall": 0.0, "cross_file_recall": 0.0,
+             "precision": 0.0, "total_tokens": 5, "run_errors": ["boom"],
+             "ground_truth_version": "gt1", "config_fingerprint": "cfg1"},
+            {"graded": True, "recall": 0.0, "cross_file_recall": 0.0, "precision": 0.0,
+             "total_tokens": 50, "tokens_per_detected": None, "zero_findings_complete": True,
+             "cap_hit": True, "abort_guard_rearms": 1,
+             "telemetry": {"unwindowed_reads": 0, "structural_nav_calls": 0},
+             "ground_truth_version": "gt1", "config_fingerprint": "cfg1"},
+        ]
+        agg = summarize_research_runs(runs)
+        self.assertEqual((agg["runs"], agg["graded"], agg["ungraded"]), (3, 2, 1))
+        self.assertAlmostEqual(agg["avg_recall"], 0.25)  # (0.5 + 0.0) / 2 -- the crash is not a zero
+        self.assertEqual(agg["worst_recall"], 0.0)       # the real zero is
+        self.assertAlmostEqual(agg["avg_tokens"], 75.0)
+        self.assertEqual(agg["zero_finding_runs"], 1)
+        self.assertEqual(agg["cap_hits"], 1)
+        self.assertEqual(agg["rearms"], 1)
+        self.assertAlmostEqual(agg["avg_unwindowed_reads"], 2.0)
+        self.assertEqual(agg["ground_truth_versions"], ["gt1"])
+
+    def test_legacy_rows_without_graded_flag_count_as_graded(self):
+        agg = summarize_research_runs([{"recall": 1.0}, {"recall": 0.0}])
+        self.assertEqual(agg["graded"], 2)
+        self.assertAlmostEqual(agg["avg_recall"], 0.5)
+
+    def test_mixed_versions_are_reported_not_hidden(self):
+        agg = summarize_research_runs([
+            {"recall": 1.0, "ground_truth_version": "a", "config_fingerprint": "x"},
+            {"recall": 1.0, "ground_truth_version": "b", "config_fingerprint": "x"},
+        ])
+        self.assertEqual(agg["ground_truth_versions"], ["a", "b"])
+
+    def test_empty_input(self):
+        agg = summarize_research_runs([])
+        self.assertEqual((agg["runs"], agg["graded"], agg["avg_recall"]), (0, 0, 0.0))
 
 
 if __name__ == "__main__":

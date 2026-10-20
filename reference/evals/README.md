@@ -83,7 +83,34 @@ python3 evals/run_eval.py --stage research --runs 3
 # Single configuration, explicit toolset A/B:
 python3 evals/research_eval.py --model vertex_ai/gemini-3.8-flash \
     --effort low --toolset baseline --json-out /tmp/baseline.json
+
+# Two arms at equal spend; the score is recall at the cap:
+python3 evals/research_eval.py --toolset baseline   --max-tokens 1500000 ...
+python3 evals/research_eval.py --toolset structural --max-tokens 1500000 ...
 ```
+
+### What a result says about itself
+
+Recall on a 26-file corpus says little about a repository that does not fit in
+one context window, so every result also records *how* the run read, and whether
+the number is a measurement at all:
+
+- `telemetry`: whole-file vs windowed `read_file` calls (a read with
+  `start_line=0, end_line=0` is whole-file), structural navigation calls,
+  loop-guard hints fired, unique files read, repeated whole-file reads, and the
+  cumulative token count at each `report_findings` call (the raw material for a
+  recall-vs-tokens curve).
+- `graded` / `status`: a run that crashed is `ungraded`. Its partial findings
+  are kept for a human reader, but `run_eval.py` leaves it out of every mean and
+  counts it as a failure — a crash is a missing measurement, not a low score. A
+  run that completed and reported nothing is a real zero
+  (`zero_findings_complete`).
+- `cap_hit`: the run was stopped at `--max-tokens` / `--max-tool-calls`; still
+  graded, as recall@cap.
+- `config_fingerprint` / `ground_truth_version`: what was measured (model,
+  effort, tools, prompt) and against which answer key. `run_eval.py` warns when
+  runs that differ in either are averaged together. A toolset whose tools are
+  not all registered fails to run rather than quietly becoming the other arm.
 
 ### Field evidence: toolset A/B on an external target
 

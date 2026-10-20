@@ -350,21 +350,28 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, to
             print(f"--> [CALIBRATE] MAE: {avg_mae_s} | Priority Acc: {avg_prio*100:.0f}% | Max Unscored: {max_unscored} | Latency: {avg_lat:.2f}s")
             summary_rows.append(row)
         elif stage == "research":
-            recalls = [r.get("recall", 0.0) for r in run_results]
-            cross = [r.get("cross_file_recall", 0.0) for r in run_results]
-            precisions = [r.get("precision", 0.0) for r in run_results]
-            token_counts = [r.get("total_tokens", 0) for r in run_results]
-            tptf = [r.get("tokens_per_detected") for r in run_results if r.get("tokens_per_detected")]
-            avg_rec = sum(recalls) / len(recalls) if recalls else 0.0
+            from evals.research_eval import summarize_research_runs
+
+            agg = summarize_research_runs(run_results)
+            avg_rec = agg["avg_recall"]
             # Report worst-case recall across runs too: a configuration that
             # only sometimes finds the cross-file bugs is not reliable.
-            worst_rec = min(recalls) if recalls else 0.0
-            avg_cross = sum(cross) / len(cross) if cross else 0.0
-            avg_prec = sum(precisions) / len(precisions) if precisions else 0.0
-            avg_tokens = sum(token_counts) / len(token_counts) if token_counts else 0
-            avg_tptf = sum(tptf) / len(tptf) if tptf else 0
-            row = {"model": short_name, "effort": effort, "avg_recall": f"{avg_rec*100:.0f}%", "worst_recall": f"{worst_rec*100:.0f}%", "cross_recall": f"{avg_cross*100:.0f}%", "avg_precision": f"{avg_prec*100:.0f}%", "tokens_per_detected": f"{avg_tptf:,.0f}" if avg_tptf else "n/a", "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
-            print(f"--> [RESEARCH] Avg Rec: {avg_rec*100:.0f}% (worst {worst_rec*100:.0f}%) | Cross-file Rec: {avg_cross*100:.0f}% | Prec: {avg_prec*100:.0f}% | Tokens: {avg_tokens:,.0f} | Latency: {avg_lat:.2f}s")
+            worst_rec = agg["worst_recall"]
+            avg_cross = agg["avg_cross_file_recall"]
+            avg_prec = agg["avg_precision"]
+            avg_tokens = agg["avg_tokens"]
+            avg_tptf = agg["avg_tokens_per_detected"]
+            validity = f"{agg['graded']}/{agg['runs']} graded"
+            if agg["zero_finding_runs"]:
+                validity += f", {agg['zero_finding_runs']} zero"
+            if agg["cap_hits"]:
+                validity += f", {agg['cap_hits']} capped"
+            if agg["rearms"]:
+                validity += f", {agg['rearms']} re-armed"
+            row = {"model": short_name, "effort": effort, "avg_recall": f"{avg_rec*100:.0f}%", "worst_recall": f"{worst_rec*100:.0f}%", "cross_recall": f"{avg_cross*100:.0f}%", "avg_precision": f"{avg_prec*100:.0f}%", "tokens_per_detected": f"{avg_tptf:,.0f}" if avg_tptf else "n/a", "validity": validity, "latency": f"{avg_lat:.2f}s ({min_lat:.1f}s-{max_lat:.1f}s)"}
+            print(f"--> [RESEARCH] Avg Rec: {avg_rec*100:.0f}% (worst {worst_rec*100:.0f}%) | Cross-file Rec: {avg_cross*100:.0f}% | Prec: {avg_prec*100:.0f}% | Tokens: {avg_tokens:,.0f} | Reads un/windowed: {agg['avg_unwindowed_reads']:.1f} | Nav calls: {agg['avg_structural_nav_calls']:.1f} | {validity} | Latency: {avg_lat:.2f}s")
+            if len(agg["ground_truth_versions"]) > 1 or len(agg["config_fingerprints"]) > 1:
+                print("    WARNING: these runs mix ground-truth versions or configurations; the averages above blend different measurements.")
             summary_rows.append(row)
     print("\n" + "=" * 110)
     print(f"                    STAGE: {stage.upper()} BENCHMARK RESULTS SUMMARY ({runs} RUNS)")
@@ -390,10 +397,10 @@ async def run_stage_benchmark(stage: str, models: List[tuple], runs: int = 1, to
         for r in summary_rows:
             print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_mae']:<15} | {r['prio_acc']:<13} | {r['max_unscored']:<13} | {r['latency']}")
     elif stage == "research":
-        print(f"{'Model':<22} | {'Effort':<6} | {'Avg Rec':<8} | {'Worst Rec':<10} | {'XFile Rec':<10} | {'Avg Prec':<9} | {'Tok/Detected':<13} | {'Latency Distribution'}")
+        print(f"{'Model':<22} | {'Effort':<6} | {'Avg Rec':<8} | {'Worst Rec':<10} | {'XFile Rec':<10} | {'Avg Prec':<9} | {'Tok/Detected':<13} | {'Validity':<22} | {'Latency Distribution'}")
         print("-" * 110)
         for r in summary_rows:
-            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_recall']:<8} | {r['worst_recall']:<10} | {r['cross_recall']:<10} | {r['avg_precision']:<9} | {r['tokens_per_detected']:<13} | {r['latency']}")
+            print(f"{r['model']:<22} | {r['effort']:<6} | {r['avg_recall']:<8} | {r['worst_recall']:<10} | {r['cross_recall']:<10} | {r['avg_precision']:<9} | {r['tokens_per_detected']:<13} | {r['validity']:<22} | {r['latency']}")
     print("=" * 110)
 
 async def main():
