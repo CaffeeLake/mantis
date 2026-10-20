@@ -78,14 +78,43 @@ class SetupScriptTest(unittest.TestCase):
             p.chmod(0o755)
         self.log = self.tmp / "calls.log"
 
-    def run_script(self, *args, exists=False, env_exists=False, **stub_env):
-        env = dict(os.environ, PATH=f"{self.bin}:{os.environ.get('PATH', '')}",
+    def run_script(self, *args, exists=False, env_exists=False, path=None, **stub_env):
+        env = dict(os.environ, PATH=path or f"{self.bin}:{os.environ.get('PATH', '')}",
                    STUB_LOG=str(self.log), STUB_EXISTS="1" if exists else "0",
                    STUB_ENV_EXISTS="1" if env_exists else "0")
         env.update({k: str(v) for k, v in stub_env.items()})
         proc = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True,
                               timeout=120, env=env)
         return proc.returncode, proc.stdout + proc.stderr
+
+    def path_without(self, *names):
+        """A PATH equal to the current one minus the named commands.
+
+        `command -v gh` in the script must fail for the "gh is not installed"
+        case, and whether a real gh sits in /usr/bin depends on the machine
+        (one appeared on the dev box mid-day and this test started failing).
+        Every executable on the current PATH except `names` is symlinked into
+        one directory, which becomes the whole PATH after the stub dir.
+        """
+        shadow = self.tmp / "shadow_path"
+        shadow.mkdir(exist_ok=True)
+        seen = set(names)
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            for name in entries:
+                if name in seen:
+                    continue
+                src = os.path.join(d, name)
+                if os.path.isfile(src) and os.access(src, os.X_OK):
+                    try:
+                        os.symlink(src, shadow / name)
+                        seen.add(name)
+                    except OSError:
+                        pass
+        return f"{self.bin}:{shadow}"
 
     def calls(self):
         if not self.log.exists():
@@ -308,7 +337,8 @@ class SetupScriptTest(unittest.TestCase):
 
     def test_name_only_pinning_warns(self):
         (self.bin / "gh").unlink()
-        code, out = self.run_script("--project", "my-mantis-scan", "--repo", "acme/widgets", "--no-budget")
+        no_gh = self.path_without("gh")
+        code, out = self.run_script("--project", "my-mantis-scan", "--repo", "acme/widgets", "--no-budget", path=no_gh)
         self.assertEqual(code, 0, out)
         self.assertIn("WARNING", out)
         self.assertIn("by NAME only", out)
@@ -317,7 +347,7 @@ class SetupScriptTest(unittest.TestCase):
         self.assertNotIn("repository_id", cond)
         # A dry run without gh shows the name-only plan rather than placeholders.
         code, out = self.run_script("--project", "my-mantis-scan", "--repo", "acme/widgets", "--no-budget",
-                                    "--dry-run")
+                                    "--dry-run", path=no_gh)
         self.assertEqual(code, 0, out)
         self.assertNotIn("<repo-id>", out)
         self.assertIn("by NAME only", out)

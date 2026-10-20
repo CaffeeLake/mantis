@@ -22,7 +22,9 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 _REF_ROOT = Path(__file__).resolve().parent.parent
@@ -275,6 +277,43 @@ class AdapterTest(unittest.TestCase):
             rd = adapter.execute("demo", None, "demo--base1")
             self.assertEqual(json.loads((rd / "summary.json").read_text())["trajectory_source"], "stdout")
 
+    def test_the_trajectory_opens_with_a_digest_whose_offsets_are_real(self):
+        events = [
+            {"type": "tool_call", "node": "architect", "name": "list_files", "args": "{}"},
+            {"type": "tool_response", "node": "architect", "name": "list_files", "text": "a.py\nb.py"},
+            {"type": "tool_call", "node": "architect", "name": "read_file", "args": "{'filepath': 'a.py'}"},
+            {"type": "tool_response", "node": "architect", "name": "read_file", "text": "x\n" * 300},
+            {"type": "tool_call", "node": "researcher", "name": "read_file", "args": "{'filepath': 'a.py', 'start_line': 10, 'end_line': 40}"},
+            {"type": "tool_response", "node": "researcher", "name": "read_file", "text": "y\n" * 30},
+            {"type": "tool_call", "node": "researcher", "name": "report_findings", "args": "{'findings': [{'title': 'A'}, {'title': 'B'}]}"},
+            {"type": "tool_response", "node": "researcher", "name": "report_findings", "text": "Recorded 2"},
+            {"type": "error", "node": "reviewer", "name": "RateLimitError", "text": "429"},
+        ]
+        body = ad.render_trajectory(events, 20_000)
+        digest = ad.render_digest(events, body)
+        full = digest + body
+        self.assertTrue(full.startswith("# TRAJECTORY DIGEST"))
+        self.assertIn("| architect | list_files×1, read_file×1 | 1/0 | 0 | 0 |", digest)
+        self.assertIn("| researcher | read_file×1, report_findings×1 | 0/1 | 2 | 0 |", digest)
+        self.assertIn("| reviewer | - | 0/0 | 0 | 1 |", digest)
+        self.assertIn("most-touched files: a.py ×2", digest)
+        # The "starts at line" column points at the stage's first event in the final file.
+        for stage, marker in (("architect", "[ACTION 1] (architect)"), ("researcher", "[ACTION 5] (researcher)"),
+                              ("reviewer", "[ERROR 9] (reviewer)")):
+            row = next(r for r in digest.splitlines() if r.startswith(f"| {stage} "))
+            line_no = int(row.split("|")[-2].strip())
+            self.assertTrue(full.splitlines()[line_no - 1].startswith(marker), (stage, line_no))
+        # And the adapter serves it in front of the body.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            adapter = _adapter(tmp, target)
+            rd = adapter.execute("demo", None, "demo--base1")
+            text = adapter.trajectory(rd, obs_trunc=50_000)
+            self.assertTrue(text.startswith("# TRAJECTORY DIGEST"))
+            self.assertIn("# FULL TRAJECTORY", text)
+            self.assertIn("[OBSERVATION 2]", text)
+
     def test_a_failed_rollout_is_described_not_just_declared(self):
         def killed(target, workflow_path, run_dir, settings):
             fake_pipeline(target, workflow_path, run_dir, settings)
@@ -356,7 +395,7 @@ class ProposerTest(unittest.TestCase):
             touched = []
             ls, rf, wf, df = make_context_tools(root, lambda rel: rel.startswith("prompts/") or rel == "workflow.json", touched)
             self.assertIn("harness/prompts/researcher.md", ls(""))
-            self.assertEqual(rf("harness/prompts/researcher.md", 2, 3), "2: b\n3: c")
+            self.assertTrue(rf("harness/prompts/researcher.md", 2, 3).startswith("2: b\n3: c\n[read budget:"))
             self.assertIn("refused", rf("../../etc/passwd"))
             self.assertIn("refused", wf("scripts/x.py", "print(1)"))
             self.assertIn("wrote", wf("prompts/researcher.md", "new"))
@@ -459,6 +498,139 @@ class ProposerTest(unittest.TestCase):
         from core.config import get_llm_kwargs
         _, kw = get_llm_kwargs(model_id="openai/m1", default_timeout=P.PROPOSER_LLM_TIMEOUT_SECONDS)
         self.assertEqual(kw.get("timeout"), P.PROPOSER_LLM_TIMEOUT_SECONDS)
+
+    def test_reads_are_budgeted_per_session_and_say_so(self):
+        import evals.evolve.proposer as P
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "context"; (root / "rollouts").mkdir(parents=True)
+            (root / "rollouts" / "base1.md").write_text("".join(f"line {i} {'x' * 60}\n" for i in range(5000)))
+            budget = {}
+            ls, rf = make_context_tools(root, lambda rel: True, [], read_only=True, read_budget_chars=50_000, budget=budget)
+            first = rf("rollouts/base1.md", 1, 200)
+            self.assertIn("1: line 0", first)
+            self.assertRegex(first, r"\[read budget: [\d,]+ of 50,000 characters left this session; file has 5,000 lines\]")
+            served_after_one = budget["served"]
+            self.assertGreater(served_after_one, 10_000)
+            # Keep reading until the budget is spent; the cut is announced, then reads stop serving content.
+            out = ""
+            for start in range(200, 5000, 200):
+                out = rf("rollouts/base1.md", start, start + 200)
+                if "read budget exhausted" in out:
+                    break
+            self.assertIn("read budget exhausted", out)
+            self.assertNotIn("line 4", out.split("exhausted")[0] if "line 4" in out else "")
+            self.assertLessEqual(budget["served"], 50_000 + P.MAX_TOOL_OUTPUT_CHARS)
+            self.assertIn("rollouts/base1.md", ls(""), "listing is not budgeted")
+
+    def test_describe_event_is_compact_and_never_raises(self):
+        from types import SimpleNamespace as NS
+        import evals.evolve.proposer as P
+        ev = NS(partial=False, usage_metadata=NS(total_token_count=1234), error_code=None, content=NS(parts=[
+            NS(function_call=NS(name="read_file", args={"path": "rollouts/base1.md", "start_line": 1, "end_line": 300, "note": "z" * 200}),
+               function_response=None, text=None, thought=False),
+            NS(function_call=None, function_response=NS(name="read_file", response={"result": "y" * 5000}), text=None, thought=False),
+            NS(function_call=None, function_response=None, text="I think", thought=True),
+            NS(function_call=None, function_response=None, text="<notes>done</notes>", thought=False),
+        ]))
+        lines = P.describe_event(ev)
+        self.assertEqual(len(lines), 3, lines)
+        self.assertTrue(lines[0].startswith("call read_file {"))
+        self.assertIn("'note': 'zzz", lines[0]); self.assertIn("...'", lines[0]); self.assertNotIn("z" * 100, lines[0])
+        self.assertEqual(lines[1], "response read_file 5,000 chars")
+        self.assertIn("text 19 chars (turn tokens: 1,234)", lines[2])
+        self.assertEqual(P.describe_event(None), [])
+        self.assertEqual(P.describe_event(NS(partial=True)), [])
+
+    def test_each_session_is_its_own_process_and_a_hung_one_is_killed(self):
+        """Upstream runs sessions concurrently in threads; LiteLLM's async client is per-loop. One process each."""
+        import evals.evolve.proposer as P
+        from harness2.core.spec import ChannelSpec
+        load_harness2()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Path(tmp) / "context"; (ctx / "harness").mkdir(parents=True)
+            prop = MantisProposer(ChannelSpec("opencode", "m"), surface_workflow={"nodes": []})
+            touched = []
+            # Stand in for the child interpreter: a script that prints progress, then a result line.
+            fake_child = Path(tmp) / "child.py"
+            fake_child.write_text(
+                "import json, sys, time\n"
+                "spec = json.load(open(sys.argv[sys.argv.index('--session') + 1]))\n"
+                "print(f\"[proposer {spec['label']} +0.1s] call read_file {{}}\", file=sys.stderr)\n"
+                "if spec['label'].startswith('hang'):\n    time.sleep(30)\n"
+                "print(json.dumps({'text': '<notes>ok</notes>', 'steps': 3, 'touched': ['prompts/researcher.md'],\n"
+                "                  'read_chars': 1234, 'mission_len': len(spec['mission']), 'ro': spec['read_only'],\n"
+                "                  'wf': spec['surface_workflow']}))\n")
+            real_run = P.subprocess.run
+
+            def run_with_fake_child(cmd, **kw):
+                self.assertEqual(cmd[1:3], ["-m", "evals.evolve.proposer"])
+                return real_run([cmd[0], str(fake_child), *cmd[3:]], **kw)
+
+            with unittest.mock.patch.object(P.subprocess, "run", side_effect=run_with_fake_child), \
+                    unittest.mock.patch.object(P, "SESSION_UNWIND_GRACE_SECONDS", 0.2):
+                out = prop._run_session_subprocess(mission="m" * 50, system="s", context_root=ctx, touched=touched,
+                                                   label="inv1.a1", timeout=20, read_only=False)
+                self.assertEqual(out["text"], "<notes>ok</notes>")
+                self.assertEqual(out["mission_len"], 50)
+                self.assertFalse(out["ro"])
+                self.assertEqual(out["wf"], {"nodes": []}, "the surface workflow crosses to the child")
+                self.assertEqual(touched, ["prompts/researcher.md"], "the child's edits are reported back")
+                t0 = time.time()
+                with self.assertRaises(TimeoutError) as cm:
+                    prop._run_session_subprocess(mission="m", system="s", context_root=ctx, touched=[],
+                                                 label="hang.a1", timeout=1, read_only=True)
+                self.assertLess(time.time() - t0, 5, "the child was killed, not waited for")
+                self.assertIn("killed", str(cm.exception))
+
+    def test_the_session_entry_point_reports_a_failed_session_without_a_traceback(self):
+        import evals.evolve.proposer as P
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Path(tmp) / "context"; ctx.mkdir()
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps({"mission": "m", "system": "s", "context_root": str(ctx), "label": "x.a1",
+                                        "read_only": True, "model_id": "openai/nonexistent", "max_steps": 2, "timeout": 3}))
+            import io, contextlib
+            err = io.StringIO()
+            with unittest.mock.patch.dict("os.environ", {"OPENAI_API_KEY": "dummy", "LLM_API_BASE": "http://127.0.0.1:9",
+                                                          "MANTIS_LLM_MAX_PATIENCE_SECONDS": "0"}), \
+                    contextlib.redirect_stderr(err):
+                code = P._session_main(["--session", str(spec)])
+            self.assertEqual(code, 1)
+            self.assertIn("session failed", err.getvalue())
+
+    def test_run_bounded_returns_results_raises_errors_and_abandons_a_stuck_session(self):
+        import asyncio
+        import evals.evolve.proposer as P
+
+        async def fine():
+            return {"text": "ok"}
+        self.assertEqual(P.run_bounded(fine, timeout=5, label="t")["text"], "ok")
+
+        async def broken():
+            raise ValueError("boom")
+        with self.assertRaises(ValueError):
+            P.run_bounded(broken, timeout=5, label="t")
+
+        async def cooperative_hang():
+            await asyncio.sleep(3600)
+        t0 = time.time()
+        with self.assertRaises(TimeoutError) as cm:
+            P.run_bounded(cooperative_hang, timeout=0.2, label="t")
+        self.assertLess(time.time() - t0, 5)
+        self.assertIn("exceeded", str(cm.exception))
+
+        # A session whose cleanup refuses to unwind (blocking sleep in a finally) is abandoned, not waited on.
+        async def uncancellable():
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                time.sleep(3)  # longer than the test's grace below
+        with unittest.mock.patch.object(P, "SESSION_UNWIND_GRACE_SECONDS", 0.5):
+            t0 = time.time()
+            with self.assertRaises(TimeoutError) as cm:
+                P.run_bounded(uncancellable, timeout=0.2, label="t")
+            self.assertLess(time.time() - t0, 2.5, "the caller did not wait for the stuck cleanup")
+            self.assertIn("abandoned", str(cm.exception))
 
 
 # --- Selection -----------------------------------------------------------------------------

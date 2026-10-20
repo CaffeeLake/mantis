@@ -296,7 +296,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     proposer = MantisProposer(adapter.spec.channels["proposer"], model_id=args.proposer_model or args.model or "",
                               reasoning_effort=args.effort or "", audit_dir=Path(args.out) / "proposer",
-                              surface_ok=lambda rel: _on_surface(adapter, rel))
+                              surface_ok=lambda rel: _on_surface(adapter, rel),
+                              surface_workflow=adapter._base_workflow)
     lib_root = Path(args.library) if args.library else Path(args.out) / "library"
     records = []
     for i, task_id in enumerate(tasks):

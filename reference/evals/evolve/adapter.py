@@ -245,6 +245,118 @@ def render_trajectory(events: Sequence[Dict[str, Any]], obs_trunc: int) -> str:
     return "\n\n".join(lines) + ("\n" if lines else "")
 
 
+def _call_filepath(args: Any) -> str:
+    """The file a tool call names, if any, from its repr'd args."""
+    m = re.search(r"'(?:filepath|path)':\s*'([^']*)'", str(args or ""))
+    return m.group(1) if m else ""
+
+
+def _is_whole_file_read(args: Any) -> bool:
+    text = str(args or "")
+    for key in ("start_line", "end_line"):
+        m = re.search(rf"'{key}':\s*(\d+)", text)
+        if m and int(m.group(1)) > 0:
+            return False
+    return True
+
+
+def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
+    """A one-screen map of a trajectory, for a reader that cannot read all of it.
+
+    A rollout of the full graph over a few dozen files renders to ~1 MB; the
+    proposer reads it 20 KB at a time and cannot see the shape of the run
+    from inside one page. This puts the shape first: per stage, how many tool
+    calls of which kind, how many whole-file versus windowed reads, which
+    files were read most, what the stage reported, and where in the rendered
+    text the stage starts, so the reader can jump instead of paging.
+    """
+    per_stage: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    def stage(name: str) -> Dict[str, Any]:
+        if name not in per_stage:
+            per_stage[name] = {"calls": {}, "whole_reads": 0, "windowed_reads": 0, "files": {},
+                               "reported": 0, "errors": 0, "messages": 0, "first_event": None}
+            order.append(name)
+        return per_stage[name]
+
+    for i, ev in enumerate(events, 1):
+        name = str(ev.get("node") or "?")
+        st = stage(name)
+        if st["first_event"] is None:
+            st["first_event"] = i
+        kind = ev.get("type")
+        if kind == "tool_call":
+            tool = str(ev.get("name") or "")
+            st["calls"][tool] = st["calls"].get(tool, 0) + 1
+            if tool == "read_file":
+                if _is_whole_file_read(ev.get("args")):
+                    st["whole_reads"] += 1
+                else:
+                    st["windowed_reads"] += 1
+            fp = _call_filepath(ev.get("args"))
+            if fp and tool in ("read_file", "get_function_boundary", "find_callers", "find_symbol"):
+                st["files"][fp] = st["files"].get(fp, 0) + 1
+            if tool == "report_findings":
+                st["reported"] += str(ev.get("args") or "").count("'title'")
+        elif kind == "error":
+            st["errors"] += 1
+        elif kind == "message":
+            st["messages"] += 1
+
+    # Line offsets of each stage's first event in the rendered body, so the
+    # digest can say "stage X starts at line N" (N counted in the final file,
+    # digest included -- the digest's own length is added after it is built).
+    starts: Dict[str, int] = {}
+    if body:
+        first_idx = {st["first_event"]: name for name, st in per_stage.items() if st["first_event"] is not None}
+        for line_no, line in enumerate(body.split("\n"), 1):
+            m = re.match(r"\[(?:ACTION|OBSERVATION|ERROR|MESSAGE) (\d+)\]", line)
+            if m:
+                name = first_idx.get(int(m.group(1)))
+                if name and name not in starts:
+                    starts[name] = line_no
+
+    total_calls = sum(sum(st["calls"].values()) for st in per_stage.values())
+    lines = [
+        "# TRAJECTORY DIGEST (harness-generated map; the full trajectory follows)",
+        f"events: {len(events)}  tool calls: {total_calls}  stages: {len(order)}  rendered: ~{len(body):,} chars",
+        "Read this map, then open targeted line ranges of the stages you care about; the file is "
+        "far larger than one read.",
+        "",
+    ]
+    header = ["stage", "tool calls (by tool)", "reads whole/windowed", "reported", "errors", "starts at line"]
+    rows = []
+    for name in order:
+        st = per_stage[name]
+        calls = ", ".join(f"{t}×{n}" for t, n in sorted(st["calls"].items(), key=lambda kv: (-kv[1], kv[0]))[:6]) or "-"
+        rows.append([name, calls, f"{st['whole_reads']}/{st['windowed_reads']}", str(st["reported"]),
+                     str(st["errors"]), "?" if name not in starts else "@DIGEST_OFFSET+" + str(starts[name])])
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "|".join("---" for _ in header) + "|")
+    for r in rows:
+        lines.append("| " + " | ".join(r) + " |")
+    hot = {}
+    for st in per_stage.values():
+        for fp, n in st["files"].items():
+            hot[fp] = hot.get(fp, 0) + n
+    if hot:
+        top = sorted(hot.items(), key=lambda kv: -kv[1])[:12]
+        lines.append("")
+        lines.append("most-touched files: " + ", ".join(f"{fp} ×{n}" for fp, n in top))
+    lines.append("")
+    lines.append("# FULL TRAJECTORY")
+    digest = "\n".join(lines) + "\n\n"
+    # Now that the digest's length is known, make the offsets absolute.
+    return _apply_shift(digest, digest.count("\n"))
+
+
+def _apply_shift(digest: str, shift: int) -> str:
+    def repl(m: re.Match) -> str:
+        return str(int(m.group(1)) + shift)
+    return re.sub(r"@DIGEST_OFFSET\+(\d+)", repl, digest)
+
+
 def evidence_vector(findings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """What the pipeline itself established about a run's findings -- no answer key.
 
@@ -511,7 +623,8 @@ class MantisAdapterBase:
         if not path.exists():
             return "(no trajectory: the run left no event stream)"
         events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        return render_trajectory(events, obs_trunc)
+        body = render_trajectory(events, obs_trunc)
+        return render_digest(events, body) + body
 
     def deliverable_files(self, run_dir: Path) -> Dict[str, str]:
         path = Path(run_dir) / "findings.md"
