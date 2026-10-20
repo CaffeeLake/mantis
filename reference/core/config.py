@@ -688,6 +688,49 @@ def _largest_message_summary(messages: Any) -> str:
     )
 
 
+# Share of the model's input window that ONE tool response may occupy. The window-relative
+# request guard below refuses a request that no longer fits; this is the control that keeps
+# a single tool response from being the reason it does not. A quarter leaves room for the
+# instruction, the conversation so far, a few more tool responses and the answer. Measured
+# failure this exists for: a 1 MiB read_file (~262k tokens) and a 975k-char recorded summary
+# each delivered whole into a 272k-token window, which refused the request on the spot.
+TOOL_RESPONSE_WINDOW_FRACTION = 0.25
+
+# No model-derived cap goes below this many characters (~10k tokens). The verdict stages
+# read tool output looking for a bounds check; a cut tight enough to hide one reads as
+# "the check is missing" (see tools/research_tools.MAX_READ_SIZE).
+MIN_TOOL_RESPONSE_CHARS = 40_000
+
+_TOOL_RESPONSE_CAP_ENV = "MANTIS_MAX_TOOL_RESPONSE_CHARS"
+
+
+def resolve_tool_response_char_cap(model: Any) -> Optional[int]:
+    """Characters one tool response may carry into `model`'s context, or None for no cap.
+
+    Derived from the model's input window (``TOOL_RESPONSE_WINDOW_FRACTION`` of it, in
+    characters at the guard's chars-per-token estimate) and from the operator's
+    per-request input cap when that is tighter. ``MANTIS_MAX_TOOL_RESPONSE_CHARS`` is an
+    absolute operator override that applies whether or not the model is known. An
+    unknown model with no override means no cap -- the request guard still refuses what
+    cannot fit, and the per-tool byte limits still apply -- which is the fail-open
+    direction every control in this file takes.
+    """
+    raw = str(os.environ.get(_TOOL_RESPONSE_CAP_ENV, "") or "").strip()
+    if raw:
+        try:
+            override = int(raw)
+        except ValueError:
+            override = 0
+        if override > 0:
+            return override
+
+    limits = [l for l in (resolve_context_limit(model), resolve_input_token_cap()) if l]
+    if not limits:
+        return None
+    tokens = int(min(limits) * TOOL_RESPONSE_WINDOW_FRACTION)
+    return max(tokens * _CHARS_PER_TOKEN, MIN_TOOL_RESPONSE_CHARS)
+
+
 def resolve_input_token_cap() -> Optional[int]:
     """An absolute per-request input ceiling from MANTIS_MAX_INPUT_TOKENS, or None.
 

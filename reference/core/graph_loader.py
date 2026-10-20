@@ -658,12 +658,49 @@ def compute_harness_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()):
-    """Steers agents away from repeated un-windowed read_file calls on the same file."""
+def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = (), model: Any = None):
+    """Bounds every tool response to the node's model, then steers repeat whole-file reads.
+
+    The bound: one tool response may occupy at most
+    ``core.config.TOOL_RESPONSE_WINDOW_FRACTION`` of the model's input window
+    (``resolve_tool_response_char_cap``). Per-tool byte limits are sized for
+    the largest windows; a 1 MiB read or a run-long recorded summary that fits
+    a million-token model is 1.1x a 272k window on its own, and the request
+    guard then refuses the whole turn. The cut keeps the untrusted-content
+    fence closed and puts the marker after it (``bound_fenced_text``).
+    """
     has_structural_nav = (
         "get_function_boundary" in tool_names or "find_symbol" in tool_names
     )
     local_counts: dict[str, int] = {}
+    cap_cache: dict[str, Optional[int]] = {}
+
+    def _cap() -> Optional[int]:
+        if "cap" not in cap_cache:
+            try:
+                from core.config import resolve_tool_response_char_cap
+                cap_cache["cap"] = resolve_tool_response_char_cap(model) if model else None
+            except Exception:
+                cap_cache["cap"] = None
+        return cap_cache["cap"]
+
+    def _bounded(tool_name: str, tool_response: Any) -> tuple[Any, bool]:
+        cap = _cap()
+        if not cap:
+            return tool_response, False
+        from core.truncation import bound_fenced_text
+        what = f"{tool_name} output" if tool_name else "tool output"
+        if isinstance(tool_response, str):
+            if len(tool_response) <= cap:
+                return tool_response, False
+            return bound_fenced_text(tool_response, cap, what), True
+        if isinstance(tool_response, dict) and isinstance(tool_response.get("result"), str):
+            if len(tool_response["result"]) <= cap:
+                return tool_response, False
+            updated = dict(tool_response)
+            updated["result"] = bound_fenced_text(tool_response["result"], cap, what)
+            return updated, True
+        return tool_response, False
 
     def _after_tool(
         tool: Any,
@@ -671,9 +708,22 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
         tool_context: Any,
         tool_response: Any,
     ) -> Any:
+        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
+        tool_response, changed = _bounded(str(tool_name or ""), tool_response)
+        if changed:
+            print(
+                f"[{node_id}] {tool_name} response exceeded the per-response cap for this "
+                f"model ({_cap():,} chars); cut with a marker.",
+                file=sys.stderr, flush=True,
+            )
+        steered = _steer(tool_name, args, tool_response)
+        if steered is not None:
+            return steered
+        return tool_response if changed else None
+
+    def _steer(tool_name: Any, args: Any, tool_response: Any) -> Any:
         if not has_structural_nav:
             return None
-        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
         if tool_name != "read_file" or not isinstance(args, dict):
             return None
         # read_file's bounds default to 0 (= whole file) and models routinely
@@ -1856,13 +1906,12 @@ def load_workflow_from_json(
                 agent_kwargs["before_agent_callback"] = before_reuse
                 agent_kwargs["after_agent_callback"] = after_reuse
 
-            if "read_file" in node_cfg.tools and (
-                "get_function_boundary" in node_cfg.tools
-                or "find_symbol" in node_cfg.tools
-            ):
-                agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
-                    node_id, node_cfg.tools
-                )
+            # Every agent node: bounds each tool response to its model's window
+            # and, where the node has structural navigation, steers repeated
+            # whole-file reads toward it.
+            agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
+                node_id, node_cfg.tools, model=node_model_id
+            )
 
             agent_kwargs["before_model_callback"] = (
                 _make_stage_experience_before_model_callback(node_id)

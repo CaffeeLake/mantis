@@ -112,3 +112,52 @@ def is_truncation_marker_present(text: str) -> bool:
         except Exception:
             return False
     return TRUNCATION_MARKER_PREFIX in text
+
+
+def bound_fenced_text(text: str, limit: int, what: str = "tool output") -> str:
+    """`text` unchanged when within `limit`, else cut to `limit` chars with the
+    fence kept closed and the marker placed after it.
+
+    A tool response that carries untrusted content is wrapped
+    ``<<<UNTRUSTED_SOURCE_CODE_DATA_START ...>>> body <<<..._END>>>``, and
+    whatever the harness appends after the fence (steering hints, earlier cut
+    notes) is harness text. A plain character slice would cut the END fence
+    off and leave the marker inside the untrusted region, where a hostile
+    file could have forged it. So: the body is cut, the fence is closed again,
+    the marker follows the fence, and any harness text that already followed
+    the fence is kept. Text with no fence is cut like any other output.
+    """
+    if text is None:
+        text = ""
+    elif not isinstance(text, str):
+        text = str(text)
+    try:
+        limit_i = max(int(limit), 0)
+    except (TypeError, ValueError):
+        limit_i = 0
+    total = len(text)
+    if total <= limit_i:
+        return text
+
+    try:
+        from core.llm_gateway import UNTRUSTED_DATA_END
+    except Exception:  # pragma: no cover - gateway unavailable in minimal environments
+        UNTRUSTED_DATA_END = "<<<UNTRUSTED_SOURCE_CODE_DATA_END>>>"
+
+    end_at = text.rfind(UNTRUSTED_DATA_END)
+    if end_at < 0:
+        return text[:limit_i] + "\n" + truncation_marker(what, limit_i, total)
+
+    fenced = text[:end_at]
+    trailer = text[end_at + len(UNTRUSTED_DATA_END):]
+    # The budget pays for the fenced part; the fence and the trailer are the
+    # harness's own and short.
+    body_limit = max(limit_i - len(UNTRUSTED_DATA_END) - len(trailer), 0)
+    if len(fenced) <= body_limit:
+        return text
+    kept = fenced[:body_limit].rstrip("\n")
+    return (
+        f"{kept}\n{UNTRUSTED_DATA_END}\n"
+        f"{truncation_marker(what, len(kept), len(fenced))}"
+        f"{trailer}"
+    )

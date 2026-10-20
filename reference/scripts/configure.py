@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -670,6 +671,57 @@ def _check_llm_preflight(config: dict, probe: bool = False) -> Tuple[bool, str]:
     return True, static_msg
 
 
+_PINNED_RUNTIME_PACKAGES = ("google-adk", "litellm")
+
+
+def check_pinned_dependencies(requirements_path: Optional[str] = None) -> Tuple[bool, str]:
+    """Compares the installed runtime packages against requirements.txt's pins.
+
+    Reported in the field: a fresh `git pull` on a venv that still carried the
+    previous google-adk failed inside ADK's workflow replay with a traceback
+    that no longer exists in the pinned release, and the report read as a
+    Mantis regression. The check is a warning, not a gate -- an operator may
+    run a newer ADK on purpose -- but it names the package, both versions and
+    the command, so the next report says which it was.
+    """
+    try:
+        from importlib import metadata
+    except Exception:  # pragma: no cover
+        return True, "dependency pins not checked (importlib.metadata unavailable)"
+
+    req = Path(requirements_path) if requirements_path else Path(__file__).resolve().parent.parent / "requirements.txt"
+    try:
+        text = req.read_text(encoding="utf-8")
+    except OSError:
+        return True, f"dependency pins not checked ({req.name} not found)"
+
+    pins: Dict[str, str] = {}
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\;]+)", line.strip())
+        if m:
+            pins[m.group(1).lower().replace("_", "-")] = m.group(2)
+
+    stale = []
+    for name in _PINNED_RUNTIME_PACKAGES:
+        pinned = pins.get(name)
+        if not pinned:
+            continue
+        try:
+            installed = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            stale.append(f"{name}: not installed (pinned {pinned})")
+            continue
+        if installed != pinned:
+            stale.append(f"{name}: installed {installed}, pinned {pinned}")
+    if stale:
+        return False, (
+            "installed packages differ from requirements.txt -- " + "; ".join(stale)
+            + f". Reinstall with: pip install --require-hashes -r {req} "
+            "(failures inside google.adk on a stale install are not Mantis bugs)."
+        )
+    return True, "installed google-adk and litellm match requirements.txt"
+
+
 async def run_preflight_checks_async(
     config: dict,
     test_llm: bool = True,
@@ -680,6 +732,10 @@ async def run_preflight_checks_async(
     """Runs combined LLM and Sandbox preflight testing asynchronously in ~1-2s."""
     messages = []
     all_ok = True
+
+    # Advisory: stale runtime packages. Never fails the preflight.
+    pins_ok, pins_msg = check_pinned_dependencies()
+    messages.append(f"[DEPENDENCY PREFLIGHT] {'✅ PASSED' if pins_ok else '⚠️ WARNING'}: {pins_msg}")
 
     if test_llm:
         ok, msg = _check_llm_preflight(config, probe=probe_llm)
