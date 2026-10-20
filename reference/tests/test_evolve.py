@@ -508,7 +508,7 @@ class ProposerTest(unittest.TestCase):
             self.assertEqual(P.proposer_max_output_tokens("openai/small"), 16_384)
         with unittest.mock.patch("litellm.get_max_tokens", side_effect=Exception("no such model")):
             self.assertEqual(P.proposer_max_output_tokens("x"), P.PROPOSER_MAX_OUTPUT_TOKENS)
-        self.assertIn("ONE file per tool call", P._TOOL_INSTRUCTIONS)
+        self.assertIn("ONE file per turn", P._TOOL_INSTRUCTIONS)
 
     def test_reads_are_budgeted_per_session_and_say_so(self):
         import evals.evolve.proposer as P
@@ -566,11 +566,12 @@ class ProposerTest(unittest.TestCase):
             fake_child.write_text(
                 "import json, sys, time\n"
                 "spec = json.load(open(sys.argv[sys.argv.index('--session') + 1]))\n"
+                "import os\n"
                 "print(f\"[proposer {spec['label']} +0.1s] call read_file {{}}\", file=sys.stderr)\n"
                 "if spec['label'].startswith('hang'):\n    time.sleep(30)\n"
                 "print(json.dumps({'text': '<notes>ok</notes>', 'steps': 3, 'touched': ['prompts/researcher.md'],\n"
                 "                  'read_chars': 1234, 'mission_len': len(spec['mission']), 'ro': spec['read_only'],\n"
-                "                  'wf': spec['surface_workflow']}))\n")
+                "                  'wf': spec['surface_workflow'], 'cap': os.environ.get('MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS')}))\n")
             real_run = P.subprocess.run
 
             def run_with_fake_child(cmd, **kw):
@@ -585,6 +586,7 @@ class ProposerTest(unittest.TestCase):
                 self.assertEqual(out["mission_len"], 50)
                 self.assertFalse(out["ro"])
                 self.assertEqual(out["wf"], {"nodes": []}, "the surface workflow crosses to the child")
+                self.assertEqual(out["cap"], str(P.PROPOSER_EMPTY_TURN_MAX_ATTEMPTS), "a proposer empty turn is not transient")
                 self.assertEqual(touched, ["prompts/researcher.md"], "the child's edits are reported back")
                 t0 = time.time()
                 with self.assertRaises(TimeoutError) as cm:
