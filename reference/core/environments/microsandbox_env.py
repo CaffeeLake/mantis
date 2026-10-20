@@ -24,7 +24,12 @@ from microsandbox.types import Network
 
 from .base import BaseEnvironment
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
+from core.truncation import truncate_with_marker
 
+# Per-stream cap on what one execute() hands back. Must stay >= 10_000 and
+# the cut must be announced (core.truncation): the reproducer reads this
+# trace for the reached-sink sentinel, and a silent cut before the sentinel
+# reads as "the PoC never got there".
 MAX_OUTPUT = 16000
 
 
@@ -108,8 +113,8 @@ class MicrosandboxEnvironment(BaseEnvironment):
             stdout_text = out.stdout_text or ""
             stderr_text = getattr(out, "stderr_text", "") or ""
             return ExecutionResult(
-                stdout=stdout_text[:MAX_OUTPUT],
-                stderr=stderr_text[:MAX_OUTPUT],
+                stdout=truncate_with_marker(stdout_text, MAX_OUTPUT, what="sandbox stdout"),
+                stderr=truncate_with_marker(stderr_text, MAX_OUTPUT, what="sandbox stderr"),
                 exit_code=out.exit_code,
                 timed_out=False,
             )

@@ -24,8 +24,15 @@ from typing import Optional, Union, List
 import uuid
 
 from google.adk.environment import ExecutionResult
+from core.truncation import truncate_with_marker
 from .base import BaseEnvironment
 from .static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
+
+# Per-stream cap on what one execute() or apply_patch() hands back. Must stay
+# >= 10_000 and the cut must be announced (core.truncation): the reproducer
+# reads this trace for the reached-sink sentinel, and a silent cut before the
+# sentinel reads as "the PoC never got there".
+MAX_OUTPUT = 16000
 
 
 class GvisorEnvironment(BaseEnvironment):
@@ -163,8 +170,8 @@ class GvisorEnvironment(BaseEnvironment):
                     timeout=t,
                 )
                 return ExecutionResult(
-                    stdout=(p.stdout or "")[:16000],
-                    stderr=(p.stderr or "")[:16000],
+                    stdout=truncate_with_marker(p.stdout or "", MAX_OUTPUT, what="sandbox stdout"),
+                    stderr=truncate_with_marker(p.stderr or "", MAX_OUTPUT, what="sandbox stderr"),
                     exit_code=p.returncode,
                     timed_out=False,
                 )
@@ -303,9 +310,9 @@ class GvisorEnvironment(BaseEnvironment):
                     stdin=diff,
                 )
                 if rc_retry == 0:
-                    return f"exit=0\n{out_retry[:16000]}"
-                return f"exit={rc_retry}\n{out_retry[:16000]}"
-            return f"exit={rc}\n{out[:16000]}"
+                    return f"exit=0\n{truncate_with_marker(out_retry, MAX_OUTPUT, what='patch output')}"
+                return f"exit={rc_retry}\n{truncate_with_marker(out_retry, MAX_OUTPUT, what='patch output')}"
+            return f"exit={rc}\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
 
         return await asyncio.to_thread(_patch)
 

@@ -20,9 +20,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.context import current_run_context
 from core.llm_gateway import SecretScrubber, wrap_untrusted_content
+from core.truncation import is_truncation_marker_present
 from google.adk.environment import ExecutionResult
 
 MANTIS_SENTINEL_TOKEN = "MANTIS_REACHED_ENTRYPOINT"
+
+# Reason prefix for "the output was cut before the sentinel could be
+# confirmed". Deliberately distinct from EVIDENCE_ABSENT: absent means the
+# whole trace was seen and carried no proof; truncated means the trace was
+# not whole, so its silence proves nothing either way. Both are not-verified.
+EVIDENCE_TRUNCATED_PREFIX = "EVIDENCE_TRUNCATED"
 
 _SANITIZER_SIGNALS = [
     re.compile(r"==\d+==ERROR:\s+(?:AddressSanitizer|UndefinedBehaviorSanitizer|MemorySanitizer|ThreadSanitizer|LeakSanitizer)", re.IGNORECASE),
@@ -82,6 +89,27 @@ def _crash_corroborated(output: str, exit_code: int) -> bool:
     return code != 0 and bool(_frame_symbols(output))
 
 
+def _no_evidence(output: str, detail: str) -> Tuple[bool, str]:
+    """The negative verdict, worded for whether the trace was whole.
+
+    A harness truncation marker in the output means the sandbox cut the
+    trace (core.truncation). Not finding the sentinel in a cut trace is not
+    finding it absent: it may sit in the part that was dropped. The verdict
+    is still False -- INV-1 fails closed, a cut trace verifies nothing -- but
+    the reason says so, because a reproducer that reads EVIDENCE_ABSENT
+    writes "the PoC never reached the sink" when the honest conclusion is
+    "run it again with less noise".
+    """
+    if is_truncation_marker_present(output):
+        return False, (
+            f"{EVIDENCE_TRUNCATED_PREFIX}: sandbox output was cut by the harness before "
+            f"the sentinel could be confirmed ({detail}); not verified. Re-run with a "
+            "narrower command (filter or tail the output, or send the sentinel to the "
+            "sidecar file via sentinel_path) so the proof lands inside the output cap."
+        )
+    return False, f"EVIDENCE_ABSENT: {detail}"
+
+
 def check_reached_sink_evidence(
     output: str,
     exit_code: int,
@@ -110,18 +138,22 @@ def check_reached_sink_evidence(
     # Channel B: Target-produced Sanitizer / Crash backtrace naming sink.
     # The crash must be real (see _crash_corroborated), and a sink symbol
     # must be named by a backtrace frame, not merely present in the output.
+    # Positive verdicts stand whether or not the trace was cut: proof that
+    # survived the cut is still proof. Only the negatives go through
+    # _no_evidence, which says whether the silence came from a whole trace.
     has_sanitizer_or_crash = any(pat.search(output) for pat in _SANITIZER_SIGNALS)
     if has_sanitizer_or_crash:
         if not _crash_corroborated(output, exit_code):
-            return False, ("EVIDENCE_ABSENT: crash-like text in output, but the process exited "
-                           f"{exit_code} with no sanitizer report; text alone is not a crash")
+            return _no_evidence(output, (
+                "crash-like text in output, but the process exited "
+                f"{exit_code} with no sanitizer report; text alone is not a crash"))
         if sink_symbol:
             if _frame_names_sink(_frame_symbols(output), sink_symbol):
                 return True, f"EVIDENCE_PRESENT: crash backtrace explicitly confirms sink '{sink_symbol}'"
-            return False, f"EVIDENCE_ABSENT: crash occurred but no backtrace frame names target sink '{sink_symbol}'"
+            return _no_evidence(output, f"crash occurred but no backtrace frame names target sink '{sink_symbol}'")
         return True, "EVIDENCE_PRESENT: sanitizer/crash frame detected in execution output"
 
-    return False, "EVIDENCE_ABSENT: no sentinel token or target-produced crash backtrace observed"
+    return _no_evidence(output, "no sentinel token or target-produced crash backtrace observed")
 
 
 def _is_non_repro_node(ctx) -> bool:

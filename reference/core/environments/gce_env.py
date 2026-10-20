@@ -26,6 +26,7 @@ from typing import Optional, Union, List
 import uuid
 
 from google.adk.environment import ExecutionResult
+from core.truncation import truncate_with_marker
 from .base import BaseEnvironment
 from .staging import create_vetted_tar_archive
 
@@ -108,6 +109,10 @@ print('ISOLATION_VERIFIED')
 """
 
 
+# Per-stream cap on what one execute() hands back. Must stay >= 10_000 and
+# the cut must be announced (core.truncation): the reproducer reads this
+# trace for the reached-sink sentinel, and a silent cut before the sentinel
+# reads as "the PoC never got there".
 MAX_OUTPUT = 16000
 
 
@@ -462,14 +467,17 @@ class GceEnvironment(BaseEnvironment):
                     shell=False,
                 )
                 return ExecutionResult(
-                    stdout=(p.stdout or "")[:MAX_OUTPUT],
-                    stderr=(p.stderr or "")[:MAX_OUTPUT],
+                    stdout=truncate_with_marker(p.stdout or "", MAX_OUTPUT, what="sandbox stdout"),
+                    stderr=truncate_with_marker(p.stderr or "", MAX_OUTPUT, what="sandbox stderr"),
                     exit_code=p.returncode,
                     timed_out=False,
                 )
             except subprocess.TimeoutExpired as e:
+                partial = e.stdout if hasattr(e, "stdout") and e.stdout else ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", errors="replace")
                 return ExecutionResult(
-                    stdout=(e.stdout or "")[:MAX_OUTPUT] if hasattr(e, "stdout") and e.stdout else "",
+                    stdout=truncate_with_marker(partial, MAX_OUTPUT, what="sandbox stdout"),
                     stderr=f"SANDBOX-TIMEOUT: Command exceeded {t}s limit.",
                     exit_code=124,
                     timed_out=True,

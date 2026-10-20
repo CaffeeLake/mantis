@@ -359,6 +359,24 @@ Three rules are enforced structurally, not by convention:
 > [`core/evidence.py`](core/evidence.py). The absence is a security property,
 > not an unfinished feature.
 
+### Truncation is the harness's, not the target's
+
+Every tool output the harness cuts — `read_file`, `get_function_boundary`,
+`get_git_log`/`get_git_diff`, sandbox stdout/stderr, `list_files` — is cut
+through one helper, [`core/truncation.py`](core/truncation.py), and announces
+the cut with one marker:
+`[MANTIS TRUNCATION: <what> cut by the harness after <limit> of <total> chars (<omitted> omitted) ...]`.
+The limits on outputs the verdict stages read are never below 10,000 characters.
+The marker exists because a cut that is not announced is read as the whole
+observation: a file that ends before its bounds check reads as a missing check,
+a sandbox log that ends before its sentinel reads as a PoC that never got there,
+and both become verdicts carrying INV-1 weight. So the reviewer, critic,
+reproducer and patcher prompts say that the marker is the harness cutting the
+observation and never evidence, and `check_reached_sink_evidence` fails closed
+with a distinct `EVIDENCE_TRUNCATED` reason — not `EVIDENCE_ABSENT` — when the
+sentinel is not found in a trace that carries the marker. Proof that survives a
+cut still counts; only silence from a cut trace is refused.
+
 ## Custom Tools
 
 The 28 built-in tools are a closed set, and a workflow naming anything else

@@ -30,12 +30,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.context import current_run_context
 from core.llm_gateway import wrap_untrusted_content
 from core.structural_index import StructuralIndex, state_dir_for_db
+from core.truncation import split_truncation
 
 logger = logging.getLogger(__name__)
 
 # A function body returned by get_function_boundary is bounded the same way
 # read_file bounds whole files, just tighter: a boundary read that returns
-# more than this is cheaper done through read_file anyway.
+# more than this is cheaper done through read_file anyway. Must stay >=
+# 10_000: the reviewer and critic read function bodies through this tool to
+# check a guard, and a cut that hides the guard reads as a missing guard.
 MAX_SNIPPET_BYTES = 32_768
 
 _PAGE_SIZE = 20
@@ -317,11 +320,14 @@ async def get_function_boundary(filepath: str, line: int) -> str:
         text = content_bytes.decode("utf-8", errors="replace")
         selected = text.splitlines()[res["start_line"] - 1 : res["end_line"]]
         snippet = "\n".join(selected)
-        if len(snippet) > MAX_SNIPPET_BYTES:
-            snippet = snippet[:MAX_SNIPPET_BYTES] + "\n[TRUNCATED: boundary exceeds snippet limit; use read_file]"
+        snippet, cut_note = split_truncation(
+            snippet, MAX_SNIPPET_BYTES,
+            what=f"function body {res['file_path']}:{res['start_line']}-{res['end_line']}",
+        )
         return (
             header + "\n"
             + wrap_untrusted_content(snippet, filename=res["file_path"])
+            + cut_note
             + "\n" + _footer(idx)
         )
     except Exception as e:

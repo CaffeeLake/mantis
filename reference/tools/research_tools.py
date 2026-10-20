@@ -35,9 +35,15 @@ from core.database import (
 from core.context import current_run_context
 from core.environments.static_env import PROTECTED_VCS_DIRS, PROTECTED_METADATA_FILES
 from core.llm_gateway import wrap_untrusted_content, safe_markdown_fence, safe_markdown_inline
+from core.truncation import split_truncation, truncation_marker
 
 logger = logging.getLogger(__name__)
 
+# Every cut below is announced through core.truncation so a reader can tell
+# the harness's cut from the target's content. Must stay >= 10_000: these
+# outputs are read by the verdict stages (reviewer, critic, reproducer,
+# patcher), and a cut tight enough to hide the bounds check it was looking
+# for reads as "the check is missing".
 MAX_READ_SIZE = 1024 * 1024  # 1 MiB
 
 # Unbounded disk reads larger than this get a steering note appended. At
@@ -150,8 +156,10 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
                     art = read_artifact(resolved_db, artifact_type="report", run_id=ctx.run_id)
 
             if art is not None:
-                if len(art) > MAX_READ_SIZE:
-                    art = art[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
+                # The marker rides outside the untrusted fence (when one is
+                # applied): it is the harness's note about the cut, not part
+                # of the artifact.
+                art, cut_note = split_truncation(art, MAX_READ_SIZE, what=f"artifact '{clean_path}'")
                 # An artifact that came in with a knowledge import is a file
                 # from the repository, not this run's own notes: it is read
                 # the way any repository file is, fenced as untrusted.
@@ -160,8 +168,8 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
                         artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
                         (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
                          and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id)):
-                    return wrap_untrusted_content(art, filename=clean_path)
-                return art
+                    return wrap_untrusted_content(art, filename=clean_path) + cut_note
+                return art + cut_note
 
             # Check findings virtual paths
             if clean_path.startswith("workspace/findings") or clean_path.startswith("findings"):
@@ -242,9 +250,10 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
             # The range header is harness bookkeeping, not file content, so it
             # stays outside the untrusted-content wrapper below.
             header = f"[{clean_path}: lines {lo}-{hi} of {total}]\n"
-        if len(text) > MAX_READ_SIZE:
-            text = text[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
-        result = header + wrap_untrusted_content(text, filename=clean_path)
+        # Cut inside the fence, announce outside it: the marker is harness
+        # bookkeeping like the range header, not bytes from the file.
+        text, cut_note = split_truncation(text, MAX_READ_SIZE, what=f"file '{clean_path}'")
+        result = header + wrap_untrusted_content(text, filename=clean_path) + cut_note
         if not header and full_len > LARGE_READ_NOTE_BYTES:
             result += (
                 f"\n[NOTE: this file is {full_len} characters. For focused "
@@ -902,17 +911,23 @@ def _bounded_listing(entries: list, directory: str = "") -> str:
     logger.warning(
         "list_files truncated: returning %d of %d entries under '%s'.", cap, total, scope,
     )
+    # The structured fields are the contract callers branch on; the hint is
+    # the same cut announced in the harness's one marker shape, so a reader
+    # that only sees prose still recognises it.
     return json.dumps(
         {
             "entries": entries[:cap],
             "shown": cap,
             "total": total,
             "truncated": True,
-            "hint": (
-                f"Only the first {cap} of {total} entries under '{scope}' are shown. "
-                "This target is too large to enumerate in one call. Call list_files again "
-                "with a narrower 'directory' to walk a specific subtree, or read_file on "
-                "paths you already know. Do not assume the shown entries are exhaustive."
+            "hint": truncation_marker(
+                f"listing under '{scope}'", cap, total, unit="entries",
+                advice=(
+                    "this target is too large to enumerate in one call; call "
+                    "list_files again with a narrower 'directory' to walk a "
+                    "specific subtree, or read_file on paths you already know. "
+                    "Do not assume the shown entries are exhaustive."
+                ),
             ),
         },
         indent=2,
@@ -1878,9 +1893,8 @@ async def get_git_log(max_commits: int = 50, path: str = "") -> str:
     if not out.strip():
         return "INFO: No commit history found for the specified target."
 
-    if len(out) > MAX_READ_SIZE:
-        out = out[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: Log exceeds {MAX_READ_SIZE} characters limit]"
-    return wrap_untrusted_content(out, filename=f"git_log_{path or 'repo'}")
+    out, cut_note = split_truncation(out, MAX_READ_SIZE, what=f"git log for '{path or 'repo'}'")
+    return wrap_untrusted_content(out, filename=f"git_log_{path or 'repo'}") + cut_note
 
 
 _COMMIT_HASH_RE = re.compile(r"^[a-zA-Z0-9~^._-]+$")
@@ -1929,9 +1943,8 @@ async def get_git_diff(commit_hash: str = "", path: str = "") -> str:
     if not out.strip():
         return "INFO: No diff found for the specified commit or path."
 
-    if len(out) > MAX_READ_SIZE:
-        out = out[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: Diff exceeds {MAX_READ_SIZE} characters limit]"
-    return wrap_untrusted_content(out, filename=f"git_diff_{commit_hash or 'HEAD'}")
+    out, cut_note = split_truncation(out, MAX_READ_SIZE, what=f"git diff for '{commit_hash or 'HEAD'}'")
+    return wrap_untrusted_content(out, filename=f"git_diff_{commit_hash or 'HEAD'}") + cut_note
 
 
 def detect_vcs_info(target_path: Optional[Union[str, Path]] = None) -> dict[str, Any]:
