@@ -1,0 +1,33 @@
+--- a/harness2/core/prompts.py
++++ b/harness2/core/prompts.py
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++# Modified by Mantis: see reference/third_party/harness2/VENDOR.md (register_surface).
++
+ """Every prompt the method sends. Benchmark text arrives as values, never as branches.
+ 
+ The stage prompts are identical across benchmarks; only the `BenchPrompts` slots differ. The
+@@ -672,6 +674,21 @@
+     return got
+ 
+ 
++def register_surface(name: str, *, surface_md: str, inv: str, dom: str, tts_surface: str) -> None:
++    """Add the prompt surface for a substrate this module does not ship (Mantis addition).
++
++    A downstream substrate supplies its own `# WHAT YOU CAN CHANGE` block (`surface_md`),
++    its INV and DOM authoring prompts and its tts surface text, and `_st(name)` resolves it
++    from then on. The builtin names are refused so upstream text is never replaced in
++    place; registering a downstream name again replaces that name's text.
++    """
++    if name in ("opencode", "codex"):
++        raise ValueError(f"cannot overwrite builtin prompt surface {name!r}")
++    _SURFACE_TEXTS[name] = _SurfaceText(
++        surface_md=surface_md, inv=inv, dom=dom, tts_surface=tts_surface
++    )
++
++
+ def _tts_propose(bp: BenchPrompts, dim: str, st: _SurfaceText, *, k: int, index: int) -> str:
+     """propose(), in the tts pack's words."""
+     block = (_TTS_INV if dim == "INV" else _TTS_DOM).format(

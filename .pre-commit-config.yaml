@@ -4,6 +4,9 @@ repos:
     hooks:
       - id: mdformat
         args: ["--number", "--wrap", "80"]
+        # Vendored upstream trees are kept byte-for-byte; their Markdown is
+        # not ours to reflow. VENDOR.md there is written by a script.
+        exclude: ^reference/third_party/
         additional_dependencies:
           - mdformat-gfm
           - mdformat-frontmatter
