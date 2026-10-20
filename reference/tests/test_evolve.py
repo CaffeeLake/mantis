@@ -498,6 +498,17 @@ class ProposerTest(unittest.TestCase):
         from core.config import get_llm_kwargs
         _, kw = get_llm_kwargs(model_id="openai/m1", default_timeout=P.PROPOSER_LLM_TIMEOUT_SECONDS)
         self.assertEqual(kw.get("timeout"), P.PROPOSER_LLM_TIMEOUT_SECONDS)
+        self.assertGreaterEqual(P.PROPOSER_LLM_TIMEOUT_SECONDS, 600, "a writing turn can legitimately run for minutes")
+
+    def test_the_proposer_output_budget_is_large_and_clamped_to_the_model(self):
+        import evals.evolve.proposer as P
+        self.assertGreaterEqual(P.PROPOSER_MAX_OUTPUT_TOKENS, 32_000)
+        self.assertEqual(P.proposer_max_output_tokens("totally/unknown-model"), P.PROPOSER_MAX_OUTPUT_TOKENS)
+        with unittest.mock.patch("litellm.get_max_tokens", return_value=16_384):
+            self.assertEqual(P.proposer_max_output_tokens("openai/small"), 16_384)
+        with unittest.mock.patch("litellm.get_max_tokens", side_effect=Exception("no such model")):
+            self.assertEqual(P.proposer_max_output_tokens("x"), P.PROPOSER_MAX_OUTPUT_TOKENS)
+        self.assertIn("ONE file per tool call", P._TOOL_INSTRUCTIONS)
 
     def test_reads_are_budgeted_per_session_and_say_so(self):
         import evals.evolve.proposer as P

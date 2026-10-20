@@ -658,6 +658,60 @@ def compute_harness_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+class LiteralInstruction:
+    """An ADK ``InstructionProvider`` that returns fixed text.
+
+    ADK renders a *string* instruction as a template: ``{name}`` is a
+    session-state lookup, ``{artifact.x}`` an artifact load, and a key that
+    does not exist raises ``KeyError`` when the stage first runs. A callable
+    instruction is used verbatim (``canonical_instruction`` returns it with
+    ``bypass_state_injection=True``). Mantis node prompts are literal: they
+    quote code, and code has braces. This object is that callable, and reads
+    like the string it carries so callers that inspect an agent's prompt
+    (tests, the synthesizer's audit) keep working.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = str(text or "")
+
+    def __call__(self, _ctx: Any = None) -> str:
+        return self.text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __repr__(self) -> str:
+        return f"LiteralInstruction({self.text[:60]!r}...)" if len(self.text) > 60 else f"LiteralInstruction({self.text!r})"
+
+    def __contains__(self, item: object) -> bool:
+        return str(item) in self.text
+
+    def __len__(self) -> int:
+        return len(self.text)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, LiteralInstruction):
+            return self.text == other.text
+        if isinstance(other, str):
+            return self.text == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.text)
+
+    def startswith(self, *args: Any) -> bool:
+        return self.text.startswith(*args)
+
+    def endswith(self, *args: Any) -> bool:
+        return self.text.endswith(*args)
+
+
+def _literal_instruction(text: str) -> LiteralInstruction:
+    return text if isinstance(text, LiteralInstruction) else LiteralInstruction(text)
+
+
 def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = (), model: Any = None):
     """Bounds every tool response to the node's model, then steers repeat whole-file reads.
 
@@ -1855,7 +1909,15 @@ def load_workflow_from_json(
             agent_kwargs: dict[str, Any] = {
                 "name": node_id,
                 "model": model_inst,
-                "instruction": instruction,
+                # Handed to ADK as a provider, not a string: a string instruction
+                # is a template in which `{name}` is a session-state lookup that
+                # raises KeyError at run time when no such key exists. Mantis
+                # prompts are literal text -- they quote code, and code has
+                # braces (`f"... WHERE name='{name}'"` killed a live rollout at
+                # the threat modeler). Nothing in Mantis uses state templating
+                # in node instructions; the seed prompt's {filepath} is
+                # substituted by main.py itself.
+                "instruction": _literal_instruction(instruction),
                 "tools": agent_tools,
                 "output_schema": schema_cls,
                 "output_key": node_cfg.output_key,
