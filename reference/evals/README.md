@@ -142,6 +142,44 @@ python3 evals/research_targets/gen.py --list holdout    # 9000-9099 (needs --all
   `tests/test_research_targets.py` greps every file for words that would name a
   flaw.
 
+### Sweeps and the change gate (`sweep.py`, `compare.py`)
+
+A single comparison is a sample. `sweep.py` runs the matrix
+`{arm × seed × repeat}` **interleaved in time** (both arms back to back per
+target, so model drift hits them equally), writes one directory per cell, marks
+a cell complete only after a graded return (re-rolling crashes up to
+`--max-attempts`, then keeping the failure as `exhausted`), and locks the
+directory to one identity (model, effort, arms, seeds, caps) so two different
+measurements cannot share it. `compare.py` reads the cells and applies the gate
+a change must clear:
+
+```bash
+python3 evals/sweep.py --out runs/dev-1 --arms baseline,structural --seeds dev:10 \
+    --repeats 3 --size medium --max-tokens 1500000 --model vertex_ai/gemini-3.8-flash
+python3 evals/compare.py runs/dev-1 --baseline baseline --candidate structural
+# after it passes on dev, once:
+python3 evals/sweep.py --out runs/holdout-1 --seeds holdout:8 --confirm-holdout ...
+python3 evals/compare.py runs/holdout-1
+```
+
+The gate, over **targets** (repeats on one target are correlated through it):
+
+1. paired-bootstrap 95% CI of Δrecall has lower bound > 0, **or** the CI
+   contains 0 and tokens-per-true-finding improves ≥ 20% with its own CI
+   excluding 0;
+2. mean Δrecall exceeds **2× the baseline's A/A noise floor** (mean absolute
+   difference between baseline repeats on the same target — the number a single
+   run's "improvement" has to beat);
+3. worst-target Δrecall ≥ −0.10;
+4. decoy false-positive rate and the ungraded / zero-finding / re-armed rates do
+   not increase.
+
+It also reports **union gain** for two arms — union recall against the best
+single arm and against what two independent samplers would reach — so a second
+arm that merely re-samples the first is visible. Suggested sizes: smoke 10
+targets × 1 repeat × 2 arms (20 campaigns); dev 10 × 3 × 2 (60); holdout 8 × 3 ×
+2 (48), run once. Past ~30 targets, spend on targets rather than repeats.
+
 ### Field evidence: toolset A/B on an external target
 
 The seeded corpus measures recall; it cannot say whether the structural toolset
