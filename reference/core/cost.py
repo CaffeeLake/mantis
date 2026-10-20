@@ -68,6 +68,20 @@ RESUMPTION
     That is intentional and matches the resume contract: `--resume` starts a
     fresh budget so an operator can resume out of the box without recomputing
     anything. See `estimate_scan` and the README.
+
+WHICH HARNESS COVERED IT
+    Every row also names the harness configuration that ran the campaign
+    (`harness_fingerprint`, from core.graph_loader). "Covered" without that is
+    a statement about the past harness: after any upgrade -- a new tool, a
+    stronger model, a rewritten stage prompt -- a slice the old configuration
+    examined was never examined by the new one, and `--resume` and `auto`
+    would skip it forever. `uncovered_files`, `harness_mismatches` and
+    `run_ledger` compare the stamp on reuse. By default a mismatch still
+    counts as covered and is only REPORTED (the operator decides whether the
+    upgrade warrants re-examining what it covers); `--rescan-changed-harness`
+    treats it as uncovered. A row with no stamp -- recorded before this
+    existed, or imported from an export that did not carry one -- covers for
+    every harness, so turning the stamp on re-sweeps nothing (INV-6).
 """
 
 from __future__ import annotations
@@ -190,13 +204,33 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
             llm_calls INTEGER,
             graph_steps INTEGER,
             elapsed_seconds REAL,
-            metadata_json TEXT DEFAULT '{}'
+            metadata_json TEXT DEFAULT '{}',
+            harness_fingerprint TEXT
         )
         """
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_campaign_spend_mode ON campaign_spend(scan_mode)"
     )
+    # Columns added after the table first shipped. ALTER guarded by the
+    # catalogue, the way core.database grows `findings`: an existing ledger
+    # keeps every row (old rows read back as NULL, which every reader treats
+    # as "unknown harness" -- INV-6), and a ledger created today gets the
+    # column from the CREATE above.
+    if not has_fingerprint_column(conn):
+        conn.execute("ALTER TABLE campaign_spend ADD COLUMN harness_fingerprint TEXT")
+
+
+def has_fingerprint_column(conn: sqlite3.Connection) -> bool:
+    """Whether this ledger carries `harness_fingerprint`.
+
+    Readers ask rather than migrate: uncovered_files and run_ledger are
+    read-only probes that may run against a database this process must not
+    write (a shared knowledge base, a read-only mount), so they select the
+    column only where it exists and read NULL everywhere else.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(campaign_spend)").fetchall()}
+    return "harness_fingerprint" in cols
 
 
 def _row_failed(metadata_json: Any) -> bool:
@@ -207,7 +241,99 @@ def _row_failed(metadata_json: Any) -> bool:
     return isinstance(meta, dict) and bool(meta.get("failed"))
 
 
-def uncovered_files(db_path: str, files, model: str = "") -> Optional[list]:
+def _completed_coverage(db_path: str, model: str = "") -> Optional[dict]:
+    """Every target a completed campaign covered, mapped to the harness
+    fingerprints of the rows that covered it (None for a row recorded before
+    fingerprints existed, or imported from an export that did not carry one).
+
+    Returns None when the ledger was never written -- no file, no table --
+    which is a genuine first run. Raises when the ledger exists and cannot be
+    read; the callers decide what an unreadable ledger means to them.
+
+    With `model` given, only rows of that model and rows of no known model
+    count, for the reasons uncovered_files gives.
+    """
+    if not os.path.exists(db_path):
+        return None
+    conn = _connect(db_path)
+    try:
+        try:
+            fp_col = "s.harness_fingerprint" if has_fingerprint_column(conn) else "NULL"
+            has_runs = model and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+            if has_runs:
+                # Rows of this model, and rows of no known model.
+                rows = conn.execute(
+                    f"SELECT s.target, s.metadata_json, {fp_col} FROM campaign_spend s "
+                    "LEFT JOIN runs r ON r.run_id = s.run_id "
+                    "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                    (str(model),)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT s.target, s.metadata_json, {fp_col} FROM campaign_spend s "
+                    "WHERE s.target IS NOT NULL"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return None  # Ledger never written: genuine first run.
+            raise
+    finally:
+        conn.close()
+    targets: dict = {}
+    for target, metadata_json, fingerprint in rows:
+        t = str(target or "").rstrip("/")
+        if t and not _row_failed(metadata_json):
+            targets.setdefault(t, set()).add(str(fingerprint) if fingerprint else None)
+    return targets
+
+
+def _covering_fingerprints(path: str, targets: dict) -> Optional[set]:
+    """The fingerprints of every completed campaign whose target was `path`
+    or an ancestor of it; None when nothing covered it.
+
+    Walks UP the directory chain so each check is a set lookup. Comparing
+    every file against every target is the quadratic nobody notices until
+    chromium's 462,079 files meet a ledger with a few thousand rows. The whole
+    chain is walked, not just to the first hit: a file covered by an old
+    whole-repository campaign AND by a recent per-file one is covered by both
+    harnesses, and the verdict below needs to know that.
+    """
+    found: Optional[set] = None
+    probe = path.rstrip("/")
+    while probe:
+        if probe in targets:
+            found = (found or set()) | targets[probe]
+        parent = probe.rsplit("/", 1)[0] if "/" in probe else ""
+        if parent == probe:
+            break
+        probe = parent
+    return found
+
+
+def coverage_verdict(fingerprints: Optional[set], current: str) -> str:
+    """'uncovered', 'covered', or 'mismatched' -- covered only by campaigns
+    that ran a different harness configuration.
+
+    A row with no fingerprint always counts as covered: it predates the
+    stamp, and turning the stamp on must not make an existing knowledge base
+    re-sweep itself (INV-6). With no current fingerprint to compare against,
+    every covering row counts, as it always did.
+    """
+    if fingerprints is None:
+        return "uncovered"
+    if not current or None in fingerprints or current in fingerprints:
+        return "covered"
+    return "mismatched"
+
+
+def uncovered_files(
+    db_path: str,
+    files,
+    model: str = "",
+    harness_fingerprint: str = "",
+    rescan_changed_harness: bool = False,
+) -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
 
     With `model` given, covered means covered BY THAT MODEL: a file another
@@ -218,6 +344,15 @@ def uncovered_files(db_path: str, files, model: str = "") -> Optional[list]:
     did not say) counts as coverage for every model, as it always did:
     turning on provenance must not make an existing knowledge base re-sweep
     itself.
+
+    With `harness_fingerprint` given, a file whose covering campaigns ALL
+    carry a different, non-NULL fingerprint was examined by another harness
+    configuration -- older tools, a weaker model, a previous prompt. By
+    default it still counts as covered (the caller reports the count, see
+    harness_mismatches, and the operator decides); with
+    `rescan_changed_harness` it is uncovered and swept again. A row with no
+    fingerprint covers the file for every harness, exactly as a row with no
+    model covers it for every model (INV-6).
 
     A file counts as covered when some completed campaign's target was the
     file itself or an ancestor directory of it: scanning `repo/lib` covers
@@ -245,58 +380,64 @@ def uncovered_files(db_path: str, files, model: str = "") -> Optional[list]:
         return None  # No ledger to consult: coverage is unknowable.
     all_files = [str(f) for f in files]
     try:
-        if not os.path.exists(db_path):
-            return all_files
-        conn = _connect(db_path)
-        try:
-            try:
-                has_runs = model and conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
-                if has_runs:
-                    # Rows of this model, and rows of no known model.
-                    rows = conn.execute(
-                        "SELECT s.target, s.metadata_json FROM campaign_spend s "
-                        "LEFT JOIN runs r ON r.run_id = s.run_id "
-                        "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
-                        (str(model),)
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
-                    ).fetchall()
-            except sqlite3.OperationalError as exc:
-                if "no such table" in str(exc).lower():
-                    return all_files  # Ledger never written: genuine first run.
-                raise
-        finally:
-            conn.close()
-        targets = set()
-        for target, metadata_json in rows:
-            t = str(target or "").rstrip("/")
-            if t and not _row_failed(metadata_json):
-                targets.add(t)
+        targets = _completed_coverage(db_path, model)
+        if targets is None:
+            return all_files  # Ledger never written: genuine first run.
+        current = str(harness_fingerprint or "")
         out = []
         for path in all_files:
-            probe = path.rstrip("/")
-            # Walk UP the directory chain so each check is a set lookup.
-            # Comparing every file against every target is the quadratic
-            # nobody notices until chromium's 462,079 files meet a ledger
-            # with a few thousand rows.
-            while probe and probe not in targets:
-                parent = probe.rsplit("/", 1)[0] if "/" in probe else ""
-                if parent == probe:
-                    break
-                probe = parent
-            if not probe:
+            verdict = coverage_verdict(_covering_fingerprints(path, targets), current)
+            if verdict == "uncovered" or (verdict == "mismatched" and rescan_changed_harness):
                 out.append(path)
         return out
     except Exception:
         return None
 
 
+def harness_mismatches(
+    db_path: str,
+    files,
+    model: str = "",
+    harness_fingerprint: str = "",
+) -> Optional[dict]:
+    """The files in `files` that count as covered ONLY because a different
+    harness configuration examined them, as
+    `{"files": [...], "fingerprints": {other_fingerprint: file_count}}`.
+
+    These are exactly the files uncovered_files() would add under
+    `rescan_changed_harness`; the caller states the count once per run so
+    the operator can decide whether the upgrade is worth re-examining them.
+    Same model scoping and NULL-fingerprint rule as uncovered_files.
+
+    Returns None when there is nothing to compare -- no ledger path, no
+    current fingerprint -- or the ledger cannot be read. Never raises.
+    """
+    if not db_path or not harness_fingerprint:
+        return None
+    all_files = [str(f) for f in files]
+    try:
+        targets = _completed_coverage(db_path, model)
+        out: dict = {"files": [], "fingerprints": {}}
+        if targets is None:
+            return out  # Ledger never written: nothing was covered by anyone.
+        current = str(harness_fingerprint)
+        for path in all_files:
+            covering = _covering_fingerprints(path, targets)
+            if coverage_verdict(covering, current) != "mismatched":
+                continue
+            out["files"].append(path)
+            for fp in sorted(covering or ()):
+                out["fingerprints"][fp] = out["fingerprints"].get(fp, 0) + 1
+        return out
+    except Exception:
+        return None
+
+
 def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
-    """What one run's campaigns did, as `{target: {"failed": bool}}`, the
+    """What one run's campaigns did, as
+    `{target: {"failed": bool, "harness_fingerprint": str | None}}`, the
     latest row per target winning (a retried campaign supersedes its failure).
+    The fingerprint is None for rows recorded before the stamp existed.
 
     Returns None when the ledger cannot be read, `{}` when the run has no
     rows: a run that paused inside its first campaign recorded nothing, and
@@ -311,8 +452,9 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
         conn = _connect(db_path)
         try:
             try:
+                fp_col = "harness_fingerprint" if has_fingerprint_column(conn) else "NULL"
                 rows = conn.execute(
-                    "SELECT target, metadata_json FROM campaign_spend "
+                    f"SELECT target, metadata_json, {fp_col} FROM campaign_spend "
                     "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
                     (str(run_id),),
                 ).fetchall()
@@ -323,10 +465,13 @@ def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
         finally:
             conn.close()
         out: dict = {}
-        for target, metadata_json in rows:
+        for target, metadata_json, fingerprint in rows:
             t = str(target or "").rstrip("/")
             if t:
-                out[t] = {"failed": _row_failed(metadata_json)}
+                out[t] = {
+                    "failed": _row_failed(metadata_json),
+                    "harness_fingerprint": str(fingerprint) if fingerprint else None,
+                }
         return out
     except Exception:
         return None
@@ -415,8 +560,15 @@ def record_spend(
     graph_steps: int = 0,
     elapsed_seconds: float = 0.0,
     metadata: Optional[dict] = None,
+    harness_fingerprint: str = "",
 ) -> bool:
     """Records what one campaign actually cost. Returns True if stored.
+
+    `harness_fingerprint` names the configuration that ran the campaign
+    (core.graph_loader.compute_harness_fingerprint), so a later run can tell
+    whether "covered" means covered by the harness it is about to run. Empty
+    is stored as NULL -- unknown -- which every reader treats as covering
+    for any harness, the same way a row with no model covers for any model.
 
     Never raises. This is bookkeeping: a scan that found a real vulnerability
     must not fail because the accounting table was unwritable (INV-6).
@@ -435,8 +587,8 @@ def record_spend(
                 """
                 INSERT INTO campaign_spend
                     (run_id, target, scan_mode, tokens, llm_calls, graph_steps,
-                     elapsed_seconds, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     elapsed_seconds, metadata_json, harness_fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(run_id),
@@ -447,6 +599,7 @@ def record_spend(
                     int(graph_steps or 0),
                     float(elapsed_seconds or 0.0),
                     json.dumps(metadata or {}),
+                    str(harness_fingerprint) if harness_fingerprint else None,
                 ),
             )
         return True

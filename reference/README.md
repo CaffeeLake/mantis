@@ -191,6 +191,27 @@ reflects this by suggesting a larger budget on the resume line.
 If you need a hard total across resumptions, enforce it outside Mantis — the
 per-campaign spend ledger below records what each run actually cost.
 
+**Coverage remembers which harness covered it.** Every campaign row in the spend
+ledger carries a *harness fingerprint*: a 16-hex digest of the resolved graph —
+node ids, each node's tools, model and final prompt (whitespace-collapsed, so
+re-wrapping a prompt changes nothing), the default model and the sandbox tier.
+After an upgrade, ground the previous configuration examined was never examined
+by the one that runs now, and without the stamp `--resume` and `auto` would skip
+it forever. By default such ground still counts as covered, and the run says so
+once:
+
+```
+12 previously covered slice(s) were examined by a different harness configuration
+(fingerprint 1f2e3d4c5b6a7980 vs 9a8b7c6d5e4f3021); pass --rescan-changed-harness to re-examine them.
+```
+
+Pass `--rescan-changed-harness` to treat it as uncovered — a resumed run scans
+those campaigns again under its run ID, and `auto` adds them to the sweep. Rows
+recorded before the stamp existed, or imported from an export without one, count
+as covered for every harness, so upgrading never re-sweeps an existing knowledge
+base on its own. The knowledge export carries the fingerprint per
+`coverage.json` entry and the import preserves it.
+
 #### Sizing a scan to its budget
 
 Before any campaign runs, Mantis states what the token budget covers:

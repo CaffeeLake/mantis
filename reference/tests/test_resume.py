@@ -68,11 +68,18 @@ class LedgerTest(unittest.TestCase):
         record_spend(self.db, "r1", self.a, "file-by-file", tokens=10, metadata={"failed": True})
         record_spend(self.db, "r1", self.b, "file-by-file", tokens=10, metadata={"failed": False})
         record_spend(self.db, "r2", self.c, "file-by-file", tokens=10, metadata={"failed": False})
-        self.assertEqual(run_ledger(self.db, "r1"), {self.a: {"failed": True}, self.b: {"failed": False}})
+        # Rows written without a harness fingerprint read back as None: the
+        # stamp is unknown, never invented.
+        self.assertEqual(run_ledger(self.db, "r1"), {
+            self.a: {"failed": True, "harness_fingerprint": None},
+            self.b: {"failed": False, "harness_fingerprint": None},
+        })
         self.assertEqual(run_ledger(self.db, "r3"), {})
-        # A retry that succeeds supersedes the failure.
-        record_spend(self.db, "r1", self.a, "file-by-file", tokens=10, metadata={"failed": False})
-        self.assertEqual(run_ledger(self.db, "r1")[self.a], {"failed": False})
+        # A retry that succeeds supersedes the failure, stamp included.
+        record_spend(self.db, "r1", self.a, "file-by-file", tokens=10, metadata={"failed": False},
+                     harness_fingerprint="abcdef0123456789")
+        self.assertEqual(run_ledger(self.db, "r1")[self.a],
+                         {"failed": False, "harness_fingerprint": "abcdef0123456789"})
         corrupt = os.path.join(self.tmp, "corrupt.db")
         Path(corrupt).write_bytes(b"not a database")
         self.assertIsNone(run_ledger(corrupt, "r1"))
@@ -186,9 +193,9 @@ class ResumeRunTest(unittest.TestCase):
         # The dummy endpoint pauses the run at its one allowed LLM call, and a
         # paused campaign records nothing, so the ledger is as seeded.
         self.assertEqual(run_ledger(self.db, run), {
-            self.files["a"]: {"failed": False},
-            self.files["b"]: {"failed": False},
-            self.files["c"]: {"failed": True},
+            self.files["a"]: {"failed": False, "harness_fingerprint": None},
+            self.files["b"]: {"failed": False, "harness_fingerprint": None},
+            self.files["c"]: {"failed": True, "harness_fingerprint": None},
         })
 
         # Everything now has a successful row: nothing to do, and no id needed.

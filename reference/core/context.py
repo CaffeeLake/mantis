@@ -44,6 +44,12 @@ class RunContext:
     exclude: tuple = ()
     # The model this run uses (resolved id). Empty when unknown.
     model: str = ""
+    # Identity of the harness configuration this run executes (node ids,
+    # tools, models, prompts, sandbox tier; core.graph_loader
+    # .compute_harness_fingerprint). Stamped on every coverage row so a later
+    # run can tell "covered" from "covered by THIS harness". Empty means
+    # unknown: rows are written without one and never reported stale (INV-6).
+    harness_fingerprint: str = ""
     # Per-file un-windowed read_file call counters for tool-loop steering.
     read_file_counts: dict[str, int] = field(default_factory=dict)
 

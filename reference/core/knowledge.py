@@ -91,6 +91,9 @@ MAX_SHORT_CHARS = 300
 MAX_LIST_ITEMS = 500
 _IDENT_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
 _STATUS_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+# A harness fingerprint is a hex digest prefix (core.graph_loader); the
+# importer keeps only values of that shape.
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{8,64}$")
 
 README_TEXT = """\
 # Mantis knowledge
@@ -105,7 +108,9 @@ a re-export diffs cleanly.
   one model keeps who found what and who covered what.
 - `threat_model.json` / `.md`, `architecture.md`, `summary.json`: the model's
   current map of the system.
-- `coverage.json`: what has been scanned, and at which snapshot.
+- `coverage.json`: what has been scanned, at which snapshot, and by which
+  harness configuration (`harness_fingerprint`), so a run after an upgrade
+  can tell "covered" from "covered by what runs now".
 - `learnings.jsonl`: what the pipeline learned about this codebase.
 
 Regenerate with `scripts/knowledge.py export`; a run reads it back with
@@ -355,9 +360,14 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
                          "snapshot_id": _scrub(entry.get("snapshot_id"), MAX_SHORT_CHARS),
                          "examined": examined})
     scanned: Dict[str, Dict[str, Any]] = {}
+    # The ledger grew `harness_fingerprint` after it first shipped; a database
+    # last written by an older Mantis has no such column and must still export.
+    from core.cost import has_fingerprint_column
+
     try:
+        fp_col = "harness_fingerprint" if has_fingerprint_column(conn) else "NULL AS harness_fingerprint"
         spend = conn.execute(
-            "SELECT target, scan_mode, run_id, tokens FROM campaign_spend ORDER BY id ASC").fetchall()
+            f"SELECT target, scan_mode, run_id, tokens, {fp_col} FROM campaign_spend ORDER BY id ASC").fetchall()
     except sqlite3.Error:
         spend = []
     for row in spend:
@@ -368,7 +378,8 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
         run_id = _scrub(r.get("run_id"), MAX_SHORT_CHARS)
         model = models.get(run_id, "")
         scanned[(rel, model)] = {"path": rel, "scan_mode": _scrub(r.get("scan_mode"), MAX_SHORT_CHARS),
-                                 "last_run_id": run_id, "model": model}
+                                 "last_run_id": run_id, "model": model,
+                                 "harness_fingerprint": _scrub(r.get("harness_fingerprint"), MAX_SHORT_CHARS)}
     return {"schema_version": SCHEMA_VERSION, "runs": runs,
             "scanned": [scanned[k] for k in sorted(scanned)]}
 
@@ -719,9 +730,17 @@ def _import_coverage(db_path: str, path: Path, repo_root: str, targets: List[str
         if (abs_path, run_id) in already:
             paths += 1
             continue
+        # The harness that covered it, carried through so an imported row
+        # answers "covered by THIS harness?" the same way a native one does.
+        # Bounded to the shape the exporter writes; anything else -- and an
+        # export that predates the field -- imports as unknown, which covers
+        # for every harness (INV-6).
+        fingerprint = _short(entry.get("harness_fingerprint"))
+        if not _FINGERPRINT_RE.match(fingerprint):
+            fingerprint = ""
         if record_spend(db_path, run_id, abs_path,
                         _short(entry.get("scan_mode")) or "whole", tokens=0,
-                        metadata={"imported": True}):
+                        metadata={"imported": True}, harness_fingerprint=fingerprint):
             already.add((abs_path, run_id))
             paths += 1
     return runs, paths

@@ -301,6 +301,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--rescan-changed-harness",
+        action="store_true",
+        help=(
+            "Treat ground covered by a different harness configuration (other tools, "
+            "model, stage prompts or sandbox tier -- the coverage ledger stamps each "
+            "campaign with a fingerprint of what ran it) as uncovered, so --resume and "
+            "auto mode examine it again. By default such ground still counts as covered "
+            "and the run reports how much of it there is."
+        ),
+    )
+    parser.add_argument(
         "--inspect",
         action="store_true",
         help="Preview synthesized workflow layout and prompt before execution",
@@ -392,6 +403,7 @@ def run_launch(
     no_context_cache: bool = False,
     cache_discount: Optional[float] = None,
     import_knowledge: str = "",
+    rescan_changed_harness: bool = False,
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -704,6 +716,7 @@ def run_launch(
                 enable_context_cache=False if no_context_cache else None,
                 cache_discount_override=cache_discount,
                 import_knowledge_dir=import_knowledge,
+                rescan_changed_harness=rescan_changed_harness,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -787,6 +800,7 @@ def main() -> int:
             no_context_cache=args.no_context_cache,
             cache_discount=cache_discount,
             import_knowledge=args.import_knowledge,
+            rescan_changed_harness=args.rescan_changed_harness,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)

@@ -2023,6 +2023,28 @@ class DeferredEnvLiteLlm(ResilientLiteLlm):
             yield item
 
 
+def resolve_model_id(
+    model_id: Optional[str] = None,
+    default_model: str = DEFAULT_MODEL,
+    global_model_override: Optional[str] = None,
+) -> str:
+    """The model a node will actually call, as its normalized id.
+
+    Precedence: global_override > MANTIS_MODEL > node > MODEL_ID > default.
+    Split out of get_llm_kwargs so a caller that only needs the identity --
+    the harness fingerprint stamps it on every coverage row -- gets the same
+    answer whether or not the credentials get_llm_kwargs goes on to require
+    are present.
+    """
+    if global_model_override:
+        raw_model = global_model_override
+    elif os.environ.get("MANTIS_MODEL"):
+        raw_model = os.environ.get("MANTIS_MODEL")
+    else:
+        raw_model = model_id or os.environ.get("MODEL_ID") or default_model
+    return normalize_model_id(raw_model)
+
+
 def get_llm_kwargs(
     model_id: Optional[str] = None,
     default_model: str = DEFAULT_MODEL,
@@ -2036,14 +2058,7 @@ def get_llm_kwargs(
     config: Optional[dict] = None,
 ) -> Tuple[str, dict]:
     """Resolves the LLM mapping details cleanly with precedence: global_override > MANTIS_MODEL > node > MODEL_ID > default."""
-    if global_model_override:
-        raw_model = global_model_override
-    elif os.environ.get("MANTIS_MODEL"):
-        raw_model = os.environ.get("MANTIS_MODEL")
-    else:
-        raw_model = model_id or os.environ.get("MODEL_ID") or default_model
-
-    resolved_model = normalize_model_id(raw_model)
+    resolved_model = resolve_model_id(model_id, default_model, global_model_override)
     resolved_api_base = api_base or os.environ.get("LLM_API_BASE") or default_api_base
     raw_timeout = timeout if timeout is not None else (
         os.environ.get("LLM_TIMEOUT")

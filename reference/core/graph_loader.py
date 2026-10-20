@@ -32,7 +32,7 @@ from google.genai import types
 from core.prompts import get_stage_prompt, STAGE_PROMPTS
 
 
-from core.config import get_llm_kwargs, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict
+from core.config import get_llm_kwargs, resolve_model_id, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict
 
 LiteLlm = ResilientLiteLlm
 from core.environments import ENVIRONMENTS, get_shared_proxy_environment
@@ -588,6 +588,69 @@ def compute_prefix_fingerprint(
             "node_id": node_id,
             "snapshot_id": snapshot_id,
             "tools": sorted(str(t) for t in tools),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _instruction_digest(instruction: str) -> str:
+    """sha256 of an instruction with its whitespace collapsed.
+
+    Re-wrapping a prompt, fixing its indentation, or a trailing newline does
+    not change what the model is told; a fingerprint that flipped on those
+    would mark every covered slice stale on each cosmetic edit, and the
+    operator would learn to ignore it.
+    """
+    collapsed = " ".join(str(instruction or "").split())
+    return hashlib.sha256(collapsed.encode("utf-8")).hexdigest()
+
+
+def compute_harness_fingerprint(
+    nodes: Sequence[dict],
+    default_model: str = "",
+    sandbox: str = "",
+) -> str:
+    """Content-addressed identity of a resolved harness configuration.
+
+    The coverage ledger records that a slice was examined; this says by WHAT.
+    After an upgrade -- a tool added to a node, a stronger model, a rewritten
+    stage prompt, a different sandbox tier -- a slice covered under the old
+    configuration was never seen by the new one, and without this stamp
+    `--resume` and `auto` treat it as done forever. Stamped on every
+    campaign_spend row (cost.record_spend) and compared on reuse
+    (cost.uncovered_files, cost.run_ledger).
+
+    `nodes` is one dict per graph node: `id`, and for agent nodes `tools`
+    (names), `model` (resolved id) and `instruction` (final text, after the
+    loader's appended guard and output contract). Order never matters: nodes
+    sort by id and tools by name. Instructions enter as a whitespace-collapsed
+    digest (see _instruction_digest), so cosmetic prompt edits do not change
+    the result and the payload never holds prompt text.
+
+    Deliberately NOT in the hash: edges, budgets, timeouts, retry counts,
+    reasoning effort, API bases and exclusions. Those tune how much a run
+    does, not what the harness is capable of finding; folding them in would
+    make every budget tweak look like an upgrade. 16 hex characters, like
+    compute_prefix_fingerprint.
+    """
+    normalized = []
+    for raw in nodes or []:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        normalized.append({
+            "id": str(raw["id"]),
+            "instruction": _instruction_digest(raw.get("instruction") or ""),
+            "model": str(raw.get("model") or ""),
+            "tools": sorted(str(t) for t in (raw.get("tools") or [])),
+        })
+    normalized.sort(key=lambda n: n["id"])
+    payload = json.dumps(
+        {
+            "default_model": str(default_model or ""),
+            "nodes": normalized,
+            "sandbox": str(sandbox or ""),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1533,6 +1596,11 @@ def load_workflow_from_json(
     nodes = {}
     node_specs = {}
     declared_node_ids = set()
+    # Material for the harness fingerprint (compute_harness_fingerprint):
+    # every node by id, and for agent nodes the resolved tools, model and
+    # final instruction. Gathered here because this loop is the only place
+    # the final instruction text exists.
+    harness_nodes: list[dict] = []
 
     for node_cfg in spec.nodes:
         node_id = node_cfg.id
@@ -1548,6 +1616,7 @@ def load_workflow_from_json(
         declared_node_ids.add(node_id)
 
         if isinstance(node_cfg, ClassifierNode):
+            harness_nodes.append({"id": node_id})
             if len(node_cfg.routes) != len(set(node_cfg.routes)):
                 errors.append(f"Classifier '{node_id}' routes contain duplicates: {node_cfg.routes}.")
             if node_id == "findings_gate":
@@ -1569,8 +1638,16 @@ def load_workflow_from_json(
                 # or tools are built: the stage makes no LLM calls.
                 nodes[node_id] = create_structural_index_node(node_id)
                 node_specs[node_id] = {"type": "agent"}
+                harness_nodes.append({"id": node_id})
                 continue
             node_has_error = False
+            # What this node will call, as the identity the fingerprint
+            # stamps: resolved through the same precedence get_llm_kwargs
+            # applies, and available whether or not the credentials it goes
+            # on to need are present.
+            node_model_id = resolve_model_id(
+                node_cfg.model, spec.config.default_model, model_override
+            )
             # The exact call graph build used to make eagerly, frozen as a
             # zero-argument resolver so it can run either here (normal path)
             # or inside DeferredEnvLiteLlm at first LLM call (hermetic path).
@@ -1680,6 +1757,12 @@ def load_workflow_from_json(
                     system_instruction=instruction,
                 )
                 node_specs[node_id] = {"type": "agent"}
+                harness_nodes.append({
+                    "id": node_id,
+                    "tools": list(node_cfg.tools),
+                    "model": node_model_id,
+                    "instruction": instruction,
+                })
                 continue
 
             if schema_cls:
@@ -1715,6 +1798,13 @@ def load_workflow_from_json(
                         f"strength confirm them. The top-level route/reason then summarize the overall outcome "
                         f"(confirmed if ANY finding is confirmed)."
                     )
+
+            harness_nodes.append({
+                "id": node_id,
+                "tools": list(node_cfg.tools),
+                "model": node_model_id,
+                "instruction": instruction,
+            })
 
             agent_kwargs: dict[str, Any] = {
                 "name": node_id,
@@ -1924,6 +2014,20 @@ def load_workflow_from_json(
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):
         cfg["budget"] = raw_json["budget"]
+    # What this harness IS, for the coverage ledger: main.py stamps it on
+    # every spend row and compares it when deciding what a resumed or
+    # coverage-driven run may skip. Empty on any failure, which every consumer
+    # reads as "unknown" -- rows are written without a fingerprint and no
+    # mismatch is ever reported (INV-6); a broken hash must not cost the run.
+    try:
+        cfg["harness_fingerprint"] = compute_harness_fingerprint(
+            harness_nodes,
+            default_model=resolve_model_id(None, spec.config.default_model, model_override),
+            sandbox=spec.config.sandbox.type,
+        )
+    except Exception as exc:
+        print(f"[graph_loader] harness fingerprint unavailable: {exc}", file=sys.stderr)
+        cfg["harness_fingerprint"] = ""
 
     return (
         Workflow(

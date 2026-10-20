@@ -462,7 +462,7 @@ SCENARIOS = {
     # ---- Campaign cost model / scan sizing ----
     "scan_revert_virgin_sweep": [
         ('main.py',
-         '                uncovered = uncovered_files(db_path, discovered_files, model=run_model)',
+         '                uncovered = uncovered_files(\n                    db_path, discovered_files, model=run_model,\n                    harness_fingerprint=harness_fp,\n                    rescan_changed_harness=rescan_changed,\n                )',
          '                uncovered = None  # NEUTERED: coverage gaps are silently skipped, never swept'),
     ],
     "cost_revert_coverage_failsafe": [
@@ -472,7 +472,7 @@ SCENARIOS = {
     ],
     "cost_revert_spend_recording": [
         ('main.py',
-         '                    record_spend(\n                        db_path,\n                        run_id,\n                        scan_item,\n                        scan_mode,\n                        tokens=budget_ctrl.accumulated_tokens - tokens_before,\n                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,\n                        graph_steps=budget_ctrl.graph_steps - steps_before,\n                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,\n                        metadata={"failed": bool(task_failed)},\n                    )',
+         '                    record_spend(\n                        db_path,\n                        run_id,\n                        scan_item,\n                        scan_mode,\n                        tokens=budget_ctrl.accumulated_tokens - tokens_before,\n                        llm_calls=budget_ctrl.llm_calls - llm_calls_before,\n                        graph_steps=budget_ctrl.graph_steps - steps_before,\n                        elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,\n                        metadata={"failed": bool(task_failed)},\n                        harness_fingerprint=harness_fingerprint,\n                    )',
          '                    pass  # NEUTERED: nothing is ever learned about what a campaign costs'),
     ],
     "cost_revert_spend_delta": [

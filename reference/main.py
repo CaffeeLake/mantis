@@ -769,7 +769,7 @@ def resolve_scan_targets(
         else:
             uncovered = None
             try:
-                from core.cost import uncovered_files
+                from core.cost import harness_mismatches, uncovered_files
 
                 # Coverage is asked per model: the sweep is of what THIS
                 # model has not seen, so knowledge built by several models
@@ -777,7 +777,27 @@ def resolve_scan_targets(
                 from core.config import normalize_model_id
 
                 run_model = normalize_model_id(str(config.get("default_model") or ""))
-                uncovered = uncovered_files(db_path, discovered_files, model=run_model)
+                # And per harness: a file an older configuration covered is
+                # reported (default) or re-swept (--rescan-changed-harness).
+                # An empty fingerprint compares nothing and sweeps nothing extra.
+                harness_fp = str(config.get("harness_fingerprint") or "")
+                rescan_changed = bool(config.get("rescan_changed_harness"))
+                uncovered = uncovered_files(
+                    db_path, discovered_files, model=run_model,
+                    harness_fingerprint=harness_fp,
+                    rescan_changed_harness=rescan_changed,
+                )
+                stale = harness_mismatches(
+                    db_path, discovered_files, model=run_model, harness_fingerprint=harness_fp,
+                )
+                if stale and stale.get("files"):
+                    print(
+                        _changed_harness_notice(
+                            len(stale["files"]), stale.get("fingerprints") or {},
+                            harness_fp, rescan_changed,
+                        ),
+                        file=sys.stderr,
+                    )
             except Exception as exc:
                 print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             if uncovered:
@@ -929,7 +949,37 @@ def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
     return counts
 
 
-def _stamp_member_coverage(db_path: str, run_id: str, group: dict, scan_item: str, scan_mode: str) -> int:
+def _changed_harness_notice(count: int, fingerprints: dict, current: str, rescanning: bool) -> str:
+    """The one line a run prints about ground an earlier harness covered.
+
+    Numbers and digests only -- no repository bytes -- stated once so a CI
+    log records that coverage was inherited from a different configuration.
+    Names the stamp(s) found against the one this run carries, so two logs
+    can be compared, and says what the run is doing about it: counting them
+    as covered (default) or re-examining them (--rescan-changed-harness).
+    """
+    ranked = sorted((fingerprints or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ", ".join(fp for fp, _n in ranked[:3]) or "unknown"
+    if len(ranked) > 3:
+        shown += f" +{len(ranked) - 3} more"
+    label = "fingerprint" if len(ranked) <= 1 else "fingerprints"
+    head = (
+        f"{count} previously covered slice(s) were examined by a different "
+        f"harness configuration ({label} {shown} vs {current})"
+    )
+    if rescanning:
+        return f"{head}; re-examining them (--rescan-changed-harness)."
+    return f"{head}; pass --rescan-changed-harness to re-examine them."
+
+
+def _stamp_member_coverage(
+    db_path: str,
+    run_id: str,
+    group: dict,
+    scan_item: str,
+    scan_mode: str,
+    harness_fingerprint: str = "",
+) -> int:
     """Coverage stamps for the members a multi-target campaign spanned beyond
     its primary.
 
@@ -958,6 +1008,7 @@ def _stamp_member_coverage(db_path: str, run_id: str, group: dict, scan_item: st
                 graph_steps=0,
                 elapsed_seconds=0.0,
                 metadata={"member_of": scan_item},
+                harness_fingerprint=harness_fingerprint,
             ):
                 stamped += 1
     except Exception as exc:
@@ -1136,6 +1187,7 @@ async def pipeline(
     path_root: str = "",
     save_config: bool = False,
     db_timeout: Optional[float] = None,
+    rescan_changed_harness: bool = False,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     # SQLite serializes writers, and every parallel campaign writes findings
@@ -1248,6 +1300,18 @@ async def pipeline(
         record_run(db_path, run_id, run_model)
     except Exception as exc:
         print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
+
+    # What this run IS, for the coverage ledger: the loader hashed the
+    # resolved graph (node ids, tools, models, final prompts, sandbox tier)
+    # into one fingerprint. Every spend row this run writes carries it, and
+    # every place that skips "already covered" ground compares it, so an
+    # upgrade stops being invisible to coverage. Empty means the loader could
+    # not say, and every consumer then behaves exactly as before the stamp
+    # existed (INV-6). The policy for a mismatch rides in config beside
+    # scan_mode because resolve_scan_targets reads config, not flags: warn by
+    # default (still covered, counted once on stderr), re-examine on request.
+    harness_fingerprint = str(config.get("harness_fingerprint") or "")
+    config = {**config, "rescan_changed_harness": bool(rescan_changed_harness)}
 
     # What not to scan: the workflow's `exclude` list plus any --exclude flags,
     # as patterns relative to the target (core.exclusions). Resolved once here
@@ -1548,8 +1612,14 @@ async def pipeline(
     # run id so findings, dedup and coverage carry on. Applied after the
     # planner so a grouped plan is narrowed the same way. An unreadable
     # ledger narrows nothing: rescanning is the safe direction.
+    #
+    # A completed campaign that a DIFFERENT harness configuration ran -- the
+    # run paused, Mantis was upgraded, the operator resumed -- still counts as
+    # completed by default and is counted once on stderr; with
+    # --rescan-changed-harness it is scanned again. A row with no stamp
+    # predates the stamp and is completed for every harness (INV-6).
     if resume_run_id:
-        from core.cost import run_ledger
+        from core.cost import coverage_verdict, run_ledger
 
         ledger = run_ledger(db_path, run_id)
         if ledger is None:
@@ -1560,13 +1630,47 @@ async def pipeline(
 
             completed = {_key(t) for t, row in ledger.items() if not row.get("failed")}
             failed = {_key(t) for t, row in ledger.items() if row.get("failed")} - completed
+            # Which harness completed each one. Judged by the same rule as
+            # cross-run coverage (cost.coverage_verdict): stale only when
+            # every completing row carries a different, non-empty stamp.
+            stamps: dict = {}
+            for t, row in ledger.items():
+                if not row.get("failed"):
+                    stamps.setdefault(_key(t), set()).add(row.get("harness_fingerprint") or None)
             planned = list(targets_to_scan)
+            stale = [
+                t for t in planned
+                if _key(t) in completed
+                and coverage_verdict(stamps.get(_key(t)), harness_fingerprint) == "mismatched"
+            ]
+            if stale:
+                stale_fps: dict = {}
+                for t in stale:
+                    for fp in sorted(stamps.get(_key(t)) or ()):
+                        stale_fps[fp] = stale_fps.get(fp, 0) + 1
+                print(
+                    _changed_harness_notice(
+                        len(stale), stale_fps, harness_fingerprint, bool(rescan_changed_harness)
+                    ),
+                    file=sys.stderr,
+                )
+                if rescan_changed_harness:
+                    completed -= {_key(t) for t in stale}
             remaining = [t for t in planned if _key(t) not in completed]
             n_failed = sum(1 for t in remaining if _key(t) in failed)
-            n_new = len(remaining) - n_failed
+            # Re-examined ground is its own count: it neither failed nor
+            # went unstarted, and folding it into either would misstate
+            # what the earlier process did.
+            rescanned = {_key(t) for t in stale} if rescan_changed_harness else set()
+            n_stale = sum(1 for t in remaining if _key(t) in rescanned)
+            n_new = len(remaining) - n_failed - n_stale
+            breakdown = (
+                f"{n_failed} failed and {n_new} never started" if not n_stale else
+                f"{n_failed} failed, {n_stale} examined by a different harness and {n_new} never started"
+            )
             print(
                 f"\n🔄 Resuming run {run_id}: {len(planned) - len(remaining)} of {len(planned)} "
-                f"campaign(s) completed; {n_failed} failed and {n_new} never started: "
+                f"campaign(s) completed; {breakdown}: "
                 f"{len(remaining)} to scan.",
                 file=sys.stderr,
             )
@@ -1868,6 +1972,7 @@ async def pipeline(
         path_root=resolved_path_root,
         exclude=exclude,
         model=run_model,
+        harness_fingerprint=harness_fingerprint,
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -2064,6 +2169,7 @@ async def pipeline(
                         graph_steps=budget_ctrl.graph_steps - steps_before,
                         elapsed_seconds=budget_ctrl.elapsed_seconds - spend_t0,
                         metadata={"failed": bool(task_failed)},
+                        harness_fingerprint=harness_fingerprint,
                     )
                 except Exception as exc:
                     # Bookkeeping must never cost a scan that is finding real bugs.
@@ -2091,7 +2197,10 @@ async def pipeline(
                         # them would hide unopened files from the next run's
                         # gap-filler -- see _stamp_member_coverage for the
                         # pairing with cost.py's zero-token exclusion.
-                        _stamp_member_coverage(db_path, run_id, group, scan_item, scan_mode)
+                        _stamp_member_coverage(
+                            db_path, run_id, group, scan_item, scan_mode,
+                            harness_fingerprint=harness_fingerprint,
+                        )
                     else:
                         print(
                             f"[COVERAGE GUARD] '{scan_item}': campaign finished without "
