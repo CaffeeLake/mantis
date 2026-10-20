@@ -421,6 +421,45 @@ class ProposerTest(unittest.TestCase):
             with self.assertRaises(ProposerError):
                 empty.call("mission", ctx, "inv1.a2", max_attempts=1)
 
+    def test_a_session_is_always_wall_clock_bounded(self):
+        """Upstream calls without a timeout; a hung connection must not hang the loop."""
+        load_harness2()
+        from harness2.core.proposer import ProposerError
+        from harness2.core.spec import ChannelSpec
+        import evals.evolve.proposer as P
+        seen = []
+
+        def recording_agent(*, timeout, **kw):
+            seen.append(timeout)
+            return {"text": "<notes>ok</notes>"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Path(tmp) / "ctx"; (ctx / "harness").mkdir(parents=True)
+            MantisProposer(ChannelSpec("opencode", "m"), agent_runner=recording_agent).call("m", ctx, "inv1.a1")
+            self.assertEqual(seen[-1], 3600, "the channel's own timeout when the caller gives none")
+            MantisProposer(ChannelSpec("opencode", "m", timeout=0), agent_runner=recording_agent).call("m", ctx, "inv1.a1")
+            self.assertEqual(seen[-1], P.DEFAULT_SESSION_TIMEOUT_SECONDS)
+            MantisProposer(ChannelSpec("opencode", "m"), agent_runner=recording_agent).call("m", ctx, "inv1.a1", timeout=42)
+            self.assertEqual(seen[-1], 42, "an explicit timeout is respected")
+
+            # The real session runner enforces it: a runner that never returns is cut off,
+            # and the call reports a ProposerError instead of sleeping forever.
+            def hanging(*, mission, system, context_root, touched, label, timeout, read_only=False):
+                import asyncio
+                async def forever():
+                    await asyncio.sleep(3600)
+                return asyncio.run(asyncio.wait_for(forever(), timeout=timeout))
+            prop = MantisProposer(ChannelSpec("opencode", "m"), agent_runner=hanging)
+            with self.assertRaises(ProposerError) as cm:
+                prop.call("m", ctx, "inv1.a1", timeout=0.05, max_attempts=1)
+            self.assertIn("TimeoutError", str(cm.exception))
+
+    def test_the_proposer_model_has_a_request_timeout(self):
+        import evals.evolve.proposer as P
+        from core.config import get_llm_kwargs
+        _, kw = get_llm_kwargs(model_id="openai/m1", default_timeout=P.PROPOSER_LLM_TIMEOUT_SECONDS)
+        self.assertEqual(kw.get("timeout"), P.PROPOSER_LLM_TIMEOUT_SECONDS)
+
 
 # --- Selection -----------------------------------------------------------------------------
 

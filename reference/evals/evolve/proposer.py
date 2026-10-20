@@ -48,6 +48,13 @@ from evals.evolve._vendor import load_harness2
 
 MAX_TOOL_OUTPUT_CHARS = 20_000
 MAX_STEPS_DEFAULT = 60
+# Wall-clock bound on one proposer session when the caller gives none, and
+# the per-request timeout on the proposer's model (a request that produces
+# nothing for five minutes is retried by the model layer's backoff, not
+# waited on). Both exist because a stalled connection otherwise stalls the
+# whole evolve loop with no process to blame.
+DEFAULT_SESSION_TIMEOUT_SECONDS = 1800
+PROPOSER_LLM_TIMEOUT_SECONDS = 300.0
 
 _TOOL_INSTRUCTIONS = (
     "You are working in a directory named `context/`. Use the tools to read the evidence "
@@ -201,6 +208,12 @@ class MantisProposer:
         from harness2.core.proposer import ProposerError, Reply
 
         tries = max(1, int(self.attempts if max_attempts is None else max_attempts))
+        # Upstream's recursion calls without a timeout. A session with no
+        # wall-clock bound hangs the whole loop on one half-closed connection
+        # (observed live: 55 minutes asleep on two CLOSE-WAIT sockets). The
+        # channel's own timeout is the bound when the caller gives none.
+        if timeout is None:
+            timeout = int(getattr(self.spec, "timeout", 0) or 0) or DEFAULT_SESSION_TIMEOUT_SECONDS
         last_err = ""
         t0 = time.time()
         for attempt in range(1, tries + 1):
@@ -267,7 +280,8 @@ class MantisProposer:
 
         from core.config import ResilientLiteLlm, get_llm_kwargs
 
-        _, llm_kwargs = get_llm_kwargs(model_id=self.model_id or None, reasoning_effort=self.reasoning_effort or None)
+        _, llm_kwargs = get_llm_kwargs(model_id=self.model_id or None, reasoning_effort=self.reasoning_effort or None,
+                                       default_timeout=PROPOSER_LLM_TIMEOUT_SECONDS)
         tools = make_context_tools(context_root, self._surface_ok, touched, read_only=read_only)
         agent = LlmAgent(name=f"proposer_{label.replace('.', '_').replace('-', '_')}"[:60],
                          model=ResilientLiteLlm(**llm_kwargs), instruction=system, tools=tools)
