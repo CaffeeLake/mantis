@@ -453,13 +453,47 @@ class MantisEmptyResponseError(RuntimeError):
     is that each attempt was a billed prompt, so the response's usage is
     metered against the run budget before this is raised: the token ceiling
     bounds the worst case, as it bounds everything else. Past the patience
-    window the empty response is passed on unchanged, and the pipeline sees
-    exactly what it saw before.
+    window -- or past ``MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS`` empty turns on
+    the one request, whichever comes first -- the empty response is passed
+    on unchanged, and the pipeline sees exactly what it saw before.
     """
 
     def __init__(self, message: str, response: Any = None):
         super().__init__(message)
         self.response = response
+
+
+# How many empty STOP turns one request may draw before the empty turn is
+# passed on. The general patience window is for faults that pass (quota,
+# 5xx); a request the model has answered with nothing six times in a row is
+# being answered, and the answer is nothing. A calibrator with twenty
+# findings and an hour of patience each would otherwise stall a run for a
+# day on a prompt the model will never fill.
+DEFAULT_EMPTY_TURN_MAX_ATTEMPTS = 6
+
+
+def structured_llm_request(prompt: str, system_instruction: str, schema_cls: Any) -> Any:
+    """A one-shot request whose answer is a ``set_model_response`` call.
+
+    The tool is registered with ``LlmRequest.append_tools``, which fills both
+    ``config.tools`` (a ``types.Tool`` carrying the declaration) and
+    ``tools_dict``. Putting the ``SetModelResponseTool`` straight into
+    ``GenerateContentConfig(tools=[...])`` looks the same and is not: ADK's
+    LiteLlm adapter forwards only ``types.Tool`` instances and drops anything
+    else without a word, so the model was being told to call a tool it had
+    never been given. Some models then answer in prose that the caller can
+    still parse; some answer with nothing, and an empty turn is retried.
+    """
+    from google.adk.models.llm_request import LlmRequest
+    from google.adk.tools.set_model_response_tool import SetModelResponseTool
+    from google.genai import types
+
+    req = LlmRequest(
+        contents=[types.Content(parts=[types.Part.from_text(text=prompt)], role="user")],
+        config=types.GenerateContentConfig(system_instruction=system_instruction),
+    )
+    req.append_tools([SetModelResponseTool(schema_cls)])
+    return req
 
 
 def is_empty_stop_response(response: Any) -> bool:
@@ -1819,9 +1853,16 @@ class ResilientLiteLlm(LiteLlm):
         max_delay = float(os.environ.get("MANTIS_LLM_RETRY_MAX_DELAY", "60.0"))
         min_offset = float(os.environ.get("MANTIS_LLM_MIN_OFFSET", "5.0"))
         backoff_factor = float(os.environ.get("MANTIS_LLM_RETRY_BACKOFF", "2.0"))
+        # An empty STOP turn is retried like a 429, but it is not a 429: a
+        # request the model has answered with nothing this many times in a
+        # row is being answered, and the answer is nothing. Past the cap the
+        # empty turn is passed on (below) instead of burning the rest of the
+        # patience window one identical request at a time.
+        max_empty_turns = int(os.environ.get("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS", str(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS)))
 
         start_time = time.time()
         attempt = 0
+        empty_turns = 0
         auth_refreshed = False
         current_stream = stream
         while True:
@@ -1912,16 +1953,21 @@ class ResilientLiteLlm(LiteLlm):
                     ) from None
 
                 elapsed = time.time() - start_time
-                if isinstance(e, MantisEmptyResponseError) and elapsed >= max_patience:
-                    # Out of patience: hand the empty turn on as it was, so ADK
-                    # reports MODEL_RETURNED_NO_CONTENT and the campaign fails
-                    # the way it did before this retry existed. --resume picks
+                if isinstance(e, MantisEmptyResponseError):
+                    empty_turns += 1
+                if isinstance(e, MantisEmptyResponseError) and (elapsed >= max_patience or empty_turns >= max_empty_turns):
+                    # Out of patience, or out of empty turns: hand the empty
+                    # turn on as it was, so ADK reports
+                    # MODEL_RETURNED_NO_CONTENT and the campaign fails the
+                    # way it did before this retry existed. --resume picks
                     # that up; an exception here would turn one known failure
                     # mode into another.
                     model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
+                    reason = (f"{empty_turns} empty turn(s) in a row on this request (cap {max_empty_turns})"
+                              if empty_turns >= max_empty_turns else f"{elapsed:.0f}s of retries")
                     print(
                         f"\n[LLM RETRY] '{model_name}' still returned no content after "
-                        f"{elapsed:.0f}s of retries; passing the empty turn on.",
+                        f"{reason}; passing the empty turn on.",
                         file=sys.stderr,
                         flush=True,
                     )

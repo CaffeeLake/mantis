@@ -275,6 +275,26 @@ class AdapterTest(unittest.TestCase):
             rd = adapter.execute("demo", None, "demo--base1")
             self.assertEqual(json.loads((rd / "summary.json").read_text())["trajectory_source"], "stdout")
 
+    def test_a_failed_rollout_is_described_not_just_declared(self):
+        def killed(target, workflow_path, run_dir, settings):
+            fake_pipeline(target, workflow_path, run_dir, settings)
+            return {"exit_code": -1, "wall_seconds": float(settings.timeout_seconds), "timed_out": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            adapter = ad.MantisRepoAdapter(targets={"demo": target}, workflow_path=WORKFLOW, runs_root=tmp / "runs",
+                                           settings=ad.RunSettings(model="m", timeout_seconds=120), runner=killed, domain="demo")
+            rd = adapter.execute("demo", None, "demo--base1")
+            self.assertFalse(adapter.delivered(rd))
+            text = adapter.describe_outcome(rd)
+            self.assertIn("timed out after 120s (--rollout-timeout)", text)
+            self.assertIn("at stage reviewer", text, "the last stage the transcript saw")
+            self.assertIn("finding(s) were in the DB", text)
+            self.assertIn("never ran", adapter.describe_outcome(tmp / "nowhere"))
+        # The default is a safety net under the token budget, not a budget of its own.
+        self.assertGreaterEqual(ad.DEFAULT_ROLLOUT_TIMEOUT_SECONDS, 2 * 3600)
+        self.assertEqual(ad.RunSettings().timeout_seconds, ad.DEFAULT_ROLLOUT_TIMEOUT_SECONDS)
+
     def test_evidence_vector_weights_tiers_and_tracks_verified_keys(self):
         ev = ad.evidence_vector([
             {"status": "dynamic_confirmed", "severity": "high", "filepath": "a.py", "title": "Cmd injection"},

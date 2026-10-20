@@ -165,6 +165,24 @@ class EmptyTurnRetryTest(unittest.TestCase):
         self.assertTrue(is_empty_stop_response(out[0]), "ADK gets the empty turn and flags it as before")
         self.assertIn("passing the empty turn on", err)
 
+    def test_a_request_the_model_keeps_answering_with_nothing_is_passed_on_before_patience_runs_out(self):
+        # Patience is an hour; the cap on empty turns per request is what ends this.
+        controller = self.with_budget()
+        with mock.patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "3600",
+                                          "MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS": "3"}):
+            upstream = ScriptedUpstream([[empty(1000)], [empty(1000)], [empty(1000)], [good()]])
+            out, err = self.run_turn(upstream)
+        self.assertEqual(len(upstream.seen), 3, "three empty turns, then the third is handed on")
+        self.assertTrue(is_empty_stop_response(out[0]))
+        self.assertIn("3 empty turn(s) in a row on this request (cap 3); passing the empty turn on", err)
+        self.assertEqual(controller.accumulated_tokens, 3000, "every empty turn was billed, so every one is charged")
+        self.assertEqual(err.count("[LLM RETRY] Transient error"), 2, "two backoffs, not three")
+
+    def test_the_default_cap_is_small_enough_to_matter(self):
+        from core.config import DEFAULT_EMPTY_TURN_MAX_ATTEMPTS
+        self.assertLessEqual(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS, 10)
+        self.assertGreaterEqual(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS, 3, "a single empty turn is still transient")
+
     def test_the_budget_ceiling_stops_the_retries(self):
         controller = self.with_budget(max_tokens=1500)
         upstream = ScriptedUpstream([[empty(1000)], [empty(1000)], [good()]])

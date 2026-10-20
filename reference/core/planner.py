@@ -1516,19 +1516,9 @@ async def propose_campaigns(
             f"response text."
         )
 
-        from google.adk.models import LlmRequest
-        from google.adk.tools.set_model_response_tool import SetModelResponseTool
-        from google.genai import types
+        from core.config import structured_llm_request
 
-        req = LlmRequest(
-            contents=[
-                types.Content(parts=[types.Part.from_text(text=prompt)], role="user")
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=_PLANNER_SYSTEM_INSTRUCTION,
-                tools=[SetModelResponseTool(plan_cls)],
-            ),
-        )
+        req = structured_llm_request(prompt, _PLANNER_SYSTEM_INSTRUCTION, plan_cls)
 
         resp_text = ""
         structured: Optional[Dict[str, Any]] = None
@@ -1779,19 +1769,9 @@ async def replan_campaigns(
             f"text."
         )
 
-        from google.adk.models import LlmRequest
-        from google.adk.tools.set_model_response_tool import SetModelResponseTool
-        from google.genai import types
+        from core.config import structured_llm_request
 
-        req = LlmRequest(
-            contents=[
-                types.Content(parts=[types.Part.from_text(text=prompt)], role="user")
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=_REPLANNER_SYSTEM_INSTRUCTION,
-                tools=[SetModelResponseTool(plan_cls)],
-            ),
-        )
+        req = structured_llm_request(prompt, _REPLANNER_SYSTEM_INSTRUCTION, plan_cls)
 
         resp_text = ""
         structured: Optional[Dict[str, Any]] = None

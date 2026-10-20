@@ -50,7 +50,7 @@ from evals.evolve import selection as ev_selection  # noqa: E402
 from evals.evolve import surface as hsurface  # noqa: E402
 from evals.evolve import surface_text  # noqa: E402
 from evals.evolve._vendor import load_harness2  # noqa: E402
-from evals.evolve.adapter import MantisEvalAdapter, MantisRepoAdapter, RunSettings  # noqa: E402
+from evals.evolve.adapter import DEFAULT_ROLLOUT_TIMEOUT_SECONDS, MantisEvalAdapter, MantisRepoAdapter, RunSettings  # noqa: E402
 from evals.evolve.proposer import MantisProposer  # noqa: E402
 
 ADOPTION_FILE = "adoption.json"
@@ -91,7 +91,8 @@ def evolve_task(task_id: str, *, adapter, proposer, selector, work_dir: Path, k:
             rv = RunView(label=label, run_id=rid, run_dir=rd, ok=rd.exists() and runmark.is_complete(rd, harness_dir=None),
                          delivered=adapter.delivered(rd))
             if not rv.ok:
-                rv.error = runmark.why_not(rd, harness_dir=None)
+                rv.error = f"{runmark.why_not(rd, harness_dir=None)}: {adapter.describe_outcome(rd)}"
+                log(f"[{task_id}] base rollout {label} failed: {adapter.describe_outcome(rd)}")
         except Exception as exc:
             rv = RunView(label=label, run_id=rid, run_dir=work_dir / "missing", ok=False, delivered=False,
                          error=f"{type(exc).__name__}: {exc}")
@@ -259,7 +260,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument("--proposer-model", default=None)
     run.add_argument("--token-budget", type=int, default=None, help="Per-rollout token budget passed to main.py.")
     run.add_argument("--max-llm-calls", type=int, default=None)
-    run.add_argument("--rollout-timeout", type=int, default=3600)
+    run.add_argument("--rollout-timeout", type=int, default=DEFAULT_ROLLOUT_TIMEOUT_SECONDS,
+                     help="Seconds before a pipeline rollout is killed and counted as failed (default 3h). "
+                          "The token budget is the cost cap; this is the safety net under it.")
     run.add_argument("--domain", default=None)
     run.add_argument("--library", type=Path, default=None, help="Library root (default: <out>/library).")
     run.add_argument("--yes", action="store_true", help="Skip the cost confirmation.")

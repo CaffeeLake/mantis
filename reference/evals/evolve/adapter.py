@@ -77,6 +77,7 @@ DISMISSED_STATUSES = ("false_positive", "non_viable", "sample_or_test")
 # reach dynamic_confirmed -- still has a floor.
 CONFIRMED_STATUSES = ("static_confirmed", "confirmed", "viable", "reproduced", "dynamic_confirmed", "patch_verified")
 MACHINE_VERIFIED_STATUSES = ("dynamic_confirmed", "patch_verified", "reproduced")
+DEFAULT_ROLLOUT_TIMEOUT_SECONDS = 3 * 3600
 
 _TOOL_CALL_RE = re.compile(r"^\[TOOL CALL: ([^\]]+)\] args=(.*)$")
 _TOOL_RESP_RE = re.compile(r"^\[TOOL (RESPONSE|FEEDBACK|FATAL ERROR): ([^\]]+)\] ?(.*)$")
@@ -94,7 +95,10 @@ class RunSettings:
     token_budget: Optional[int] = None
     max_llm_calls: Optional[int] = None
     scan_mode: str = "whole"
-    timeout_seconds: int = 3600
+    # A safety net under the token budget, not the budget: the full graph over
+    # a few dozen files takes an hour or more at a reasoning model's pace, and
+    # a rollout the timeout kills is a rollout paid for and thrown away.
+    timeout_seconds: int = DEFAULT_ROLLOUT_TIMEOUT_SECONDS
     extra_args: List[str] = field(default_factory=list)
     python: str = sys.executable
 
@@ -465,6 +469,42 @@ class MantisAdapterBase:
     def delivered(self, run_dir: Path) -> bool:
         summary = _read_json(Path(run_dir) / "summary.json", {})
         return summary.get("exit_code") == 0 and (Path(run_dir) / "findings.json").exists()
+
+    def describe_outcome(self, run_dir: Path) -> str:
+        """One line on how a rollout ended, for the driver's log and adoption.json.
+
+        A failed base rollout used to be reported as "no .adapt_complete", which
+        is true and says nothing. This says whether the pipeline timed out or
+        exited non-zero, after how long, at which stage, with how many findings
+        already in the DB -- enough to decide between raising
+        ``--rollout-timeout``, reading the stage's transcript, and giving up.
+        """
+        run_dir = Path(run_dir)
+        summary = _read_json(run_dir / "summary.json", {})
+        if not summary:
+            return "no summary.json: the rollout never ran or was cut before it was recorded"
+        code = summary.get("exit_code")
+        wall = float(summary.get("wall_seconds") or 0.0)
+        last_stage = ""
+        from core.transcript import read_transcript
+        for row in reversed(read_transcript(run_dir / "transcript.raw.jsonl")):
+            if row.get("node"):
+                last_stage = str(row["node"])
+                break
+        where = f" at stage {last_stage}" if last_stage else ""
+        found = int(summary.get("findings") or 0)
+        if summary.get("timed_out"):
+            how = f"timed out after {wall:.0f}s (--rollout-timeout){where}"
+        elif code == 0:
+            how = f"exited 0 after {wall:.0f}s"
+        elif code == -2:
+            how = "could not start (see stdout.log)"
+        else:
+            how = f"exited {code} after {wall:.0f}s{where}"
+        tail = ""
+        if code != 0:
+            tail = f"; last stderr lines in stdout.log; {found} finding(s) were in the DB"
+        return how + tail
 
     def trajectory(self, run_dir: Path, *, obs_trunc: int) -> str:
         path = Path(run_dir) / "trajectory.jsonl"

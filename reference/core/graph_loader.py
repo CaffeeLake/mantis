@@ -1257,8 +1257,7 @@ def create_calibrator_node(
 
         calibrated_results: list[FindingCalibration] = []
 
-        from google.adk.tools.set_model_response_tool import SetModelResponseTool
-        set_response_tool = SetModelResponseTool(FindingCalibration)
+        from core.config import structured_llm_request
 
         for idx, f in enumerate(candidates, 1):
             f_id = f.get("id")
@@ -1307,13 +1306,10 @@ def create_calibrator_node(
                 "9. executive_summary (concise stakeholder summary)\n"
             )
 
-            req = LlmRequest(
-                contents=[types.Content(parts=[types.Part.from_text(text=finding_prompt)], role="user")],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    tools=[set_response_tool],
-                ),
-            )
+            # Registered through append_tools, not GenerateContentConfig(tools=):
+            # the LiteLlm adapter drops a bare BaseTool there (see
+            # core.config.structured_llm_request).
+            req = structured_llm_request(finding_prompt, system_instruction, FindingCalibration)
 
             resp_text = ""
             structured_data = None
