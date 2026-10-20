@@ -72,6 +72,11 @@ EVIDENCE_WEIGHTS: Dict[str, float] = {
 }
 SEVERITY_WEIGHTS: Dict[str, float] = {"critical": 1.5, "high": 1.25, "medium": 1.0, "low": 0.5, "info": 0.25}
 DISMISSED_STATUSES = ("false_positive", "non_viable", "sample_or_test")
+# Anything a verdict stage upheld. The non-regression floor is built from these
+# (intersected over base runs), so a static-only workflow -- where nothing can
+# reach dynamic_confirmed -- still has a floor.
+CONFIRMED_STATUSES = ("static_confirmed", "confirmed", "viable", "reproduced", "dynamic_confirmed", "patch_verified")
+MACHINE_VERIFIED_STATUSES = ("dynamic_confirmed", "patch_verified", "reproduced")
 
 _TOOL_CALL_RE = re.compile(r"^\[TOOL CALL: ([^\]]+)\] args=(.*)$")
 _TOOL_RESP_RE = re.compile(r"^\[TOOL (RESPONSE|FEEDBACK|FATAL ERROR): ([^\]]+)\] ?(.*)$")
@@ -100,6 +105,7 @@ def build_command(target: Path, workflow_path: Path, run_dir: Path, settings: Ru
         "--workflow", str(workflow_path),
         "--db", str(run_dir / "knowledge.db"),
         "--spend-report", str(run_dir / "spend.json"),
+        "--transcript-out", str(run_dir / "transcript.raw.jsonl"),
         "--scan-mode", settings.scan_mode,
         "--yes",
     ]
@@ -141,13 +147,38 @@ def run_pipeline(target: Path, workflow_path: Path, run_dir: Path, settings: Run
 # --- Reading a run ----------------------------------------------------------------------
 
 
+def transcript_rows_to_events(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The structured transcript main.py --transcript-out writes, as adapter events.
+
+    This is the preferred source: tool responses are complete (clipped only
+    at core.transcript's generous limits, with a marker), not the console's
+    500-character echo, and no line of a file read can be mistaken for prose.
+    """
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        kind = str(row.get("type") or "")
+        node = str(row.get("node") or row.get("author") or "")
+        if kind == "tool_call":
+            events.append({"type": "tool_call", "node": node, "name": str(row.get("name") or ""), "args": str(row.get("args") or "")})
+        elif kind == "tool_response":
+            events.append({"type": "tool_response", "node": node, "name": str(row.get("name") or ""), "text": str(row.get("response") or "")})
+        elif kind == "text":
+            text = str(row.get("text") or "").strip()
+            if text:
+                events.append({"type": "message", "node": node, "text": text})
+        elif kind == "error":
+            events.append({"type": "error", "node": node, "name": str(row.get("name") or ""), "text": str(row.get("text") or "")})
+    return events
+
+
 def parse_stdout_to_events(text: str) -> List[Dict[str, Any]]:
-    """Turns the pipeline's console stream into ordered events.
+    """Fallback when no structured transcript exists: the console stream as events.
 
     main.py prints node banners, ``[TOOL CALL: name] args=...`` and
     ``[TOOL RESPONSE: name] ...`` lines, and the model's prose in between.
-    That is enough for a proposer to see what each stage did and what came
-    back, which is the trajectory Harness2 wants.
+    The console clips every tool response to ~500 characters, and a
+    multi-line response spills into following lines, so this is a sketch of
+    the run, not a record; ``summary.json`` says which source was used.
     """
     events: List[Dict[str, Any]] = []
     prose: List[str] = []
@@ -221,6 +252,7 @@ def evidence_vector(findings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_status: Dict[str, int] = {}
     score = 0.0
     verified: List[str] = []
+    confirmed: List[str] = []
     live = 0
     dismissed = 0
     for f in findings:
@@ -234,24 +266,35 @@ def evidence_vector(findings: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         live += 1
         w = EVIDENCE_WEIGHTS.get(status, 0.0) * SEVERITY_WEIGHTS.get(sev, 1.0)
         score += w
-        if status in ("dynamic_confirmed", "patch_verified", "reproduced"):
+        if status in CONFIRMED_STATUSES:
+            confirmed.append(_finding_key(f))
+        if status in MACHINE_VERIFIED_STATUSES:
             verified.append(_finding_key(f))
     return {
         "by_status": dict(sorted(by_status.items())),
         "live": live,
         "dismissed": dismissed,
         "verified": len(verified),
-        "verified_keys": sorted(verified),
+        "verified_keys": sorted(set(verified)),
+        "confirmed": len(confirmed),
+        "confirmed_keys": sorted(set(confirmed)),
         "score": round(score, 3),
     }
 
 
 def _finding_key(f: Dict[str, Any]) -> str:
-    """A stable identity for a finding across runs: file + title words, or lineage."""
-    lineage = str(f.get("lineage_id") or "").strip()
-    if lineage:
-        return f"lineage:{lineage}"
+    """An identity for a finding that survives across independent rollouts.
+
+    Each rollout has its own knowledge DB, so lineage ids do not compare;
+    titles are paraphrased from run to run. File plus weakness class is what
+    two runs reporting the same bug agree on. Falls back to the leading title
+    words when no CWE/class is recorded.
+    """
     path = str(f.get("filepath") or "").replace("\\", "/").strip("/")
+    cwe = str(f.get("cwe") or f.get("cwe_id") or f.get("vulnerability_class") or f.get("class") or "").strip().lower()
+    cwe = re.sub(r"[^a-z0-9]+", "", cwe)
+    if cwe:
+        return f"{path}#{cwe}"
     title = re.sub(r"[^a-z0-9]+", " ", str(f.get("title") or "").lower()).strip()
     return f"{path}::{' '.join(title.split()[:6])}"
 
@@ -402,15 +445,20 @@ class MantisAdapterBase:
         pipeline_run_id = str(spend.get("run_id") or "")
         findings = _read_findings(run_dir / "knowledge.db", pipeline_run_id)
         evidence = evidence_vector(findings)
-        stdout = (run_dir / "stdout.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stdout.log").exists() else ""
-        events = parse_stdout_to_events(stdout)
+        from core.transcript import read_transcript
+        rows = read_transcript(run_dir / "transcript.raw.jsonl") if (run_dir / "transcript.raw.jsonl").exists() else []
+        if rows:
+            events, trajectory_source = transcript_rows_to_events(rows), "transcript"
+        else:
+            stdout = (run_dir / "stdout.log").read_text(encoding="utf-8", errors="replace") if (run_dir / "stdout.log").exists() else ""
+            events, trajectory_source = parse_stdout_to_events(stdout), "stdout"
         (run_dir / "trajectory.jsonl").write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in events), encoding="utf-8")
         (run_dir / "findings.json").write_text(json.dumps(findings, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         (run_dir / "evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (run_dir / "findings.md").write_text(render_findings_report(findings, evidence), encoding="utf-8")
         summary = {**outcome, "pipeline_run_id": pipeline_run_id, "tokens": spend.get("tokens", 0),
                    "llm_calls": spend.get("llm_calls", 0), "events": len(events), "findings": len(findings),
-                   "evidence": evidence}
+                   "trajectory_source": trajectory_source, "evidence": evidence}
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
     # -- reading

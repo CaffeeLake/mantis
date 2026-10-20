@@ -40,7 +40,9 @@ three kinds of file, each with a different cost and reach:
 | `{GUIDANCE_FILE}` | text appended to EVERY stage's instruction | ALWAYS ON for every stage -- the most expensive place to put anything |
 
 What a stage is called decides what it is told: `prompts/researcher.md` is the researcher's
-instruction. A prompt file for a node that is not in `{WORKFLOW_FILE}` is an error.
+instruction. Prompt files exist only for the stages the base workflow ships. A stage you ADD
+carries its instruction inline, as `"system_prompt"` on its node in `{WORKFLOW_FILE}`; a stage
+you REMOVE needs nothing else done -- its prompt file is simply no longer read.
 
 The cheap levers, in order of preference:
   - WHICH TOOLS A STAGE GETS. A stage without `find_callers` cannot trace a caller; a stage

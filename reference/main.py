@@ -49,6 +49,7 @@ from core.database import init_db, read_findings, read_risk_scores, update_statu
 from core.sandbox import build_sandbox
 from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
 from core.context import RunContext, current_run_context
+from core.transcript import TranscriptWriter, event_transcript_rows
 from core.paths import resolve_db_path
 from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
 from core.compactor import MantisEventsSummarizer
@@ -103,6 +104,7 @@ async def execute_sub_task(
     prior_memory: str = "",
     coverage_note: str = "",
     hypotheses: str = "",
+    transcript: Optional["TranscriptWriter"] = None,
 ) -> bool:
     """Executes the workflow graph for a single target file. Returns True if an error was encountered."""
     sanitized_filepath = str(filepath).replace("\n", "").replace("\r", "").strip()
@@ -214,6 +216,9 @@ async def execute_sub_task(
         ):
             node_path = getattr(getattr(event, "node_info", None), "path", None)
             route = getattr(getattr(event, "actions", None), "route", None)
+            if transcript is not None:
+                transcript.write(event_transcript_rows(
+                    event, node=(node_path.split("/")[-1].split("@")[0] if node_path else (current_active_node or ""))))
 
             if node_path:
                 node_name = node_path.split("/")[-1].split("@")[0]
@@ -1188,6 +1193,7 @@ async def pipeline(
     save_config: bool = False,
     db_timeout: Optional[float] = None,
     rescan_changed_harness: bool = False,
+    transcript_out: str = "",
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
     # SQLite serializes writers, and every parallel campaign writes findings
@@ -1977,6 +1983,11 @@ async def pipeline(
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
 
+    # A structured record of every stage's prose, tool calls and tool responses,
+    # for readers that need more than the clipped console echo (the Harness2
+    # proposer reads it as a rollout). Opened once; each campaign appends.
+    _transcript_writer = TranscriptWriter(transcript_out) if transcript_out else None
+
     failures = 0
     successes = 0
     paused = False
@@ -2149,6 +2160,7 @@ async def pipeline(
                     prior_memory=prior_memory,
                     coverage_note=coverage_note,
                     hypotheses=hypotheses_text,
+                    transcript=_transcript_writer,
                 )
                 # What this campaign actually cost. Recorded for completed campaigns
                 # only -- including failed ones, which still ran the graph and are a
@@ -2377,6 +2389,8 @@ async def pipeline(
         )
     finally:
         await runner.close()
+        if _transcript_writer is not None:
+            _transcript_writer.close()
     if any(res == 1 for res in worker_results):
         return 1
 

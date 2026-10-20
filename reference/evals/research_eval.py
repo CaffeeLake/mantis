@@ -366,53 +366,16 @@ except ImportError:  # pragma: no cover - minimal stdlib-only test environments
 # --- Transcript capture ---------------------------------------------------------------
 
 # The transcript is what a human reads to follow a run hop by hop: which
-# tools the model called, with what arguments, and what came back. Clipping
-# keeps file dumps from drowning the trace; the clip marker says how much
-# was cut so nothing disappears silently.
+# tools the model called, with what arguments, and what came back. The row
+# format is core.transcript's, shared with main.py --transcript-out, so the
+# researcher eval and the full pipeline leave the same shape behind.
 
-TRANSCRIPT_TEXT_LIMIT = 8_000
-TRANSCRIPT_PAYLOAD_LIMIT = 4_000
-
-
-def _clip(value: Any, limit: int) -> str:
-    text = str(value)
-    if len(text) > limit:
-        return text[:limit] + f"... [clipped {len(text) - limit} chars]"
-    return text
-
-
-def event_transcript_rows(event: Any) -> List[Dict[str, Any]]:
-    """Flattens one ADK event into ordered transcript rows. Never raises."""
-    rows: List[Dict[str, Any]] = []
-    try:
-        author = str(getattr(event, "author", None) or "")
-        parts = getattr(getattr(event, "content", None), "parts", None) or []
-        for part in parts:
-            text = getattr(part, "text", None)
-            call = getattr(part, "function_call", None)
-            resp = getattr(part, "function_response", None)
-            if text:
-                rows.append(
-                    {"author": author, "type": "text",
-                     "text": _clip(text, TRANSCRIPT_TEXT_LIMIT)}
-                )
-            if call is not None:
-                rows.append(
-                    {"author": author, "type": "tool_call",
-                     "name": str(getattr(call, "name", "")),
-                     "args": _clip(getattr(call, "args", None),
-                                   TRANSCRIPT_PAYLOAD_LIMIT)}
-                )
-            if resp is not None:
-                rows.append(
-                    {"author": author, "type": "tool_response",
-                     "name": str(getattr(resp, "name", "")),
-                     "response": _clip(getattr(resp, "response", None),
-                                       TRANSCRIPT_PAYLOAD_LIMIT)}
-                )
-    except Exception:  # pragma: no cover - transcripts must never sink a run
-        return rows
-    return rows
+from core.transcript import (  # noqa: E402
+    TRANSCRIPT_PAYLOAD_LIMIT,
+    TRANSCRIPT_TEXT_LIMIT,
+    clip as _clip,
+    event_transcript_rows,
+)
 
 
 # --- Behavioural telemetry (pure, no LLM, unit-tested) --------------------------------

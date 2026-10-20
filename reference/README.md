@@ -124,8 +124,8 @@ works, one for what an auditor knows about this codebase) editing
 every candidate rolled out once, a composition, and an **evidence-first
 selection** — the pipeline's own INV-1 tiers decide, a blind read of anonymised
 reports only breaks ties, and a candidate that loses a finding every base run
-machine-verified is never adopted. Nothing touches your `workflow.json` until
-you read the diff and run `adopt --yes`.
+confirmed, or scores below the weakest base run, is never adopted. Nothing
+touches your `workflow.json` until you read the diff and run `adopt --yes`.
 
 ```bash
 python3 -m evals.evolve.run run --target /path/to/repo --out runs/evolve-1 --token-budget 1500000

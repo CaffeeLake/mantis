@@ -66,17 +66,30 @@ def fake_pipeline(target: Path, workflow_path: Path, run_dir: Path, settings) ->
     write_findings(str(db), "dal/users.py", findings, run_id=run_id)
     (run_dir / "spend.json").write_text(json.dumps({"run_id": run_id, "tokens": 400_000 if improved else 500_000,
                                                     "llm_calls": 20, "exit_code": 0}), encoding="utf-8")
+    # The console echo clips every tool response and spills file lines as prose...
     (run_dir / "stdout.log").write_text(
         "-- mantis_vulnerability_pipeline@1/researcher@1\n"
         "[TOOL CALL: read_file] args={'filepath': 'dal/users.py'}\n"
-        "[TOOL RESPONSE: read_file] <<<UNTRUSTED ... def find_user(name): ...\n"
+        "[TOOL RESPONSE: read_file] <<<UNTRUSTED_SOURCE_CODE_DATA_START path=dal/users.py>>>\n"
+        "def find_user(name):\n    return conn.execute(f\"SELECT * FROM users WHERE name='{name}'\")\n"
         "I will report the query flaw.\n"
         "[TOOL CALL: report_findings] args={'findings': [...]}\n"
         "[TOOL RESPONSE: report_findings] Recorded 1 finding(s).\n", encoding="utf-8")
+    # ...while --transcript-out carries the complete rows (the adapter must prefer these).
+    big_file = "def find_user(name):\n" + "    pass\n" * 400 + "    return conn.execute(f\"SELECT * FROM users WHERE name='{name}'\")\n"
+    rows = [
+        {"author": "researcher", "node": "researcher", "type": "tool_call", "name": "read_file", "args": "{'filepath': 'dal/users.py'}"},
+        {"author": "researcher", "node": "researcher", "type": "tool_response", "name": "read_file", "response": big_file},
+        {"author": "researcher", "node": "researcher", "type": "text", "text": "I will report the query flaw."},
+        {"author": "researcher", "node": "researcher", "type": "tool_call", "name": "report_findings", "args": "{'findings': [...]}"},
+        {"author": "researcher", "node": "researcher", "type": "tool_response", "name": "report_findings", "response": "Recorded 1 finding(s)."},
+        {"author": "reviewer", "node": "reviewer", "type": "error", "name": "RateLimitError", "text": "429 slow down"},
+    ]
+    (run_dir / "transcript.raw.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return {"exit_code": 0, "wall_seconds": 1.0, "timed_out": False}
 
 
-def scripted_agent(*, mission: str, system: str, context_root: Path, touched, label: str, timeout):
+def scripted_agent(*, mission: str, system: str, context_root: Path, touched, label: str, timeout, read_only=False):
     """Edits like a proposer would, chooses like a selector would, reflects like a reflector would."""
     harness = context_root / "harness"
     if label.startswith("select."):
@@ -147,6 +160,58 @@ class SurfaceTest(unittest.TestCase):
             S.validate_tree(bad, tree)
         self.assertIn("not on the editable surface", str(cm.exception))
 
+    def test_a_proposal_may_add_a_stage_inline_and_remove_one(self):
+        tree = S.base_tree(WORKFLOW)
+        wf = json.loads(tree["workflow.json"])
+        # Add a second researcher arm with an inline instruction, wired threat_modeler -> arm -> deduplicator.
+        researcher = next(n for n in wf["nodes"] if n["id"] == "researcher")
+        arm = json.loads(json.dumps(researcher)); arm["id"] = "researcher_domain"
+        arm["system_prompt"] = "You are the domain researcher arm. Audit auth and trust boundaries; report via report_findings."
+        wf["nodes"].append(arm)
+        in_edges = [e for e in wf["edges"] if e["to"] == "researcher"]
+        out_edges = [e for e in wf["edges"] if e["from"] == "researcher"]
+        for e in in_edges:
+            wf["edges"].append({**e, "to": "researcher_domain"})
+        for e in out_edges:
+            wf["edges"].append({**e, "from": "researcher_domain"})
+        added = dict(tree); added["workflow.json"] = json.dumps(wf, indent=2)
+        census = S.validate_tree(added, tree)
+        self.assertEqual(census["agent_nodes"], len([n for n in wf["nodes"] if n.get("type", "agent") == "agent"]))
+        compiled = S.compile_tree(added)
+        self.assertIn("domain researcher arm", next(n for n in compiled["nodes"] if n["id"] == "researcher_domain")["system_prompt"])
+        # A prompt FILE for the new stage is the wrong place, and the message says where the right one is.
+        wrong = dict(added); wrong["prompts/researcher_domain.md"] = "domain arm prompt"
+        with self.assertRaises(ValueError) as cm:
+            S.validate_tree(wrong, tree)
+        self.assertIn("system_prompt", str(cm.exception))
+        self.assertFalse(S.on_surface("prompts/researcher_domain.md", json.loads(tree["workflow.json"])))
+        # A new stage with no instruction at all is refused.
+        mute = json.loads(json.dumps(wf)); next(n for n in mute["nodes"] if n["id"] == "researcher_domain").pop("system_prompt")
+        next(n for n in mute["nodes"] if n["id"] == "researcher_domain").pop("skill", None)
+        mute_tree = dict(tree); mute_tree["workflow.json"] = json.dumps(mute)
+        with self.assertRaises(ValueError) as cm:
+            S.validate_tree(mute_tree, tree)
+        self.assertIn("no instruction", str(cm.exception))
+
+        # Remove a stage: its (inherited, or upstream-stubbed) prompt file is ignored, not an error.
+        # The removal must rewire the route that fed it; the loader has the final word on that.
+        wf2 = json.loads(tree["workflow.json"])
+        wf2["nodes"] = [n for n in wf2["nodes"] if n["id"] != "chainer"]
+        wf2["edges"] = [e for e in wf2["edges"] if "chainer" not in (e["from"], e["to"])]
+        wf2["edges"].append({"from": "repro_classifier", "to": "patcher", "on": "success"})
+        removed = dict(tree); removed["workflow.json"] = json.dumps(wf2)
+        S.validate_tree(removed, tree)                       # inherited prompts/chainer.md present
+        removed["prompts/chainer.md"] = ""                   # upstream write_tree stubs always-on files as ""
+        S.validate_tree(removed, tree)
+        self.assertNotIn("chainer", {n["id"] for n in S.compile_tree(removed)["nodes"]})
+        # Removing it without rewiring is refused by the production loader, with the orphaned route named.
+        dangling = json.loads(tree["workflow.json"])
+        dangling["nodes"] = [n for n in dangling["nodes"] if n["id"] != "chainer"]
+        dangling["edges"] = [e for e in dangling["edges"] if "chainer" not in (e["from"], e["to"])]
+        with self.assertRaises(ValueError) as cm:
+            S.validate_tree({**tree, "workflow.json": json.dumps(dangling)}, tree)
+        self.assertIn("repro_classifier", str(cm.exception))
+
     def test_registered_surface_text_renders_all_prompt_families(self):
         surface_text.register()
         from harness2.core import prompts as P
@@ -175,6 +240,41 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("[ERROR 5]", text)
         self.assertIn("[MANTIS TRUNCATION:", ad.render_trajectory(events, obs_trunc=20))
 
+    def test_structured_transcript_is_preferred_over_the_clipped_console(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            adapter = _adapter(tmp, target)
+            rd = adapter.execute("demo", None, "demo--base1")
+            summary = json.loads((rd / "summary.json").read_text())
+            self.assertEqual(summary["trajectory_source"], "transcript")
+            text = adapter.trajectory(rd, obs_trunc=50_000)
+            # One observation holding the whole file, not an empty observation followed by file lines as prose.
+            self.assertEqual(text.count("[OBSERVATION"), 2)
+            head, _, tail = text.partition("[OBSERVATION 2]")
+            self.assertNotIn("pass", head)
+            self.assertGreaterEqual(tail.split("[MESSAGE")[0].count("    pass\n"), 300)
+            messages = [blk.strip() for blk in text.split("\n\n") if blk.strip().startswith("[MESSAGE")]
+            self.assertEqual(len(messages), 1)
+            self.assertIn("I will report the query flaw.", messages[0])
+            self.assertIn("[ERROR 6] (reviewer) RateLimitError", text)
+            cmd = ad.build_command(target, rd / "workflow.json", rd, ad.RunSettings())
+            self.assertIn("--transcript-out", cmd)
+            self.assertIn(str(rd / "transcript.raw.jsonl"), cmd)
+
+    def test_console_fallback_is_labelled_as_such(self):
+        def no_transcript(target, workflow_path, run_dir, settings):
+            out = fake_pipeline(target, workflow_path, run_dir, settings)
+            (run_dir / "transcript.raw.jsonl").unlink()
+            return out
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            adapter = ad.MantisRepoAdapter(targets={"demo": target}, workflow_path=WORKFLOW, runs_root=tmp / "runs",
+                                           settings=ad.RunSettings(model="m"), runner=no_transcript, domain="demo")
+            rd = adapter.execute("demo", None, "demo--base1")
+            self.assertEqual(json.loads((rd / "summary.json").read_text())["trajectory_source"], "stdout")
+
     def test_evidence_vector_weights_tiers_and_tracks_verified_keys(self):
         ev = ad.evidence_vector([
             {"status": "dynamic_confirmed", "severity": "high", "filepath": "a.py", "title": "Cmd injection"},
@@ -183,7 +283,13 @@ class AdapterTest(unittest.TestCase):
         ])
         self.assertEqual((ev["live"], ev["dismissed"], ev["verified"]), (2, 1, 1))
         self.assertEqual(ev["verified_keys"], ["a.py::cmd injection"])
+        self.assertEqual(ev["confirmed_keys"], ["a.py::cmd injection", "b.py::sqli"])
         self.assertGreater(ev["score"], 3.0)
+        # Keys compare across independent rollouts: file + CWE, not a per-DB lineage or a paraphrased title.
+        k1 = ad._finding_key({"filepath": "dal/users.py", "cwe": "CWE-89", "title": "SQL injection in find_user", "lineage_id": "L1"})
+        k2 = ad._finding_key({"filepath": "dal/users.py", "cwe": "cwe-89", "title": "Unsanitised query string", "lineage_id": "L2"})
+        self.assertEqual(k1, k2)
+        self.assertEqual(k1, "dal/users.py#cwe89")
 
     def test_execute_is_idempotent_by_runmark_and_leaves_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +343,45 @@ class ProposerTest(unittest.TestCase):
             self.assertIn("refused", df("workflow.json"))
             self.assertEqual(touched, ["prompts/researcher.md"])
 
+    def test_thought_parts_never_reach_the_reply_and_partials_are_skipped(self):
+        import types as _t
+        from evals.evolve.proposer import collect_reply_text
+        mk = lambda **kw: _t.SimpleNamespace(**{"text": None, "function_call": None, "thought": False, **kw})
+        ev = lambda parts, partial=False, tokens=0: _t.SimpleNamespace(
+            content=_t.SimpleNamespace(parts=parts), partial=partial,
+            usage_metadata=_t.SimpleNamespace(total_token_count=tokens) if tokens else None)
+        out = collect_reply_text([
+            ev([mk(text="let me think about the candidates...", thought=True)], tokens=10),
+            ev([mk(function_call=_t.SimpleNamespace(name="read_file"))]),
+            ev([mk(text="<pick>c_al")], partial=True),
+            ev([mk(text="<why>plainer</why>\n```choice\nA\n```")], tokens=20),
+            ev([mk(text="trailing scratchpad", thought=True)]),
+        ])
+        self.assertEqual(out["text"], "<why>plainer</why>\n```choice\nA\n```")
+        self.assertEqual((out["steps"], out["tokens"]), (1, 30))
+
+    def test_selector_and_reflector_sessions_are_read_only(self):
+        load_harness2()
+        from harness2.core.spec import ChannelSpec
+        seen = {}
+
+        def recording_agent(*, system, read_only, context_root, **kw):
+            seen["read_only"], seen["system"] = read_only, system
+            tools = make_context_tools(context_root, lambda rel: True, [], read_only=read_only)
+            seen["tools"] = [t.__name__ for t in tools]
+            return {"text": "<why>x</why>\n```choice\nA\n```"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Path(tmp) / "ctx"; (ctx / "harness").mkdir(parents=True)
+            prop = MantisProposer(ChannelSpec("opencode", "m"), agent_runner=recording_agent)
+            prop.call("choose", ctx, "select.agg1")                       # no harvest -> read-only
+            self.assertTrue(seen["read_only"])
+            self.assertEqual(seen["tools"], ["list_files", "read_file"])
+            self.assertNotIn("edit files", seen["system"])
+            prop.call("propose", ctx, "inv1.a1", harvest="context/harness")  # harvest -> editing
+            self.assertFalse(seen["read_only"])
+            self.assertIn("write_harness_file", seen["tools"])
+
     def test_call_harvests_the_edited_harness_and_audits(self):
         load_harness2()
         from harness2.core.proposer import ProposerError
@@ -284,9 +429,9 @@ class SelectionTest(unittest.TestCase):
             b = self._RV("agg2", self._dir(tmp, "agg2", 300))
             c = self._RV("agg3", self._dir(tmp, "agg3", 100), ok=False, error="died")
             adapter = self._Adapter({
-                "base1": {"score": 1.0, "verified": 1, "verified_keys": ["x::k"], "live": 1, "dismissed": 0},
-                "agg1": {"score": 4.0, "verified": 2, "verified_keys": ["x::k", "y::z"], "live": 2, "dismissed": 0},
-                "agg2": {"score": 6.0, "verified": 1, "verified_keys": ["y::z"], "live": 3, "dismissed": 0},   # lost x::k
+                "base1": {"score": 1.0, "verified": 1, "verified_keys": ["x::k"], "confirmed_keys": ["x::k"], "live": 1, "dismissed": 0},
+                "agg1": {"score": 4.0, "verified": 2, "verified_keys": ["x::k", "y::z"], "confirmed_keys": ["x::k", "y::z"], "live": 2, "dismissed": 0},
+                "agg2": {"score": 6.0, "verified": 1, "verified_keys": ["y::z"], "confirmed_keys": ["y::z"], "live": 3, "dismissed": 0},   # lost x::k
             })
             table = ev_sel.rank_candidates(adapter, {"agg1": a, "agg2": b, "agg3": c}, [base])
             self.assertEqual(table["base_verified_floor"], ["x::k"])
@@ -295,14 +440,35 @@ class SelectionTest(unittest.TestCase):
             self.assertIn("agg3", table["dropped"])
             self.assertEqual(table["tie"], [])
 
+    def test_static_only_regression_is_caught_by_the_score_floor(self):
+        """On the shipped static-only workflow nothing reaches dynamic_confirmed, so the
+        machine-verified floor is empty; a candidate that found nothing must still lose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._RV("base1", self._dir(tmp, "base1", 500))
+            a = self._RV("agg1", self._dir(tmp, "agg1", 100))
+            adapter = self._Adapter({
+                "base1": {"score": 7.5, "verified": 0, "verified_keys": [], "confirmed": 5,
+                          "confirmed_keys": ["a.py#cwe89", "b.py#cwe78", "c.py#cwe22", "d.py#cwe918", "e.py#cwe798"], "live": 5, "dismissed": 0},
+                "agg1": {"score": 0.0, "verified": 0, "verified_keys": [], "confirmed": 0, "confirmed_keys": [], "live": 0, "dismissed": 0},
+            })
+            table = ev_sel.rank_candidates(adapter, {"agg1": a}, [base])
+            self.assertEqual(table["base_floor"]["score"], 7.5)
+            self.assertEqual(len(table["base_floor"]["keys"]), 5)
+            self.assertEqual(table["eligible"], [])
+            self.assertTrue(table["ranked"][0]["below_base_score"])
+            self.assertEqual(len(table["ranked"][0]["regressed"]), 5)
+            sel = ev_sel.select("t", 1, "agg", {"agg1": a}, [base], adapter=adapter, selector=None, work_dir=Path(tmp) / "w")
+            self.assertFalse(sel.ok)
+            self.assertIn("below the weakest base run", sel.error)
+
     def test_tie_is_detected_only_within_epsilon(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = self._RV("base1", self._dir(tmp, "base1", 500))
             a = self._RV("agg1", self._dir(tmp, "agg1", 400))
             b = self._RV("agg2", self._dir(tmp, "agg2", 300))
-            adapter = self._Adapter({"base1": {"verified_keys": []},
-                                     "agg1": {"score": 3.0, "verified_keys": []},
-                                     "agg2": {"score": 3.2, "verified_keys": []}})
+            adapter = self._Adapter({"base1": {"score": 1.0, "verified_keys": [], "confirmed_keys": []},
+                                     "agg1": {"score": 3.0, "verified_keys": [], "confirmed_keys": []},
+                                     "agg2": {"score": 3.2, "verified_keys": [], "confirmed_keys": []}})
             table = ev_sel.rank_candidates(adapter, {"agg1": a, "agg2": b}, [base])
             self.assertEqual(sorted(table["tie"]), ["agg1", "agg2"])
             self.assertEqual(table["eligible"][0], "agg2")  # higher score first, before the tie-break

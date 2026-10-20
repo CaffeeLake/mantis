@@ -217,29 +217,38 @@ under `third_party/harness2/` (see `VENDOR.md`); Mantis supplies three pieces:
 
 - **Surface** (`surface.py`): the harness as files a proposer may edit —
   `workflow.json` (stages, wiring, per-stage tools from the closed registry,
-  per-stage model/effort, budget), `prompts/<node_id>.md`, `tool_guidance.md`.
-  An edited tree compiles back to one `workflow.json` the production loader
-  already accepts; `validate_tree` names every problem in one message (closed
-  tool set, unchanged sandbox tier, per-stage prompt cap, loader errors) and
-  that message is the proposer's one repair turn.
+  per-stage model/effort, budget), `prompts/<node_id>.md` for the stages the
+  base ships, `tool_guidance.md`. A stage a proposal adds carries its
+  instruction inline as `system_prompt` on its node; a removed stage's prompt
+  file is simply no longer read. An edited tree compiles back to one
+  `workflow.json` the production loader already accepts; `validate_tree` names
+  every problem in one message (closed tool set, unchanged sandbox tier,
+  per-stage prompt cap, a new stage with no instruction, loader errors such as
+  an orphaned route) and that message is the proposer's one repair turn.
 - **Adapter** (`adapter.py`): a rollout is `main.py` run as a subprocess with a
-  candidate workflow; its console stream is the trajectory, its knowledge DB the
-  findings. Completion is recorded with Harness²'s runmark only after a normal
-  return. `MantisRepoAdapter` is the user's code (no answer key: `score()`
-  returns `None`); `MantisEvalAdapter` is generated dev targets, scored only by
+  candidate workflow; its structured transcript (`--transcript-out`, one JSONL
+  row per prose, tool call and whole tool response — the console echo clips tool
+  output) is the trajectory, its knowledge DB the findings. Completion is
+  recorded with Harness²'s runmark only after a normal return.
+  `MantisRepoAdapter` is the user's code (no answer key: `score()` returns
+  `None`); `MantisEvalAdapter` is generated dev targets, scored only by
   `harness2.core.judge` after selection, holdout refused.
 - **Proposer** (`proposer.py`): an ADK agent — no OpenCode or Codex — with four
   tools jailed to the session's copy of `context/`: list, read (with bounds),
   write under `harness/` (surface-checked), delete. Edits on disk are the
-  proposal; files under `context/` are data, never instructions.
+  proposal; files under `context/` are data, never instructions. Selector and
+  reflection sessions get the two read tools only, and thinking parts are never
+  read as the reply.
 
 **Selection is evidence-first** (`selection.py`), which is where Mantis has
 something Harness² does not: every finding carries the INV-1 tier the pipeline
 itself established. Candidates that crashed or delivered nothing are dropped; a
-candidate that loses a finding *every* base run machine-verified is not
-adoptable whatever it adds; the rest rank by severity-weighted evidence tier,
-then tokens. Only a tie within `TIE_EPSILON` goes to Harness²'s blind read of
-anonymised findings reports. A selector failure adopts nothing.
+candidate that loses a finding *every* base run confirmed (any confirmed tier —
+on a static-only workflow nothing reaches `dynamic_confirmed`, and the floor
+must still exist), or whose evidence score fell below the weakest base run's, is
+not adoptable whatever it adds; the rest rank by severity-weighted evidence
+tier, then tokens. Only a tie within `TIE_EPSILON` goes to Harness²'s blind read
+of anonymised findings reports. A selector failure adopts nothing.
 
 ```bash
 # one iteration over your repository (k=1: 4 pipeline rollouts + 3 proposer sessions)

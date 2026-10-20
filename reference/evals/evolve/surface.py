@@ -87,6 +87,13 @@ def on_surface(rel: str, workflow: Optional[Dict[str, Any]] = None) -> bool:
     Mantis's pipeline never executes a harness-authored script, so one would
     be inert -- but inert is not the same as allowed: a tree is rejected
     rather than silently carrying a file nothing reads.
+
+    ``prompts/<node_id>.md`` exists only for the agent nodes of the workflow
+    the surface was built from (the base). Upstream's tree readers admit a
+    fixed ``always_on`` list, so a prompt file cannot follow a node a
+    proposal adds; a **new** stage carries its instruction inline as
+    ``system_prompt`` in ``workflow.json`` instead, and ``compile_tree``
+    honours both.
     """
     rel = str(rel or "").replace("\\", "/").strip().strip("/")
     if not rel or rel.startswith("/") or ".." in rel.split("/"):
@@ -254,6 +261,11 @@ def validate_tree(tree: Dict[str, str], base: Dict[str, str]) -> Dict[str, Any]:
         if not _NODE_ID_RE.match(node_id):
             errs.append(f"node id {node_id!r} is not a valid identifier (letters, digits, _ and - only)")
             continue
+        if not str(node.get("system_prompt") or "").strip() and not str(node.get("skill") or "").strip():
+            errs.append(
+                f"node '{node_id}' has neither a system_prompt nor a skill, so it would run with no instruction; "
+                "a new stage must carry its instruction inline as \"system_prompt\""
+            )
         total = len(str(node.get("system_prompt") or ""))
         if total > MAX_NODE_PROMPT_CHARS:
             errs.append(
@@ -283,6 +295,7 @@ def validate_tree(tree: Dict[str, str], base: Dict[str, str]) -> Dict[str, Any]:
                     f"(available: {', '.join(sorted(allowed))})"
                 )
 
+    base_node_ids = {str(n.get("id")) for n in _agent_nodes(base_workflow)}
     for rel in tree:
         if not on_surface(rel):
             errs.append(
@@ -291,8 +304,20 @@ def validate_tree(tree: Dict[str, str], base: Dict[str, str]) -> Dict[str, Any]:
             )
         elif rel.startswith(PROMPTS_DIR + "/") and rel.endswith(".md"):
             node_id = rel[len(PROMPTS_DIR) + 1:-3]
-            if node_id not in {str(n.get("id")) for n in _agent_nodes(workflow)}:
-                errs.append(f"{rel} names a node that is not an agent node in {WORKFLOW_FILE}; delete it or add the node")
+            if node_id in base_node_ids:
+                # A base stage, kept or removed. If removed, its prompt file
+                # stays on the always-on list (upstream stubs it back as "")
+                # and compile ignores it; nothing to fix either way.
+                continue
+            if (tree.get(rel) or "").strip():
+                # A prompt file for a stage the base does not ship: compile
+                # would fold it in, but the harvest/write_tree round trip only
+                # carries the base's always-on files, so it would be lost.
+                errs.append(
+                    f"{rel} is a prompt file for a stage that is not in the base workflow; a new stage carries "
+                    f"its instruction inline as \"system_prompt\" on its node in {WORKFLOW_FILE} (prompt files exist "
+                    "only for the stages the base workflow ships)"
+                )
 
     if errs:
         raise ValueError(" | ".join(errs))

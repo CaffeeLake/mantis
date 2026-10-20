@@ -146,6 +146,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--transcript-out",
+        type=str,
+        default="",
+        help=(
+            "Append a JSONL transcript of every stage's prose, tool calls and tool "
+            "responses to this path (the console echo clips tool output; this does not)."
+        ),
+    )
+    parser.add_argument(
         "--no-budget",
         action="store_true",
         help=(
@@ -404,6 +413,7 @@ def run_launch(
     cache_discount: Optional[float] = None,
     import_knowledge: str = "",
     rescan_changed_harness: bool = False,
+    transcript_out: str = "",
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -717,6 +727,7 @@ def run_launch(
                 cache_discount_override=cache_discount,
                 import_knowledge_dir=import_knowledge,
                 rescan_changed_harness=rescan_changed_harness,
+                transcript_out=transcript_out,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -801,6 +812,7 @@ def main() -> int:
             cache_discount=cache_discount,
             import_knowledge=args.import_knowledge,
             rescan_changed_harness=args.rescan_changed_harness,
+            transcript_out=args.transcript_out,
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
