@@ -314,6 +314,38 @@ class AdapterTest(unittest.TestCase):
             self.assertIn("# FULL TRAJECTORY", text)
             self.assertIn("[OBSERVATION 2]", text)
 
+    def test_the_digest_counts_unproductive_tool_answers(self):
+        """An aggregator kept a proposal that removed structural_index because the call counts of the
+        structural tools looked like use; every one of those calls had answered 'unavailable'."""
+        events = [
+            {"type": "tool_call", "node": "researcher", "name": "find_symbol", "args": "{'name': 'run_backup'}"},
+            {"type": "tool_response", "node": "researcher", "name": "find_symbol",
+             "text": "Structural index unavailable. Fall back to read_file and list_files; ..."},
+            {"type": "tool_call", "node": "researcher", "name": "find_callers", "args": "{'symbol': 'load_blob'}"},
+            {"type": "tool_response", "node": "researcher", "name": "find_callers", "text": "Structural index unavailable."},
+            {"type": "tool_call", "node": "researcher", "name": "read_file", "args": "{'filepath': 'a.py'}"},
+            {"type": "tool_response", "node": "researcher", "name": "read_file", "text": "def f(): pass\n"},
+            {"type": "tool_call", "node": "researcher", "name": "get_findings", "args": "{}"},
+            {"type": "tool_response", "node": "researcher", "name": "get_findings", "text": "NO_DATA: Zero findings recorded in database."},
+            {"type": "tool_call", "node": "patcher", "name": "apply_patch", "args": "{'diff_content': '...'}"},
+            {"type": "tool_response", "node": "patcher", "name": "apply_patch", "text": "SANDBOX-ERROR: patch(1) unavailable in image 'x'"},
+            {"type": "tool_call", "node": "patcher", "name": "run_sandbox", "args": "{'command': 'ls'}"},
+            {"type": "tool_response", "node": "patcher", "name": "run_sandbox", "text": "exit=0\napp.py\n"},
+        ]
+        digest = ad.render_digest(events, ad.render_trajectory(events, 20_000))
+        row = next(r for r in digest.splitlines() if r.startswith("| researcher "))
+        self.assertIn("find_symbol×1 (✗1)", row)
+        self.assertIn("find_callers×1 (✗1)", row)
+        self.assertIn("get_findings×1 (✗1)", row)
+        self.assertIn("read_file×1 |", row + " |")
+        self.assertNotIn("read_file×1 (✗", row)
+        prow = next(r for r in digest.splitlines() if r.startswith("| patcher "))
+        self.assertIn("apply_patch×1 (✗1)", prow)
+        self.assertNotIn("run_sandbox×1 (✗", prow)
+        self.assertIn("✗n = n answered with an error/empty/unavailable", digest)
+        self.assertTrue(ad.is_unproductive_response(""))
+        self.assertFalse(ad.is_unproductive_response("Recorded 3 finding(s)."))
+
     def test_a_failed_rollout_is_described_not_just_declared(self):
         def killed(target, workflow_path, run_dir, settings):
             fake_pipeline(target, workflow_path, run_dir, settings)

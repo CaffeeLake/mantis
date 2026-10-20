@@ -260,6 +260,24 @@ def _is_whole_file_read(args: Any) -> bool:
     return True
 
 
+# A tool response that did not give the stage what it asked for. Counted per
+# tool in the digest so a reader sees "find_symbol×12 (12 unproductive)" and
+# not just "find_symbol×12": live, an aggregator kept a proposal that removed
+# the stage those tools depend on because the call counts looked like use.
+_UNPRODUCTIVE_RESPONSE_RE = re.compile(
+    r"^\s*(?:ERROR\b|Error\b|SANDBOX-ERROR|SANDBOX-UNAVAILABLE|FATAL|refused\b|NO_DATA\b|"
+    r"Structural index unavailable|no such file|not found\b|Unknown tool|Tool .* not found)",
+    re.IGNORECASE,
+)
+
+
+def is_unproductive_response(text: Any) -> bool:
+    body = str(text or "")
+    if not body.strip():
+        return True
+    return bool(_UNPRODUCTIVE_RESPONSE_RE.match(body))
+
+
 def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
     """A one-screen map of a trajectory, for a reader that cannot read all of it.
 
@@ -275,7 +293,7 @@ def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
 
     def stage(name: str) -> Dict[str, Any]:
         if name not in per_stage:
-            per_stage[name] = {"calls": {}, "whole_reads": 0, "windowed_reads": 0, "files": {},
+            per_stage[name] = {"calls": {}, "unproductive": {}, "whole_reads": 0, "windowed_reads": 0, "files": {},
                                "reported": 0, "errors": 0, "messages": 0, "first_event": None}
             order.append(name)
         return per_stage[name]
@@ -299,6 +317,10 @@ def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
                 st["files"][fp] = st["files"].get(fp, 0) + 1
             if tool == "report_findings":
                 st["reported"] += str(ev.get("args") or "").count("'title'")
+        elif kind == "tool_response":
+            if is_unproductive_response(ev.get("text")):
+                tool = str(ev.get("name") or "")
+                st["unproductive"][tool] = st["unproductive"].get(tool, 0) + 1
         elif kind == "error":
             st["errors"] += 1
         elif kind == "message":
@@ -325,11 +347,14 @@ def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
         "far larger than one read.",
         "",
     ]
-    header = ["stage", "tool calls (by tool)", "reads whole/windowed", "reported", "errors", "starts at line"]
+    header = ["stage", "tool calls (by tool; ✗n = n answered with an error/empty/unavailable)", "reads whole/windowed", "reported", "errors", "starts at line"]
     rows = []
     for name in order:
         st = per_stage[name]
-        calls = ", ".join(f"{t}×{n}" for t, n in sorted(st["calls"].items(), key=lambda kv: (-kv[1], kv[0]))[:6]) or "-"
+        def _fmt(t: str, n: int) -> str:
+            bad = st["unproductive"].get(t, 0)
+            return f"{t}×{n}" + (f" (✗{bad})" if bad else "")
+        calls = ", ".join(_fmt(t, n) for t, n in sorted(st["calls"].items(), key=lambda kv: (-kv[1], kv[0]))[:6]) or "-"
         rows.append([name, calls, f"{st['whole_reads']}/{st['windowed_reads']}", str(st["reported"]),
                      str(st["errors"]), "?" if name not in starts else "@DIGEST_OFFSET+" + str(starts[name])])
     lines.append("| " + " | ".join(header) + " |")

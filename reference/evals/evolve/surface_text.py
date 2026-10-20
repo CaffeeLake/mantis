@@ -47,7 +47,12 @@ you REMOVE needs nothing else done -- its prompt file is simply no longer read.
 The cheap levers, in order of preference:
   - WHICH TOOLS A STAGE GETS. A stage without `find_callers` cannot trace a caller; a stage
     without `get_function_boundary` reads whole files. Tools come from a CLOSED registry --
-    you may give a stage a tool that exists, never invent one.
+    you may give a stage a tool that exists, never invent one. Some tools depend on an
+    earlier stage's output: `find_symbol`, `find_callers`, `find_callees` and
+    `get_function_boundary` read the index the `structural_index` stage builds, and answer
+    "Structural index unavailable" without it -- a digest row showing those tools with (✗n)
+    means the stage paid for calls that returned nothing. Removing `structural_index` removes
+    every structural tool with it.
   - WIRING. Two complementary researcher stages fanning out from the threat model and
     converging on dedupe; a classifier that routes unconfirmed findings to the reproducer;
     a stage removed because the trajectories show it adds turns and no findings.
