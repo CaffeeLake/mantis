@@ -620,7 +620,7 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
     return _after_tool
 
 
-def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
+def _make_prefix_reuse_callbacks(node_id: str):
     """Before/after callbacks that let a repo-scope prefix stage reuse itself.
 
     In cross-functional mode every campaign shares the repository jail, and the
@@ -632,10 +632,9 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
 
       * the run is cross-functional. Per-campaign jails make reuse wrong, so
         file-by-file and unknown modes always re-run;
-      * this process already ran the stage to completion for this (run_id,
-        snapshot_id, model, prefix_fingerprint) tuple. Process-local on purpose:
-        a resumed run or mutated stage config re-derives against the checkout
-        instead of trusting a pre-restart or stale artifact;
+      * this process already ran the stage to completion for this run_id.
+        Process-local on purpose: a resumed run re-derives against the
+        resynced checkout instead of trusting a pre-restart artifact;
       * the stage's artifact row actually exists in the database.
 
     Everything else -- missing context, missing artifact, any exception --
@@ -645,19 +644,6 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
     on every campaign after the first.
     """
     completed_runs: set[str] = set()
-    completed_keys: set[tuple[str, str, str, str]] = set()
-
-    def _run_key(ctx: Any) -> tuple[str, str, str, str]:
-        fp_map = getattr(ctx, "prefix_fingerprints", None) or {}
-        ctx_fp = fp_map.get(node_id, "") if isinstance(fp_map, dict) else ""
-        default_fp = getattr(_before, "_default_fingerprint", "") or fingerprint
-        eff_fp = ctx_fp or default_fp
-        return (
-            str(ctx.run_id),
-            str(getattr(ctx, "snapshot_id", "") or ""),
-            str(getattr(ctx, "model", "") or ""),
-            str(eff_fp),
-        )
 
     def _before(callback_context=None):
         try:
@@ -670,38 +656,16 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
                 return None
             if ctx.run_id not in completed_runs:
                 return None
-            key = _run_key(ctx)
-            if key not in completed_keys:
-                return None
-            from core.database import read_artifact, read_artifact_record
+            from core.database import read_artifact
             from core.paths import resolve_db_path
 
-            resolved_db = resolve_db_path(ctx.db_path)
             artifact = read_artifact(
-                resolved_db,
+                resolve_db_path(ctx.db_path),
                 artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
                 run_id=ctx.run_id,
             )
             if not artifact:
                 return None
-            rec = read_artifact_record(
-                resolved_db,
-                artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
-                run_id=ctx.run_id,
-            )
-            if rec and rec.get("metadata_json"):
-                try:
-                    meta = json.loads(rec["metadata_json"])
-                except ValueError:
-                    meta = {}
-                if isinstance(meta, dict) and meta.get("prefix_fingerprint"):
-                    stored_mark = (
-                        str(meta.get("snapshot_id", "")),
-                        str(meta.get("model", "")),
-                        str(meta.get("prefix_fingerprint", "")),
-                    )
-                    if stored_mark != (key[1], key[2], key[3]):
-                        return None
             return types.Content(
                 role="model",
                 parts=[types.Part(text=(
@@ -728,22 +692,6 @@ def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
                 and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
             ):
                 completed_runs.add(ctx.run_id)
-                key = _run_key(ctx)
-                completed_keys.add(key)
-                if ctx.db_path:
-                    from core.database import update_artifact_metadata
-                    from core.paths import resolve_db_path
-
-                    update_artifact_metadata(
-                        resolve_db_path(ctx.db_path),
-                        ctx.run_id,
-                        artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
-                        metadata={
-                            "snapshot_id": key[1],
-                            "model": key[2],
-                            "prefix_fingerprint": key[3],
-                        },
-                    )
         except Exception:
             pass
         return None
@@ -1443,7 +1391,6 @@ def load_workflow_from_json(
 
     resolvable_tools = {**TOOLS, **custom_tools}
 
-    prefix_fingerprints: dict[str, str] = {}
     unconditional_in_edges: dict[str, int] = {}
     conditional_in_edges: dict[str, int] = {}
     for edge_cfg in spec.edges:
@@ -1692,14 +1639,7 @@ def load_workflow_from_json(
                 # _make_prefix_reuse_callbacks). Attached only when the node
                 # carries no completion stamp, so a future on_enter_status on
                 # these nodes disables reuse rather than displacing the stamp.
-                prefix_fingerprints[node_id] = compute_prefix_fingerprint(
-                    node_id,
-                    instruction=instruction,
-                    tools=node_cfg.tools,
-                    model=str(node_cfg.model or spec.config.default_model or DEFAULT_MODEL),
-                )
                 before_reuse, after_reuse = _make_prefix_reuse_callbacks(node_id)
-                before_reuse._default_fingerprint = prefix_fingerprints[node_id]
                 agent_kwargs["before_agent_callback"] = before_reuse
                 agent_kwargs["after_agent_callback"] = after_reuse
 
@@ -1853,7 +1793,6 @@ def load_workflow_from_json(
     # so the map it receives must be empty. The key itself stays present
     # because it is part of the config contract main.py reads unconditionally.
     cfg["on_enter_status"] = {}
-    cfg["prefix_fingerprints"] = prefix_fingerprints
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

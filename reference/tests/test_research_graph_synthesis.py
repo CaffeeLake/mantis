@@ -547,27 +547,26 @@ class TestResearchGraphSynthesis(unittest.TestCase):
         self.assertEqual(dedupe_node.model, "vertex_ai/gemini-3.5-flash-lite")
         self.assertEqual(dedupe_node.reasoning_effort, "medium")
 
-    def test_parallel_researchers_and_propose_probe_compose(self):
-        """Verifies Harness² parallel researcher arms, Propose-Probe-Compose, and diversity metrics."""
-        from core.diversity import assign_blind_ids, format_blind_candidates, resolve_blind_pick
-
+    def test_parallel_researchers_fan_in_through_barrier(self):
+        """Two researcher arms converge once at dedupe, which must be a barrier node."""
         synth = ResearchGraphSynthesizer(default_model="vertex_ai/gemini-3.8-flash")
-        ppc = synth.propose_probe_compose(
-            objective="Web REST API authentication and SQL injection audit"
+        spec = synth.synthesize_archetype(
+            objective="Web REST API authentication and SQL injection audit",
+            parallel_researchers=True,
         )
-        self.assertIn("baseline", ppc)
-        self.assertIn("inv", ppc)
-        self.assertIn("dom", ppc)
-        self.assertIn("composed", ppc)
-
-        comp = ppc["composed"]
-        node_ids = {n.id for n in comp.nodes}
+        node_ids = {n.id for n in spec.nodes}
         self.assertIn("researcher_structural", node_ids)
         self.assertIn("researcher_domain", node_ids)
         self.assertNotIn("researcher", node_ids)
+        dedupe_in = [e for e in spec.edges if e.to_node == "dedupe"]
+        self.assertEqual(
+            sorted(e.from_node for e in dedupe_in),
+            ["researcher_domain", "researcher_structural"],
+        )
+        self.assertTrue(all(e.on is None for e in dedupe_in))
 
-        # Verify composed graph loads cleanly into an executable ADK workflow
-        recipe_path = ResearchGraphSynthesizer.persist_recipe(comp, self.workspace_dir)
+        # The graph loads into an executable ADK workflow and the fan-in is a barrier.
+        recipe_path = ResearchGraphSynthesizer.persist_recipe(spec, self.workspace_dir)
         wf, _ = load_workflow_from_json(str(recipe_path))
         self.assertIsNotNone(wf)
         sub_agents = {
@@ -580,47 +579,14 @@ class TestResearchGraphSynthesis(unittest.TestCase):
             getattr(sub_agents["dedupe"], "_requires_all_predecessors", False),
             "dedupe fan-in node must act as a barrier waiting for both parallel researcher arms",
         )
+        self.assertFalse(
+            getattr(sub_agents["reviewer"], "_requires_all_predecessors", False),
+            "a single-predecessor node must not become a barrier",
+        )
         self.assertIn(
             "Vulnerability Researcher stage",
             getattr(sub_agents["researcher_structural"], "instruction", ""),
         )
-        self.assertIn(
-            "Reviewer stage",
-            getattr(sub_agents["reviewer"], "instruction", ""),
-        )
-
-        # Verify diversity metrics confirm non-trivial divergence from baseline
-        div = ppc["diversity"]
-        self.assertEqual(div["n_candidates"], 3)
-        self.assertGreaterEqual(div["unique_structures"], 2)
-        self.assertLess(div["mean_pairwise_jaccard"], 1.0)
-        self.assertGreater(div["vs_baseline"]["composed"]["n_files_touched"], 0)
-
-        # Verify blind shuffled candidate selection strips provenance labels
-        b2r, r2b = assign_blind_ids(["baseline", "inv", "dom", "composed"], seed=42)
-        self.assertEqual(set(b2r.values()), {"baseline", "inv", "dom", "composed"})
-        formatted = format_blind_candidates({"baseline": "A", "inv": "B", "dom": "C", "composed": "D"}, b2r)
-        self.assertIn("c_alpha", formatted)
-        target_blind = r2b["composed"]
-        picked = resolve_blind_pick(
-            f"<why>Best coverage across structural and domain arms.</why><pick>{target_blind}</pick>",
-            b2r,
-        )
-        self.assertEqual(picked["selected"], "composed")
-        self.assertEqual(picked["resolved_by"], "pick")
-        self.assertIn("Best coverage", picked["why"])
-
-        # A reply that names no candidate is a selection failure, never a
-        # silent win for whichever blind id happens to come first.
-        with self.assertRaises(ValueError):
-            resolve_blind_pick("I cannot decide between these.", b2r)
-        fell_back = resolve_blind_pick(
-            "I cannot decide between these.", b2r, fallback_label="baseline"
-        )
-        self.assertEqual(fell_back["selected"], "baseline")
-        self.assertEqual(fell_back["resolved_by"], "fallback")
-        with self.assertRaises(ValueError):
-            resolve_blind_pick("no idea", b2r, fallback_label="not-a-candidate")
 
     def test_parallel_researcher_arms_earn_coverage_credit(self):
         """The arm node ids must be audit nodes, or a no-finding campaign is never credited.
@@ -669,117 +635,6 @@ class TestResearchGraphSynthesis(unittest.TestCase):
             gl.adk.Agent = orig_agent
         self.assertIsNotNone(wf)
         self.assertIn("researcher_structural", seen)
-
-    def test_evolve_iteration_runs_propose_probe_select_reflect_loop(self):
-        """End-to-end verification of ResearchGraphSynthesizer.evolve_iteration."""
-        from core.database import init_db, read_learnings
-        from core.memory import render_stage_learnings_for_agent
-
-        db_path = str(self.workspace_dir / "evolve.db")
-        init_db(db_path)
-        synth = ResearchGraphSynthesizer(
-            default_model="vertex_ai/gemini-3.8-flash", db_path=db_path
-        )
-
-        # 1. Fail-safe defaults (no probe_runner, no selector_fn, no reflector_fn):
-        #    returns winning_label="baseline" with resolved_by="unprobed", writes
-        #    nothing to rollouts/ for unprobed candidates, and persists no reflection.
-        unprobed = synth.evolve_iteration(
-            objective="Web REST API authentication and SQLi audit",
-            workspace_root=self.workspace_dir / "unprobed",
-            db_path=db_path,
-            run_id="evolve-unprobed",
-        )
-        self.assertEqual(unprobed["winning_label"], "baseline")
-        self.assertEqual(unprobed["pick_resolution"]["resolved_by"], "unprobed")
-        self.assertFalse((Path(unprobed["context_tree_root"]) / "rollouts").exists())
-        self.assertEqual(unprobed["reflection_counts"], {"edits": 0, "experiences": 0})
-        self.assertEqual(read_learnings(db_path), [])
-
-        # 2. Full Propose-Probe-Select-Reflect iteration with real probe_runner,
-        #    selector_fn, and reflector_fn:
-        probed_labels: list[str] = []
-
-        def fake_probe_runner(label, spec):
-            probed_labels.append(label)
-            return {
-                "summary": f"Probe summary for {label}: {len(spec.nodes)} nodes",
-                "rollout": [
-                    {
-                        "author": "researcher",
-                        "type": "tool_call",
-                        "name": "find_callers",
-                        "args": '{"symbol": "redeem"}',
-                    }
-                ],
-                "deliverable": [{"title": f"Finding from {label}"}],
-            }
-
-        def fake_selector(blind_packet, blind_to_real):
-            real_to_blind = {real: blind for blind, real in blind_to_real.items()}
-            return (
-                "<why>Composed candidate combined parallel arms with reviewer nav tools.</why>"
-                f"<pick>{real_to_blind['composed']}</pick>"
-            )
-
-        def fake_reflector(reflection_mission, reflection_tree):
-            self.assertIn("context/rollouts/", reflection_mission)
-            self.assertIn("context/deliverables/", reflection_mission)
-            return (
-                "<edits>\n"
-                "- `composed` parallel researcher arms — helped — traced cross-file flow\n"
-                "</edits>\n"
-                "<experience>\n"
-                "[\n"
-                "  {\n"
-                '    "cue": "auditing Web REST API authentication",\n'
-                '    "lesson": "use find_callers and get_function_boundary before reporting",\n'
-                '    "evidence": "turn 1 find_callers(redeem) in composed rollout",\n'
-                '    "confidence": "high",\n'
-                '    "target_stage": "researcher"\n'
-                "  }\n"
-                "]\n"
-                "</experience>"
-            )
-
-        out = synth.evolve_iteration(
-            objective="Web REST API authentication and SQLi audit",
-            workspace_root=self.workspace_dir,
-            db_path=db_path,
-            run_id="evolve-run-1",
-            probe_runner=fake_probe_runner,
-            selector_fn=fake_selector,
-            reflector_fn=fake_reflector,
-        )
-        self.assertEqual(set(probed_labels), {"baseline", "inv", "dom", "composed"})
-        self.assertEqual(out["winning_label"], "composed")
-        self.assertEqual(out["pick_resolution"]["resolved_by"], "pick")
-        self.assertTrue(Path(out["recipe_path"]).is_file())
-        self.assertTrue((Path(out["context_tree_root"]) / "task.md").is_file())
-        self.assertTrue(
-            (Path(out["context_tree_root"]) / "rollouts" / "composed.md").is_file()
-        )
-        self.assertIn("context/rollouts/", out["reflection_mission"])
-        self.assertIn("context/deliverables/", out["reflection_mission"])
-        self.assertEqual(out["reflection_counts"], {"edits": 1, "experiences": 1})
-
-        # Stage-targeted lesson from the reflection is immediately recallable for researcher
-        stage_block = render_stage_learnings_for_agent(db_path, "researcher")
-        self.assertIn("find_callers", stage_block)
-
-        # 3. Unparseable selector reply falls back safely to baseline (non-regression)
-        out_fallback = synth.evolve_iteration(
-            objective="Web REST API authentication and SQLi audit",
-            workspace_root=self.workspace_dir / "fb",
-            db_path=db_path,
-            run_id="evolve-run-2",
-            probe_runner=fake_probe_runner,
-            selector_fn=lambda packet, mapping: "I cannot decide which candidate is better.",
-        )
-        self.assertEqual(out_fallback["winning_label"], "baseline")
-        self.assertEqual(out_fallback["pick_resolution"]["resolved_by"], "fallback")
-
-
 
 if __name__ == "__main__":
     unittest.main()

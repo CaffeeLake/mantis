@@ -1867,48 +1867,6 @@ def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = 
         return None
 
 
-def update_artifact_metadata(
-    db_path: str,
-    run_id: str,
-    artifact_type: str = "",
-    filepath: str = "",
-    metadata: Optional[dict] = None,
-) -> bool:
-    """Merges `metadata` into the latest matching campaign_artifacts row's metadata_json."""
-    if not db_path or not run_id or not metadata:
-        return False
-    try:
-        with _db(db_path) as conn:
-            cursor = conn.cursor()
-            query = "SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ?"
-            params: List[Any] = [run_id]
-            if filepath:
-                query += " AND filepath = ?"
-                params.append(filepath)
-            elif artifact_type:
-                query += " AND artifact_type = ?"
-                params.append(artifact_type)
-            query += " ORDER BY id DESC LIMIT 1"
-            cursor.execute(query, params)
-            row = cursor.fetchone()
-            if not row:
-                return False
-            try:
-                existing = json.loads(row["metadata_json"] or "{}")
-                if not isinstance(existing, dict):
-                    existing = {}
-            except ValueError:
-                existing = {}
-            existing.update(metadata)
-            cursor.execute(
-                "UPDATE campaign_artifacts SET metadata_json = ? WHERE id = ?",
-                (json.dumps(existing), row["id"]),
-            )
-            return cursor.rowcount > 0
-    except (sqlite3.Error, OSError, TypeError, ValueError):
-        return False
-
-
 def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:
     """Records which model a run used. Idempotent: a run that is recorded
     again keeps its first model (a resumed run is the same run). Never

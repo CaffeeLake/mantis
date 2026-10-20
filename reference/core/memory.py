@@ -331,7 +331,6 @@ def recall(
     target: str = "",
     max_findings: int = _MAX_PRIOR_FINDINGS,
     max_learnings: int = _MAX_LEARNINGS,
-    include_causal_edits: bool = False,
 ) -> Dict[str, Any]:
     """Assembles what earlier runs established about this target.
 
@@ -490,9 +489,10 @@ def recall(
         if not isinstance(row, dict) or not _is_str(row.get("learning")):
             continue
         category = str(row.get("category") or "")
-        # Causal edit attributions ([EDIT:helped/hurt]) are harness-evolution
-        # decisions for ContextTree/decisions/, not codebase audit instructions.
-        if category == "causal_edit" and not include_causal_edits:
+        # Rows written by an earlier release's reflector as harness-evolution
+        # attributions ([EDIT:helped/hurt]); they are not audit instructions
+        # and never enter an agent prompt.
+        if category == "causal_edit":
             continue
         raw_tags = row.get("tags") or []
         if isinstance(raw_tags, str):
@@ -717,43 +717,31 @@ def record_reflection_output(
     run_id: str,
     raw_text: str,
 ) -> Dict[str, int]:
-    """Parses Harness² `<edits>` and `<experience>` blocks and persists them to SQLite.
+    """Parses reflector `<experience>` blocks and persists them to SQLite.
 
-    Returns counts `{"edits": int, "experiences": int}` of persisted entries.
-    Never raises (INV-6).
+    Only lessons that carry `cue`, `lesson` AND `evidence` survive
+    `parse_reflection_blocks`; nothing without evidence enters memory. Each
+    lesson is stored under category `experience:<target_stage>` with
+    `stage:` and `confidence:` tags so `recall_for_stage` can route it.
+
+    Returns `{"experiences": int}`. Never raises (INV-6).
     """
-    counts = {"edits": 0, "experiences": 0}
+    counts = {"experiences": 0}
     try:
         from core.database import record_learning
         from core.harness_context import parse_reflection_blocks
 
         parsed = parse_reflection_blocks(raw_text)
-        for edit in parsed.get("edits") or []:
-            verdict = str(edit.get("verdict") or "").strip()
-            target_edit = str(edit.get("edit") or "").strip()
-            evidence = str(edit.get("evidence") or "").strip()
-            if not target_edit or not verdict:
-                continue
-            text = f"[EDIT:{verdict}] {target_edit}" + (f" — {evidence}" if evidence else "")
-            record_learning(
-                db_path,
-                run_id,
-                "causal_edit",
-                text,
-                tags=[f"verdict:{verdict.replace(' ', '_')}"],
-            )
-            counts["edits"] += 1
-
         for exp in parsed.get("experiences") or []:
             cue = str(exp.get("cue") or "").strip()
             lesson = str(exp.get("lesson") or "").strip()
             evidence = str(exp.get("evidence") or "").strip()
             confidence = str(exp.get("confidence") or "medium").strip().lower()
-            target_stage = str(exp.get("target_stage") or "researcher").strip().lower()
-            if not cue or not lesson:
+            target_stage = str(exp.get("target_stage") or "global").strip().lower()
+            if not cue or not lesson or not evidence:
                 continue
             tags = [f"stage:{target_stage}", f"confidence:{confidence}"]
-            text = f"When {cue}: {lesson}" + (f" (evidence: {evidence})" if evidence else "")
+            text = f"When {cue}: {lesson} (evidence: {evidence})"
             record_learning(
                 db_path,
                 run_id,

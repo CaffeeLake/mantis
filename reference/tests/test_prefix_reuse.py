@@ -174,8 +174,8 @@ class WiringPinTest(unittest.TestCase):
                 self.assertNotIn("on_enter_status", node)
 
 
-class ContentAddressedPrefixAndToolLoopGuardTest(unittest.TestCase):
-    """Tests for Harness² content-addressed prefix reuse (runmark) and tool-loop guards (c8)."""
+class ToolLoopGuardTest(unittest.TestCase):
+    """Tests for the configuration fingerprint utility and the read_file tool-loop guard."""
 
     def test_compute_prefix_fingerprint_changes_on_prompt_or_tools_or_model(self):
         from core.graph_loader import compute_prefix_fingerprint
@@ -203,45 +203,6 @@ class ContentAddressedPrefixAndToolLoopGuardTest(unittest.TestCase):
             snapshot_id="snap-1",
         )
         self.assertNotEqual(fp_base, fp_changed_prompt)
-
-    def test_prefix_reuse_invalidates_when_snapshot_or_fingerprint_changes(self):
-        before, after = _make_prefix_reuse_callbacks("architect")
-        with tempfile.TemporaryDirectory() as tmp:
-            db = os.path.join(tmp, "knowledge.db")
-            init_db(db)
-            record_artifact(db, "run-1", "summary", "summary.md", "Architecture summary")
-            ctx1 = RunContext(
-                jail_dir=tmp,
-                db_path=db,
-                run_id="run-1",
-                scan_mode="cross-functional",
-                snapshot_id="snap-1",
-                model="gemini-3.8-flash",
-                prefix_fingerprints={"architect": "fp-v1"},
-            )
-            tok = current_run_context.set(ctx1)
-            try:
-                self.assertIsNone(before())
-                after()
-                self.assertIsNotNone(before())
-            finally:
-                current_run_context.reset(tok)
-
-            # Mutated fingerprint invalidates reuse even under the same run_id.
-            ctx2 = RunContext(
-                jail_dir=tmp,
-                db_path=db,
-                run_id="run-1",
-                scan_mode="cross-functional",
-                snapshot_id="snap-1",
-                model="gemini-3.8-flash",
-                prefix_fingerprints={"architect": "fp-v2"},
-            )
-            tok2 = current_run_context.set(ctx2)
-            try:
-                self.assertIsNone(before())
-            finally:
-                current_run_context.reset(tok2)
 
     def test_after_tool_guard_steers_after_repeated_unbounded_read_file(self):
         from core.graph_loader import _make_after_tool_guard_callback
@@ -317,69 +278,6 @@ class ContentAddressedPrefixAndToolLoopGuardTest(unittest.TestCase):
                 named and named <= allowed,
                 f"hint suggests {tool_name}({arg_text}) but it accepts {sorted(allowed)}",
             )
-
-    def test_load_workflow_exports_computed_prefix_fingerprints(self):
-        from core.graph_loader import load_workflow_from_json
-
-        wf_path = str(Path(_REF_ROOT) / "workflow.json")
-        _, cfg = load_workflow_from_json(wf_path)
-        fps = cfg.get("prefix_fingerprints") or {}
-        self.assertIn("architect", fps)
-        self.assertIn("threat_modeler", fps)
-        self.assertEqual(len(fps["architect"]), 16)
-        self.assertEqual(len(fps["threat_modeler"]), 16)
-
-    def test_prefix_reuse_persists_and_verifies_db_runmark_metadata(self):
-        """After-callback stamps runmark metadata into campaign_artifacts and before-callback verifies it."""
-        import json as _json
-        from core.database import read_artifact_record, update_artifact_metadata
-        from core.graph_loader import _make_prefix_reuse_callbacks
-
-        before, after = _make_prefix_reuse_callbacks("architect", fingerprint="fp-v1")
-        with tempfile.TemporaryDirectory() as tmp:
-            db = str(Path(tmp) / "knowledge.db")
-            init_db(db)
-            record_artifact(
-                db,
-                "run-mark",
-                "summary",
-                "workspace/.structured/summary.json",
-                '{"components": []}',
-            )
-            ctx = RunContext(
-                jail_dir=tmp,
-                db_path=db,
-                run_id="run-mark",
-                scan_mode="cross-functional",
-                snapshot_id="snap-abc",
-                model="vertex_ai/gemini-3.8-flash",
-                prefix_fingerprints={"architect": "fp-v1"},
-            )
-            tok = current_run_context.set(ctx)
-            try:
-                after()
-                rec = read_artifact_record(db, artifact_type="summary", run_id="run-mark")
-                self.assertIsNotNone(rec)
-                meta = _json.loads(rec["metadata_json"] or "{}")
-                self.assertEqual(meta.get("prefix_fingerprint"), "fp-v1")
-                self.assertEqual(meta.get("snapshot_id"), "snap-abc")
-                self.assertEqual(meta.get("model"), "vertex_ai/gemini-3.8-flash")
-
-                # Matching runmark reuses artifact
-                self.assertIsNotNone(before())
-
-                # Tampered/stale DB runmark metadata invalidates reuse
-                update_artifact_metadata(
-                    db,
-                    "run-mark",
-                    artifact_type="summary",
-                    metadata={"prefix_fingerprint": "fp-stale"},
-                )
-                self.assertIsNone(before())
-            finally:
-                current_run_context.reset(tok)
-
-
 
 if __name__ == "__main__":
     unittest.main()
