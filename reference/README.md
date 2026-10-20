@@ -113,6 +113,32 @@ audit objectives:
 ./run.sh path/to/code --objective "Audit for SSRF in webhook handlers" --inspect --dry-run
 ```
 
+### Evolving the harness against your own code (Harness²)
+
+Synthesis builds a graph for an objective; **evolution** improves the harness
+you already run, using evidence from runs on *your* code. `evals/evolve` runs
+[Harness²](https://github.com/google-research/harness2)'s Propose–Probe–Compose
+step over the pipeline: k base rollouts, two proposers (one for how the pipeline
+works, one for what an auditor knows about this codebase) editing
+`workflow.json`, per-stage prompts and tool guidance from the full trajectories,
+every candidate rolled out once, a composition, and an **evidence-first
+selection** — the pipeline's own INV-1 tiers decide, a blind read of anonymised
+reports only breaks ties, and a candidate that loses a finding every base run
+machine-verified is never adopted. Nothing touches your `workflow.json` until
+you read the diff and run `adopt --yes`.
+
+```bash
+python3 -m evals.evolve.run run --target /path/to/repo --out runs/evolve-1 --token-budget 1500000
+python3 -m evals.evolve.run adopt runs/evolve-1/tasks/repo/adopted --yes
+```
+
+At k=1 one iteration costs 4 pipeline rollouts plus 3 proposer sessions per
+task; the command says so and asks before spending. The proposer may not widen
+the tool set or the sandbox tier, per-stage prompt text is capped, and files
+under `context/` are evidence, never instructions. See
+[`evals/README.md`](evals/README.md#evolving-a-harness-with-harness%C2%B2-evalsevolve)
+for what a user gets — and what, without ground truth, nobody can claim.
+
 ### Synthesis Archetypes & Deterministic Gates
 
 Research graph synthesis generates specialized graph specifications validated

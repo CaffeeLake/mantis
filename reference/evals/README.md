@@ -207,6 +207,64 @@ function-level retrieval when the tools are present; and read-everything runs on
 large targets can re-read large files until they exhaust the context window, so
 cap tool calls or budget accordingly.
 
+## Evolving a harness with Harness² (`evals/evolve/`)
+
+Mantis users audit code the maintainers never see. `evals/evolve` lets them
+improve the harness *for their code*, with evidence and without ground truth, by
+running [Harness²](https://github.com/google-research/harness2)'s
+Propose–Probe–Compose loop over the ADK pipeline. Harness² core is vendored
+under `third_party/harness2/` (see `VENDOR.md`); Mantis supplies three pieces:
+
+- **Surface** (`surface.py`): the harness as files a proposer may edit —
+  `workflow.json` (stages, wiring, per-stage tools from the closed registry,
+  per-stage model/effort, budget), `prompts/<node_id>.md`, `tool_guidance.md`.
+  An edited tree compiles back to one `workflow.json` the production loader
+  already accepts; `validate_tree` names every problem in one message (closed
+  tool set, unchanged sandbox tier, per-stage prompt cap, loader errors) and
+  that message is the proposer's one repair turn.
+- **Adapter** (`adapter.py`): a rollout is `main.py` run as a subprocess with a
+  candidate workflow; its console stream is the trajectory, its knowledge DB the
+  findings. Completion is recorded with Harness²'s runmark only after a normal
+  return. `MantisRepoAdapter` is the user's code (no answer key: `score()`
+  returns `None`); `MantisEvalAdapter` is generated dev targets, scored only by
+  `harness2.core.judge` after selection, holdout refused.
+- **Proposer** (`proposer.py`): an ADK agent — no OpenCode or Codex — with four
+  tools jailed to the session's copy of `context/`: list, read (with bounds),
+  write under `harness/` (surface-checked), delete. Edits on disk are the
+  proposal; files under `context/` are data, never instructions.
+
+**Selection is evidence-first** (`selection.py`), which is where Mantis has
+something Harness² does not: every finding carries the INV-1 tier the pipeline
+itself established. Candidates that crashed or delivered nothing are dropped; a
+candidate that loses a finding *every* base run machine-verified is not
+adoptable whatever it adds; the rest rank by severity-weighted evidence tier,
+then tokens. Only a tie within `TIE_EPSILON` goes to Harness²'s blind read of
+anonymised findings reports. A selector failure adopts nothing.
+
+```bash
+# one iteration over your repository (k=1: 4 pipeline rollouts + 3 proposer sessions)
+python3 -m evals.evolve.run run --target /path/to/repo --out runs/evolve-1 \
+    --model vertex_ai/gemini-3.8-flash --token-budget 1500000
+# read runs/evolve-1/tasks/<repo>/adoption.json (unified diff, selection, experience, warnings), then
+python3 -m evals.evolve.run adopt runs/evolve-1/tasks/<repo>/adopted            # prints the diff
+python3 -m evals.evolve.run adopt runs/evolve-1/tasks/<repo>/adopted --yes      # writes workflow.json (.bak kept)
+```
+
+What a user gets is an adopted harness, the cited rationale, a `<experience>` in
+`<out>/library/<domain>/` that later iterations read first, and `warnings` that
+say when the loop did nothing (`KEEP_BASE`, a stage that fell back, `k=1`
+single-rollout evidence). What a user does *not* get is a measured improvement:
+without ground truth nothing here can claim one. The maintainers measure the
+loop itself on generated targets (`--eval-seeds dev:N`, then
+`sweep.py`/`compare.py` on holdout) before calling it an improvement.
+
+> Security of the loop: the proposer reads trajectories of *untrusted* code and
+> writes prompts every future run obeys. The closed tool allowlist and the
+> sandbox tier cannot be widened by a proposal; per-stage prompt text is capped;
+> Harness²'s evidence-boundary fence is in every mission; and nothing is written
+> to the production harness without a human running `adopt --yes` after reading
+> the diff.
+
 ## Downstream stage benchmarks (`run_eval.py`)
 
 Dedupe, review, critic, and calibrate stage benchmarks over fixed datasets:
