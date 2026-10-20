@@ -214,18 +214,32 @@ class MicrosandboxEnvironment(BaseEnvironment):
         return sorted(file_list)
 
     async def apply_patch(self, diff: str) -> str:
+        from core.environments.patch_fallback import (
+            PATCH_FILE_NAME, PATCH_SCRIPT_NAME, PYTHON_PATCH_SCRIPT, fallback_command, unavailable_message,
+        )
         try:
             data = diff.encode("utf-8") if isinstance(diff, str) else diff
-            await self.write_file(Path(".mantis.patch"), data)
-            res = await self.execute("patch -p1 -i .mantis.patch < /dev/null")
+            await self.write_file(Path(PATCH_FILE_NAME), data)
+            res = await self.execute(f"patch -p1 -i {PATCH_FILE_NAME} < /dev/null")
             output_str = f"exit={res.exit_code}\n{res.stdout}{res.stderr}"
             if res.exit_code == 127:
-                return f"SANDBOX-ERROR: patch(1) unavailable in image '{self.image}'\n{output_str}"
+                # No patch(1) in the image (python:3-slim, distroless): apply
+                # with the guest's python3 instead of failing the stage.
+                await self.write_file(Path(PATCH_SCRIPT_NAME), PYTHON_PATCH_SCRIPT)
+                fb = await self.execute(fallback_command(strip=1))
+                fb_out = f"exit={fb.exit_code}\n{fb.stdout}{fb.stderr}"
+                if fb.exit_code == 127:
+                    return unavailable_message(self.image, fb_out)
+                if fb.exit_code != 0:
+                    fb0 = await self.execute(fallback_command(strip=0))
+                    if fb0.exit_code == 0:
+                        return f"exit=0\n{fb0.stdout}{fb0.stderr}"
+                return fb_out
             if res.exit_code != 0:
-                res_no_p1 = await self.execute("patch -i .mantis.patch < /dev/null")
+                res_no_p1 = await self.execute(f"patch -i {PATCH_FILE_NAME} < /dev/null")
                 output_no_p1 = f"exit={res_no_p1.exit_code}\n{res_no_p1.stdout}{res_no_p1.stderr}"
                 if res_no_p1.exit_code == 127:
-                    return f"SANDBOX-ERROR: patch(1) unavailable in image '{self.image}'\n{output_no_p1}"
+                    return unavailable_message(self.image, output_no_p1)
                 return output_no_p1
             return output_str
         except Exception as e:

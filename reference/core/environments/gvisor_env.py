@@ -303,7 +303,7 @@ class GvisorEnvironment(BaseEnvironment):
                 stdin=diff,
             )
             if rc == 127:
-                return f"exit=127\npatch(1) unavailable in image '{self.image}'"
+                return None  # no patch(1): the caller runs the python3 fallback
             if rc != 0:
                 rc_retry, out_retry = self._run_cmd(
                     [self.tool, "exec", "-i", self.container_name, "patch", "--batch", "--force"],
@@ -314,7 +314,30 @@ class GvisorEnvironment(BaseEnvironment):
                 return f"exit={rc_retry}\n{truncate_with_marker(out_retry, MAX_OUTPUT, what='patch output')}"
             return f"exit={rc}\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
 
-        return await asyncio.to_thread(_patch)
+        result = await asyncio.to_thread(_patch)
+        if result is not None:
+            return result
+
+        # No patch(1) in the image (python:3-slim, distroless): apply with the
+        # guest's python3 instead of failing the stage.
+        from core.environments.patch_fallback import (
+            PATCH_FILE_NAME, PATCH_SCRIPT_NAME, PYTHON_PATCH_SCRIPT, fallback_argv, unavailable_message,
+        )
+        await self.write_file(Path(PATCH_FILE_NAME), diff)
+        await self.write_file(Path(PATCH_SCRIPT_NAME), PYTHON_PATCH_SCRIPT)
+
+        def _fallback():
+            # The container was created with -w <workdir>, so exec runs there.
+            rc, out = self._run_cmd([self.tool, "exec", self.container_name, *fallback_argv(strip=1)])
+            if rc == 127:
+                return unavailable_message(self.image, out)
+            if rc != 0:
+                rc0, out0 = self._run_cmd([self.tool, "exec", self.container_name, *fallback_argv(strip=0)])
+                if rc0 == 0:
+                    return f"exit=0\n{truncate_with_marker(out0, MAX_OUTPUT, what='patch output')}"
+            return f"exit={rc}\n{truncate_with_marker(out, MAX_OUTPUT, what='patch output')}"
+
+        return await asyncio.to_thread(_fallback)
 
     async def preflight(self) -> None:
         def _check():
