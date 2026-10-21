@@ -58,6 +58,36 @@ class RunLedgerTest(unittest.TestCase):
         self.assertFalse(record_run("", "r3", FLASH))
         self.assertFalse(record_run(self.db, "", FLASH))
 
+    def test_the_pipeline_records_the_run_after_it_has_an_id(self):
+        """pipeline() must call record_run only once run_id is bound. For a
+        while the call sat above the assignment: `run_id` is a local of the
+        function, so Python raised UnboundLocalError, the except swallowed
+        it as a warning, and the ledger stayed empty for every real run --
+        exports and pr_scan then attributed nothing to any model."""
+        import ast
+        import inspect
+        import textwrap
+
+        import main
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(main.pipeline)))
+        assigned: list[int] = []
+        recorded: list[int] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "run_id" for t in node.targets
+            ):
+                assigned.append(node.lineno)
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name == "record_run":
+                    recorded.append(node.lineno)
+        self.assertTrue(assigned, "pipeline() no longer binds run_id")
+        self.assertTrue(recorded, "pipeline() no longer records the run's model")
+        for line in recorded:
+            self.assertGreater(line, min(assigned),
+                               "record_run is called before run_id is bound: the ledger stays empty")
+
     def test_coverage_is_per_model_when_asked_and_any_model_otherwise(self):
         init_db(self.db)
         a, b, c = (os.path.join(self.repo, n) for n in ("a.py", "b.py", "c.py"))

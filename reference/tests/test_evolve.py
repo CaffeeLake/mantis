@@ -399,6 +399,40 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual((rd / "summary.json").stat().st_mtime_ns, stamp, "a complete run must not be re-rolled")
             self.assertIsNone(adapter.score(rd, "demo"))
 
+    def test_repo_adapter_rolls_out_a_target_with_an_answer_key_from_a_copy_without_it(self):
+        """evals/research_target carries ground_truth.json beside the app. The
+        repo adapter used to hand that directory to the pipeline as it was,
+        so every rollout could list (and read) the answer key. It now rolls
+        out from a copy with the leak globs removed; a target without one is
+        used in place, unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            target = tmp / "repo"; target.mkdir(); (target / "app.py").write_text("print(1)\n")
+            (target / "ground_truth.json").write_text("{}")
+            (target / "sub").mkdir(); (target / "sub" / "bench_dataset.json").write_text("[]")
+            (target / "sub" / "x.py").write_text("y = 1\n")
+            adapter = _adapter(tmp, target)
+            seen: list = []
+
+            def recording_runner(t, wf, rd, settings):
+                seen.append(Path(t))
+                return fake_pipeline(t, wf, rd, settings)
+            adapter._runner = recording_runner
+            jail = adapter.target_for("demo")
+            self.assertNotEqual(jail, target)
+            self.assertTrue((jail / "app.py").exists())
+            self.assertTrue((jail / "sub" / "x.py").exists())
+            self.assertFalse((jail / "ground_truth.json").exists(), "the answer key must never reach the pipeline")
+            self.assertFalse((jail / "sub" / "bench_dataset.json").exists())
+            self.assertEqual(adapter.target_for("demo"), jail, "one copy per task, shared by every rollout")
+            adapter.execute("demo", None, "demo--base1")
+            self.assertEqual(seen, [jail], "the pipeline must run on the copy, not the original")
+            # A target with nothing to hide is used where it is.
+            plain = tmp / "plain"; plain.mkdir(); (plain / "app.py").write_text("print(2)\n")
+            adapter2 = ad.MantisRepoAdapter(targets={"p": plain}, workflow_path=WORKFLOW, runs_root=tmp / "runs2",
+                                            settings=ad.RunSettings(model="m", timeout_seconds=60), runner=fake_pipeline, domain="demo")
+            self.assertEqual(adapter2.target_for("p"), plain)
+
     def test_eval_adapter_refuses_holdout_and_scores_only_through_score(self):
         from evals.research_targets import gen
         with tempfile.TemporaryDirectory() as tmp:

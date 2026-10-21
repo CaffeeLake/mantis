@@ -58,6 +58,11 @@ from evals.evolve._vendor import load_harness2
 
 REFERENCE_ROOT = Path(__file__).resolve().parent.parent.parent
 
+# What the pipeline must never see, as glob patterns on a file's name: the
+# proposer may not read these from a rollout (Harness2's leak globs) and a
+# target that carries one is rolled out from a copy without it.
+ANSWER_KEY_GLOBS = ("*ground_truth*.json", "*_dataset*.json")
+
 # Evidence tiers, strongest first. Weights are deliberately coarse: the
 # ordering is what matters for selection, and a sandbox-proven reach is not
 # "a bit better" than a static read -- it is a different kind of evidence.
@@ -510,7 +515,7 @@ class MantisAdapterBase:
                 deliverable_word="findings report",
             ),
             channels={"proposer": channel, "selector": channel},
-            leak_globs=("*ground_truth*.json", "*_dataset*.json"),
+            leak_globs=ANSWER_KEY_GLOBS,
             allow_subagents=False,
             obs_trunc=max(10_000, int(obs_trunc)),
         )
@@ -677,7 +682,14 @@ class _MantisSubstrate:
 
 
 class MantisRepoAdapter(MantisAdapterBase):
-    """The user's code: tasks are target directories; there is no answer key."""
+    """The user's code: tasks are target directories; there is no answer key.
+
+    If a target does carry one anyway (the checked-in research target does,
+    so does any generated target copied whole), the pipeline gets a copy
+    with it left out. The adapter's leak globs name what counts."""
+
+    #: What the pipeline must never see, as glob patterns on a file's name.
+    ANSWER_KEY_GLOBS = ANSWER_KEY_GLOBS
 
     def __init__(self, *, targets: Dict[str, Path | str], **kw):
         super().__init__(**kw)
@@ -687,12 +699,40 @@ class MantisRepoAdapter(MantisAdapterBase):
         for tid, path in self._targets.items():
             if not path.is_dir():
                 raise ValueError(f"task {tid!r}: {path} is not a directory")
+        self._jails: Dict[str, Path] = {}
 
     def tasks(self, split: str = "all") -> List[str]:
         return sorted(self._targets)
 
+    def _answer_keys_in(self, target: Path) -> List[Path]:
+        found: List[Path] = []
+        for pattern in self.ANSWER_KEY_GLOBS:
+            found.extend(p for p in target.rglob(pattern) if p.is_file())
+        return sorted(set(found))
+
     def target_for(self, task_id: str) -> Path:
-        return self._targets[task_id]
+        target = self._targets[task_id]
+        if task_id in self._jails:
+            return self._jails[task_id]
+        keys = self._answer_keys_in(target)
+        if not keys:
+            self._jails[task_id] = target
+            return target
+        # Copy without the answer key(s). Done once per adapter: every
+        # rollout of this task (base and candidates) sees the same tree. The
+        # copy keeps the target's name, which the task prompt shows.
+        jail = self.runs_root / "targets" / task_id / (target.name or "app")
+        if not jail.exists():
+            jail.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(target, jail,
+                            ignore=shutil.ignore_patterns(*self.ANSWER_KEY_GLOBS, "__pycache__", "*.pyc"))
+        leaked = self._answer_keys_in(jail)
+        if leaked:
+            raise RuntimeError(f"answer key leaked into the rollout copy of {task_id}: {leaked[0]}")
+        names = ", ".join(str(k.relative_to(target)) for k in keys)
+        print(f"[evolve] {task_id}: rolling out on a copy without {names}", file=sys.stderr)
+        self._jails[task_id] = jail
+        return jail
 
     def score(self, run_dir: Path, task_id: str) -> Optional[dict]:
         # No ground truth exists for a user's repository, and nothing here

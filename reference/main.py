@@ -1293,19 +1293,6 @@ async def pipeline(
 
     db_path = config.get("db_path", "knowledge.db")
     init_db(db_path)
-    # The model this run uses, written down once so every record the run
-    # leaves -- findings, learnings, coverage, spend, all keyed by run id --
-    # can say who produced it. Knowledge built by several models depends on
-    # this, and so does the per-model sweep below.
-    run_model = ""
-    try:
-        from core.config import normalize_model_id
-        from core.database import record_run
-
-        run_model = normalize_model_id(str(config.get("default_model") or ""))
-        record_run(db_path, run_id, run_model)
-    except Exception as exc:
-        print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
 
     # What this run IS, for the coverage ledger: the loader hashed the
     # resolved graph (node ids, tools, models, final prompts, sandbox tier)
@@ -1355,6 +1342,20 @@ async def pipeline(
             return 1
         print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
+    # The model this run uses, written down once so every record the run
+    # leaves -- findings, learnings, coverage, spend, all keyed by run id --
+    # can say who produced it. Knowledge built by several models depends on
+    # this, and so does the per-model sweep below. Recorded here, once the
+    # run id exists: earlier and the ledger stays empty for every run.
+    run_model = ""
+    try:
+        from core.config import normalize_model_id
+        from core.database import record_run
+
+        run_model = normalize_model_id(str(config.get("default_model") or ""))
+        record_run(db_path, run_id, run_model)
+    except Exception as exc:
+        print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
     # Memory from the repository: a checked-in knowledge export, read into
     # this database before anything chooses what to scan (coverage feeds auto
     # mode) and under this run id (so the threat model and architecture are
