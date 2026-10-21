@@ -101,7 +101,7 @@
       "id": "reproducer",
       "type": "agent",
       "reasoning_effort": "high",
-      "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file"],
+      "tools": ["run_sandbox", "run_sandbox_with_evidence", "get_findings", "get_threat_model", "read_file", "write_file", "get_function_boundary", "find_callers"],
       "on_enter_status": "static_confirmed",
       "output_schema": "ReproVerdict",
       "output_key": "verdict"
