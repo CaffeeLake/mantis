@@ -721,7 +721,9 @@ def recall_for_stage(
     the least-evidenced -- the lesson a reader would have weighted least.
     """
     stage_norm = str(stage or "").strip().lower()
-    mem = recall(db_path, target=target, max_learnings=max_learnings * 4)
+    # Pass a wide pre-cap to recall() so stage-specific high-confidence lessons
+    # are not evicted by recency slicing across unrelated stages before ranking.
+    mem = recall(db_path, target=target, max_learnings=max(max_learnings * 32, 500))
     all_learnings = mem.get("learnings") or []
     targeted: List[Dict[str, Any]] = []
     general: List[Dict[str, Any]] = []

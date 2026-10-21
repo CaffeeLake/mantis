@@ -1821,6 +1821,22 @@ class ResilientLiteLlm(LiteLlm):
 
         if not is_valid:
             schema_name = getattr(schema_cls, "__name__", str(schema_cls))
+            model_fields = getattr(schema_cls, "model_fields", None) or {}
+            if schema_name not in ("ReproVerdict", "ReviewVerdict", "ExtendedReviewVerdict", "CriticVerdict") and "route" not in model_fields:
+                # Non-verdict schemas (FindingCalibration, AuditPlan) have dedicated
+                # prose/JSON fallback parsers in their callers; replacing their text
+                # with a ReproVerdict payload would clobber those fallbacks.
+                if is_safety_block:
+                    if getattr(response, "content", None) is None:
+                        response.content = types.Content(role="model", parts=[types.Part.from_text(text="{}")])
+                    else:
+                        response.content.parts = [types.Part.from_text(text="{}")]
+                    if getattr(response, "finish_reason", None) in (types.FinishReason.SAFETY, "SAFETY"):
+                        response.finish_reason = types.FinishReason.STOP
+                    if getattr(response, "error_code", None):
+                        response.error_code = None
+                        response.error_message = None
+                return response
             clean_snippet = text.strip().replace("\n", " ")[:200] or "Model emitted non-JSON or refusal output"
             if schema_name == "ReproVerdict":
                 fallback_payload = {
@@ -1901,7 +1917,13 @@ class ResilientLiteLlm(LiteLlm):
         # row is being answered, and the answer is nothing. Past the cap the
         # empty turn is passed on (below) instead of burning the rest of the
         # patience window one identical request at a time.
-        max_empty_turns = int(os.environ.get("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS", str(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS)))
+        try:
+            max_empty_turns = max(
+                1,
+                int(os.environ.get("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS", str(DEFAULT_EMPTY_TURN_MAX_ATTEMPTS))),
+            )
+        except ValueError:
+            max_empty_turns = DEFAULT_EMPTY_TURN_MAX_ATTEMPTS
 
         start_time = time.time()
         attempt = 0

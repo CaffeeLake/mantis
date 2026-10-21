@@ -362,16 +362,18 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
     scanned: Dict[str, Dict[str, Any]] = {}
     # The ledger grew `harness_fingerprint` after it first shipped; a database
     # last written by an older Mantis has no such column and must still export.
-    from core.cost import has_fingerprint_column
+    from core.cost import _row_failed, has_fingerprint_column
 
     try:
         fp_col = "harness_fingerprint" if has_fingerprint_column(conn) else "NULL AS harness_fingerprint"
         spend = conn.execute(
-            f"SELECT target, scan_mode, run_id, tokens, {fp_col} FROM campaign_spend ORDER BY id ASC").fetchall()
+            f"SELECT target, scan_mode, run_id, tokens, metadata_json, {fp_col} FROM campaign_spend ORDER BY id ASC").fetchall()
     except sqlite3.Error:
         spend = []
     for row in spend:
         r = dict(row)
+        if _row_failed(r.get("metadata_json")):
+            continue
         rel = _relativize(str(r.get("target") or ""), repo_root)
         if not rel:
             continue

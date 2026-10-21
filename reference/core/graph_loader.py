@@ -393,6 +393,13 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
 
     def _stamp_on_success(callback_context=None, **_kwargs):
         try:
+            import asyncio
+            task = asyncio.current_task()
+            if task is not None and getattr(task, "cancelling", lambda: 0)() > 0:
+                return None
+        except Exception:
+            pass
+        try:
             from core.context import current_run_context
             rc = current_run_context.get()
             if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
@@ -748,12 +755,22 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
             if len(tool_response) <= cap:
                 return tool_response, False
             return bound_fenced_text(tool_response, cap, what), True
-        if isinstance(tool_response, dict) and isinstance(tool_response.get("result"), str):
-            if len(tool_response["result"]) <= cap:
-                return tool_response, False
-            updated = dict(tool_response)
-            updated["result"] = bound_fenced_text(tool_response["result"], cap, what)
-            return updated, True
+        if isinstance(tool_response, dict):
+            if isinstance(tool_response.get("result"), str):
+                if len(tool_response["result"]) <= cap:
+                    return tool_response, False
+                updated = dict(tool_response)
+                updated["result"] = bound_fenced_text(tool_response["result"], cap, what)
+                return updated, True
+            if isinstance(tool_response.get("output"), str) or isinstance(tool_response.get("raw"), str):
+                updated = dict(tool_response)
+                cut = False
+                for key in ("output", "raw"):
+                    val = updated.get(key)
+                    if isinstance(val, str) and len(val) > cap:
+                        updated[key] = bound_fenced_text(val, cap, what)
+                        cut = True
+                return (updated, True) if cut else (tool_response, False)
         return tool_response, False
 
     def _after_tool(

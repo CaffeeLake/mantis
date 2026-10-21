@@ -131,6 +131,22 @@ class PythonApplierTest(unittest.TestCase):
         self.assertEqual(PF.fallback_command(), f"python3 {PF.PATCH_SCRIPT_NAME} -p1 {PF.PATCH_FILE_NAME}")
         self.assertIn("python3 fallback could not run", PF.unavailable_message("img"))
 
+    def test_form_feed_and_zero_length_old_range_apply_like_gnu_patch(self):
+        self._write("ff.c", "a\n\x0cb\nc\n")
+        diff_ff = "--- a/ff.c\n+++ b/ff.c\n@@ -1,3 +1,3 @@\n a\n \x0cb\n-c\n+C\n"
+        rc, out = self._run(diff_ff)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.repo / "ff.c").read_text(), "a\n\x0cb\nC\n")
+
+        self._write("ins.txt", "".join(f"l{i}\n" for i in range(1, 6)))
+        diff_ins = "--- a/ins.txt\n+++ b/ins.txt\n@@ -2,0 +3,1 @@\n+INSERTED\n"
+        rc, out = self._run(diff_ins)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.repo / "ins.txt").read_text(), "l1\nl2\nINSERTED\nl3\nl4\nl5\n")
+
+        rc_escape, _ = self._run("--- a/../../escape.txt\n+++ b/../../escape.txt\n@@ -0,0 +1 @@\n+x\n")
+        self.assertNotEqual(rc_escape, 0)
+
 
 class _Res:
     def __init__(self, code, out="", err=""):
@@ -230,6 +246,12 @@ class GvisorFallbackTest(unittest.TestCase):
         env = self._env([("patch", (127, "")), (PF.PATCH_SCRIPT_NAME, (127, "python3: not found"))])
         out = asyncio.run(env.apply_patch("--- a/a.py\n+++ b/a.py\n"))
         self.assertTrue(out.startswith("SANDBOX-ERROR: patch(1) unavailable"), out)
+
+    def test_rc_126_also_triggers_python_fallback(self):
+        env = self._env([("patch", (126, "OCI runtime exec failed: executable file not found in $PATH")),
+                         (PF.PATCH_SCRIPT_NAME, (0, "patching file a.py\n"))])
+        out = asyncio.run(env.apply_patch("--- a/a.py\n+++ b/a.py\n"))
+        self.assertTrue(out.startswith("exit=0"), out)
 
 
 if __name__ == "__main__":

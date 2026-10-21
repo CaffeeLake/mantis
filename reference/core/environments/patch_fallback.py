@@ -45,7 +45,12 @@ import re
 import sys
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+LINE_RE = re.compile(r"[^\n]*\n|[^\n]+")
 MAX_DRIFT = 200
+
+
+def split_lf(text):
+    return LINE_RE.findall(text) if text else []
 
 
 def strip_path(path, strip):
@@ -55,12 +60,15 @@ def strip_path(path, strip):
     parts = path.split("/")
     if strip and len(parts) > strip:
         parts = parts[strip:]
-    return "/".join(parts)
+    rel = "/".join(p for p in parts if p and p != ".")
+    if not rel or path.startswith("/") or ".." in parts:
+        raise SystemExit("refusing unsafe patch path: %s" % path)
+    return rel
 
 
 def parse(diff_text):
     """Yields (old_path, new_path, hunks); a hunk is a list of (tag, line)."""
-    lines = diff_text.splitlines(True)
+    lines = split_lf(diff_text)
     i, n = 0, len(lines)
     files = []
     while i < n:
@@ -115,20 +123,22 @@ def parse(diff_text):
 
 def apply_hunks(file_lines, hunks, path):
     offset = 0
+    min_pos = 0
     out = list(file_lines)
     for old_start, body in hunks:
         old = [t for tag, t in body if tag in " -"]
         new = [t for tag, t in body if tag in " +"]
-        want = old_start - 1 + offset
-        if old_start == 0:
-            want = 0
         found = None
         if not old:
-            found = min(max(want, 0), len(out))
+            want = 0 if old_start == 0 else old_start + offset
+            found = min(max(want, min_pos), len(out))
         else:
+            want = old_start - 1 + offset
+            if old_start == 0:
+                want = 0
             for drift in range(0, MAX_DRIFT + 1):
                 for cand in (want - drift, want + drift) if drift else (want,):
-                    if 0 <= cand <= len(out) - len(old) and out[cand:cand + len(old)] == old:
+                    if max(0, min_pos) <= cand <= len(out) - len(old) and out[cand:cand + len(old)] == old:
                         found = cand
                         break
                 if found is not None:
@@ -137,7 +147,11 @@ def apply_hunks(file_lines, hunks, path):
             raise SystemExit("Hunk FAILED for %s at line %d (context not found within %d lines)."
                              % (path, old_start, MAX_DRIFT))
         out[found:found + len(old)] = new
-        offset += len(new) - len(old)
+        if old:
+            offset = (found - (old_start - 1)) + len(new) - len(old)
+        else:
+            offset += len(new)
+        min_pos = found + len(new)
     return out
 
 
@@ -182,8 +196,11 @@ def main(argv):
                 sys.stderr.write("can't find file to patch: %s\n" % old_path)
                 return 1
             with open(old_path, "r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-                current = fh.read().splitlines(True)
+                current = split_lf(fh.read())
         if new_path is None:
+            rem = apply_hunks(current, hunks, target)
+            if rem:
+                raise SystemExit("Not deleting file %s as content differs from patch." % old_path)
             planned.append(("delete", old_path, None))
             continue
         updated = apply_hunks(current, hunks, target)
@@ -195,8 +212,8 @@ def main(argv):
             sys.stdout.write("removing file %s\n" % path)
             continue
         parent = os.path.dirname(path)
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
             fh.write("".join(content))
         sys.stdout.write("patching file %s\n" % path)

@@ -302,7 +302,7 @@ class GvisorEnvironment(BaseEnvironment):
                 [self.tool, "exec", "-i", self.container_name, "patch", "--batch", "--force", "-p1"],
                 stdin=diff,
             )
-            if rc == 127:
+            if rc in (126, 127) or "executable file not found" in out.lower():
                 return None  # no patch(1): the caller runs the python3 fallback
             if rc != 0:
                 rc_retry, out_retry = self._run_cmd(
@@ -329,7 +329,7 @@ class GvisorEnvironment(BaseEnvironment):
         def _fallback():
             # The container was created with -w <workdir>, so exec runs there.
             rc, out = self._run_cmd([self.tool, "exec", self.container_name, *fallback_argv(strip=1)])
-            if rc == 127:
+            if rc in (126, 127) or "executable file not found" in out.lower():
                 return unavailable_message(self.image, out)
             if rc != 0:
                 rc0, out0 = self._run_cmd([self.tool, "exec", self.container_name, *fallback_argv(strip=0)])

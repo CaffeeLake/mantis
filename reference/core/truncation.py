@@ -140,12 +140,14 @@ def bound_fenced_text(text: str, limit: int, what: str = "tool output") -> str:
         return text
 
     try:
-        from core.llm_gateway import UNTRUSTED_DATA_END
+        from core.llm_gateway import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START_PREFIX
     except Exception:  # pragma: no cover - gateway unavailable in minimal environments
         UNTRUSTED_DATA_END = "<<<UNTRUSTED_SOURCE_CODE_DATA_END>>>"
+        UNTRUSTED_DATA_START_PREFIX = "<<<UNTRUSTED_SOURCE_CODE_DATA_START"
 
+    start_at = text.find(UNTRUSTED_DATA_START_PREFIX)
     end_at = text.rfind(UNTRUSTED_DATA_END)
-    if end_at < 0:
+    if start_at < 0 or end_at < 0 or end_at < start_at:
         return text[:limit_i] + "\n" + truncation_marker(what, limit_i, total)
 
     fenced = text[:end_at]

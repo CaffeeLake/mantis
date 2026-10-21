@@ -338,6 +338,14 @@ async def run_sandbox_with_evidence(
     sink_symbol: str = "",
 ) -> Dict[str, Any]:
     """Executes a sandbox command and evaluates reached-sink evidence deterministically."""
+    if sentinel_path:
+        ctx_pre = current_run_context.get()
+        if ctx_pre and ctx_pre.sandbox:
+            try:
+                await ctx_pre.sandbox.write_file(Path(sentinel_path), "")
+            except Exception:
+                pass
+
     raw_res = await run_sandbox(command)
     exit_code = 0
     output = raw_res

@@ -76,8 +76,14 @@ def event_transcript_rows(event: Any, *, node: str = "",
             if resp is not None:
                 payload = getattr(resp, "response", None)
                 if isinstance(payload, dict):
-                    inner = payload.get("result", payload.get("response", payload.get("output")))
-                    payload = inner if isinstance(inner, str) else json.dumps(payload, default=str)
+                    if "evidence_present" in payload and isinstance(payload.get("output"), str):
+                        payload = (
+                            f"[evidence_present={payload.get('evidence_present')} "
+                            f"reason={payload.get('evidence_reason', '')}]\n{payload['output']}"
+                        )
+                    else:
+                        inner = payload.get("result", payload.get("response", payload.get("output")))
+                        payload = inner if isinstance(inner, str) else json.dumps(payload, default=str)
                 rows.append({**base, "type": "tool_response", "name": str(getattr(resp, "name", "")),
                              "response": clip(payload, payload_limit)})
     except Exception:  # pragma: no cover - transcripts must never sink a run
@@ -93,8 +99,11 @@ class TranscriptWriter:
         self._fh = None
         self.rows = 0
         if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = self.path.open("a", encoding="utf-8")
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._fh = self.path.open("a", encoding="utf-8")
+            except OSError:
+                self._fh = None
 
     def write(self, rows: List[Dict[str, Any]]) -> None:
         if self._fh is None or not rows:

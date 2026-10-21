@@ -152,6 +152,16 @@ class AfterToolBoundTest(unittest.TestCase):
         self.assertIn("get_summary output cut by the harness", out["result"])
         self.assertLessEqual(len(out["result"]), 272_000 + 400)
 
+        ev_out = guard(
+            _Tool("run_sandbox_with_evidence"),
+            {},
+            None,
+            {"raw": summary, "output": summary, "exit_code": 0, "evidence_present": False, "evidence_reason": "EVIDENCE_ABSENT"},
+        )
+        self.assertIsInstance(ev_out, dict)
+        self.assertLessEqual(len(ev_out["output"]), 272_000 + 400)
+        self.assertLessEqual(len(ev_out["raw"]), 272_000 + 400)
+
     def test_small_responses_pass_through_untouched(self):
         guard = self._guard()
         self.assertIsNone(guard(_Tool("read_file"), {"filepath": "a.py", "start_line": 1, "end_line": 5}, None, "small"))

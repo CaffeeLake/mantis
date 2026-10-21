@@ -378,7 +378,7 @@ def _r_ssrf(n: _Names, hops: int, safe: bool, rng: random.Random) -> Rendered:
             "    parsed = urllib.parse.urlparse(url)\n"
             "    if parsed.scheme != \"https\" or parsed.hostname not in ALLOWED_HOSTS:\n"
             "        raise ValueError(\"host not allowed\")\n"
-            "    return requests.get(url, timeout=5).text[:4096]\n"
+            "    return requests.get(url, timeout=5, allow_redirects=False).text[:4096]\n"
         )
     else:
         sink = (
@@ -409,7 +409,7 @@ def _r_redirect(n: _Names, hops: int, safe: bool, rng: random.Random) -> Rendere
             "import urllib.parse\n\n\n"
             f"def {n.fn}(target):\n"
             "    parsed = urllib.parse.urlparse(target)\n"
-            "    if parsed.scheme or parsed.netloc or not target.startswith('/'):\n"
+            "    if parsed.scheme or parsed.netloc or not target.startswith('/') or target.startswith(('//', '/\\\\')):\n"
             "        return '/'\n"
             "    return target\n\n\n"
             f'@{n.blueprint}.route("{n.route}")\n'
@@ -628,8 +628,8 @@ BUG_CLASSES: Dict[str, BugClass] = {
     "weak_hash": BugClass("weak_hash", "CWE-328", ["md5", "sha1", "weak hash", "cwe-328", "cwe-327", "unsalted"], _r_weakhash),
     "hardcoded_secret": BugClass("hardcoded_secret", "CWE-798", ["hardcoded", "hard-coded", "cwe-798", "api key", "secret in source"], _r_secret, dead_ok=False, vendor_ok=False),
     "weak_random": BugClass("weak_random", "CWE-330", ["weak random", "insufficiently random", "cwe-330", "cwe-338", "random.choice", "predictable token"], _r_weakrandom, dead_ok=False),
-    "eval_injection": BugClass("eval_injection", "CWE-95", ["eval", "code injection", "cwe-95", "cwe-94", "arbitrary code"], _r_eval),
-    "xss": BugClass("xss", "CWE-79", ["xss", "cross-site scripting", "cross site scripting", "cwe-79", "html injection"], _r_xss, dead_ok=False),
+    "eval_injection": BugClass("eval_injection", "CWE-95", ["eval(", "eval (", "dynamic eval", "unsafe eval", "code injection", "cwe-95", "cwe-94", "arbitrary code"], _r_eval),
+    "xss": BugClass("xss", "CWE-79", ["xss", "cross-site scripting", "cross site scripting", "cwe-79", "html injection", "ssti", "template injection", "cwe-1336", "cwe-94"], _r_xss, dead_ok=False),
 }
 
 
@@ -714,6 +714,9 @@ _BENIGN_FUNCS = [
         "            oldest = next(iter(self._data))\n"
         "            del self._data[oldest]\n"
         "        self._data[key] = value\n"
+        "\n\n"
+        "def {name}(*args, **kwargs):\n"
+        "    return {Name}Cache()\n"
     ),
 ]
 
@@ -768,12 +771,12 @@ def plan(seed: int, size: str = "medium", skin: Optional[str] = None) -> TargetS
     skins = list(SKINS)
     if skin is None:
         dev_skins = [k for k in skins if k not in HOLDOUT_ONLY_SKINS]
-        skin = dev_skins[0] if split == "dev" else rng.choice(skins)
+        skin = dev_skins[0] if split != "holdout" else rng.choice(skins)
     if skin not in SKINS:
         raise ValueError(f"unknown skin {skin!r}; known: {sorted(SKINS)}")
-    if split == "dev" and skin in HOLDOUT_ONLY_SKINS:
-        raise HoldoutViolation(f"skin {skin!r} is holdout-only and may not be generated for dev seed {seed}")
-    classes = [c for c in BUG_CLASSES if split != "dev" or c not in HOLDOUT_ONLY_CLASSES]
+    if split != "holdout" and skin in HOLDOUT_ONLY_SKINS:
+        raise HoldoutViolation(f"skin {skin!r} is holdout-only and may not be generated for non-holdout seed {seed}")
+    classes = [c for c in BUG_CLASSES if split == "holdout" or c not in HOLDOUT_ONLY_CLASSES]
     if split == "holdout":
         # Every holdout target carries at least one holdout-only class.
         must = sorted(HOLDOUT_ONLY_CLASSES)

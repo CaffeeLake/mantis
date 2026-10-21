@@ -64,7 +64,7 @@ STAGE_CONFIGS = {
     },
     'reproducer': {
         'skill': 'mantis-reproduce',
-        'tools': ['run_sandbox', 'get_findings', 'get_threat_model', 'read_file', 'write_file'],
+        'tools': ['run_sandbox', 'run_sandbox_with_evidence', 'get_findings', 'get_threat_model', 'read_file', 'write_file', 'get_function_boundary', 'find_callers'],
         'instruction': 'You are the reproducer stage in the Mantis review pipeline. Execute exploit PoCs in the sandbox. Return ReproVerdict with route="success" if the exploit triggers, or route="failed_repro" if not.'
     },
     'patcher': {
@@ -108,18 +108,14 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
             instruction = f"{instruction}\n\n[SKILL GUIDANCE]\n{skill_obj.instructions[:1000]}"
 
     output_schema = STAGE_OUTPUT_SCHEMAS.get(stage_name)
-    after_tool_cb = None
-    if "read_file" in tool_names and (
-        "get_function_boundary" in tool_names or "find_symbol" in tool_names
-    ):
-        from core.graph_loader import _make_after_tool_guard_callback
+    from core.graph_loader import LiteralInstruction, _make_after_tool_guard_callback
 
-        after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names)
+    after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names, model=model_id)
 
     return Agent(
         name=stage_name,
         model=LiteLlm(**llm_kwargs),
-        instruction=instruction,
+        instruction=LiteralInstruction(instruction),
         tools=tools_list,
         output_schema=output_schema,
         after_tool_callback=after_tool_cb,

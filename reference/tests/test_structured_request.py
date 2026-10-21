@@ -80,6 +80,16 @@ class StructuredRequestTest(unittest.TestCase):
                       "inferred_exposure", "reasoning", "executive_summary"):
             self.assertIn(field, props)
 
+    def test_sanitizer_preserves_non_verdict_text_for_calibrator_fallback(self):
+        from google.adk.models.llm_response import LlmResponse
+        from core.config import ResilientLiteLlm
+
+        llm = ResilientLiteLlm(model="vertex_ai/gemini-3.8-flash")
+        prose = "After reviewing the sink, Final Score: 7.5"
+        resp = LlmResponse(content=types.Content(role="model", parts=[types.Part.from_text(text=prose)]))
+        out = llm._sanitize_structured_response(resp, FindingCalibration)
+        self.assertEqual(out.content.parts[0].text, prose)
+
 
 if __name__ == "__main__":
     unittest.main()

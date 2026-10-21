@@ -253,10 +253,10 @@ def evaluate_gate(cells: Iterable[Dict[str, Any]], baseline: str, candidate: str
     base_v = validity_summary(cells, baseline)
     cand_v = validity_summary(cells, candidate)
 
-    c1_recall = ci["n"] > 0 and ci["lo"] > 0
-    c1_eff = (ci["n"] > 0 and ci["lo"] <= 0 <= ci["hi"]
-              and eff_ci["n"] > 0 and eff_ci["mean"] >= GATE_EFFICIENCY_IMPROVEMENT and eff_ci["lo"] > 0)
-    c2 = ci["n"] > 0 and ci["mean"] > 2 * floor["floor"]
+    c1_recall = ci["n"] >= 2 and ci["lo"] > 0
+    c1_eff = (ci["n"] >= 2 and ci["lo"] <= 0 <= ci["hi"]
+              and eff_ci["n"] >= 2 and eff_ci["mean"] >= GATE_EFFICIENCY_IMPROVEMENT and eff_ci["lo"] > 0)
+    c2 = ci["n"] >= 2 and floor["n_targets"] >= 1 and ci["mean"] > 2 * floor["floor"]
     worst = min(deltas.values()) if deltas else 0.0
     c3 = bool(deltas) and worst >= GATE_WORST_TARGET_FLOOR
     c4_decoy = cand_v["mean_decoy_fp_rate"] <= base_v["mean_decoy_fp_rate"] + GATE_DECOY_FP_TOLERANCE

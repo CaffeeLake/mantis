@@ -678,6 +678,8 @@ async def eval_researcher(
     gt_path = target_dir / GROUND_TRUTH_BASENAME
     gt_entries = load_research_ground_truth(gt_path)
     gt_version = ground_truth_version(gt_path)
+    model_id = model_id or os.environ.get("EVAL_MODEL", "vertex_ai/gemini-3.8-flash")
+    effort = effort or os.environ.get("EVAL_REASONING_EFFORT", "low")
     tool_names = resolve_toolset(toolset)
     prompt_text = prompt_override or RESEARCH_PROMPT
     fingerprint = config_fingerprint(model_id, effort, tool_names, prompt_text, gt_version)
@@ -736,12 +738,17 @@ async def eval_researcher(
                 try:
                     async for event in agen:
                         tokens += extract_event_tokens(event)
-                        tool_calls += count_event_tool_calls(event)
+                        call_count = count_event_tool_calls(event)
+                        tool_calls += call_count
                         pseudo_calls = pseudo_calls or event_has_pseudo_tool_call(event)
                         telemetry.observe(event, tokens)
                         if transcript_path is not None:
                             transcript.extend(event_transcript_rows(event))
-                        if cap_exceeded(tokens, tool_calls, max_tokens, max_tool_calls):
+                        # Let the Nth function_call event execute its tool before
+                        # breaking on its function_response (unless already past N
+                        # or over the token budget).
+                        effective_calls = tool_calls - call_count if call_count and tool_calls == max_tool_calls else tool_calls
+                        if cap_exceeded(tokens, effective_calls, max_tokens, max_tool_calls):
                             cap_hit = True
                             break
                 finally:
@@ -779,6 +786,16 @@ async def eval_researcher(
 
         findings = read_findings(db_path)
         result = score_research_findings(findings, gt_entries)
+        if transcript_path is not None:
+            try:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                transcript_path.write_text(
+                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in transcript),
+                    encoding="utf-8",
+                )
+                result["transcript_path"] = str(transcript_path)
+            except OSError as exc:
+                run_errors.append(f"transcript write failed: {exc}")
         graded = not run_errors
         # The full records ride along for human adjudication: the eval
         # database is deleted with the temp dir, and transcript payloads
@@ -811,16 +828,6 @@ async def eval_researcher(
                 "telemetry": telemetry.as_dict(),
             }
         )
-        if transcript_path is not None:
-            try:
-                transcript_path.parent.mkdir(parents=True, exist_ok=True)
-                transcript_path.write_text(
-                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in transcript),
-                    encoding="utf-8",
-                )
-                result["transcript_path"] = str(transcript_path)
-            except OSError as exc:
-                run_errors.append(f"transcript write failed: {exc}")
         return result
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

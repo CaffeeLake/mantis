@@ -253,6 +253,16 @@ class StatisticsTest(unittest.TestCase):
         self.assertIn("A/A noise floor", text)
         self.assertIn("union:", text)
 
+    def test_gate_refuses_single_target_or_unrepeated_sweep(self):
+        one_seed = [
+            _cell("baseline", 1, 0, 0.5, ("a", "b")),
+            _cell("structural", 1, 0, 0.75, ("a", "b", "c")),
+        ]
+        gate = compare.evaluate_gate(one_seed, "baseline", "structural", n_boot=100)
+        self.assertEqual(gate["verdict"], "FAIL")
+        self.assertFalse(gate["criteria"]["1_recall_ci_above_zero_or_efficiency_win"]["pass"])
+        self.assertFalse(gate["criteria"]["2_clears_twice_aa_noise_floor"]["pass"])
+
 
 if __name__ == "__main__":
     unittest.main()

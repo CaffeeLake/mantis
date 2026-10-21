@@ -86,6 +86,12 @@ class SweepConfig:
     confirm_holdout: bool = False
     prompt_override: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if not self.model:
+            self.model = os.environ.get("EVAL_MODEL", "vertex_ai/gemini-3.8-flash")
+        if not self.effort:
+            self.effort = os.environ.get("EVAL_REASONING_EFFORT", "low")
+
     def identity(self) -> Dict[str, Any]:
         """The fields two sweeps must share to be the same measurement."""
         return {
@@ -336,6 +342,9 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
                     arm_label=c.arm,
                 )
             except Exception as exc:  # the eval swallows non-auth errors itself; this is a crash in the harness
+                from core.config import is_auth_error
+                if is_auth_error(exc):
+                    raise
                 result = {"graded": False, "status": "ungraded", "run_errors": [f"sweep: {exc!r}"[:300]],
                           "recall": 0.0, "precision": 0.0, "total_tokens": 0}
             result.setdefault("wall_seconds", round(time.time() - started, 1))

@@ -156,7 +156,10 @@ def make_context_tools(context_root: Path, surface_ok: Callable[[str], bool], to
             if remaining <= 0:
                 return (f"read budget exhausted: this session has read {served['served']:,} characters, the limit. "
                         "Decide from what you have read; no further file content will be served.")
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_text = p.read_text(encoding="utf-8", errors="replace")
+            if raw_text.endswith("\n"):
+                raw_text = raw_text[:-1]
+            lines = raw_text.split("\n") if raw_text else []
             lo = max(1, int(start_line or 1))
             hi = int(end_line) if end_line else len(lines)
             body = "\n".join(f"{i}: {ln}" for i, ln in enumerate(lines[lo - 1:hi], lo))
@@ -345,7 +348,7 @@ class MantisProposer:
         spec_path = Path(context_root).parent / f"session-{label}.json"
         spec_path.write_text(json.dumps(spec), encoding="utf-8")
         cmd = [sys.executable, "-m", "evals.evolve.proposer", "--session", str(spec_path)]
-        budget = (timeout + SESSION_UNWIND_GRACE_SECONDS) if timeout else None
+        budget = (timeout + 2 * SESSION_UNWIND_GRACE_SECONDS) if timeout else None
         env = dict(os.environ)
         # A proposer's empty turn is not transient: it is a writing turn the
         # provider returned empty (observed: finish_reason CONTINUATION on a
@@ -354,10 +357,33 @@ class MantisProposer:
         # session ends and the stage falls back; the pipeline's own default
         # (six) stays for the pipeline.
         env.setdefault("MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS", str(PROPOSER_EMPTY_TURN_MAX_ATTEMPTS))
+        harness_root = Path(context_root) / "harness"
+        before_snap = {
+            str(p.relative_to(harness_root)): p.read_bytes()
+            for p in harness_root.rglob("*") if p.is_file()
+        } if harness_root.is_dir() else {}
+
+        def _harvest_changed() -> List[str]:
+            if not harness_root.is_dir():
+                return []
+            after_snap = {
+                str(p.relative_to(harness_root)): p.read_bytes()
+                for p in harness_root.rglob("*") if p.is_file()
+            }
+            changed = [rel for rel, b in after_snap.items() if before_snap.get(rel) != b]
+            deleted = [rel for rel in before_snap if rel not in after_snap]
+            return sorted(set(changed) | set(deleted))
+
         try:
             proc = subprocess.run(cmd, cwd=str(_REFERENCE_ROOT), stdout=subprocess.PIPE, stderr=None,
                                   text=True, timeout=budget, check=False, env=env)
         except subprocess.TimeoutExpired as exc:
+            salvaged = _harvest_changed()
+            if salvaged:
+                touched.extend(salvaged)
+                print(f"[proposer {label}] session exceeded {timeout}s; salvaged {len(salvaged)} edited file(s)",
+                      file=sys.stderr, flush=True)
+                return {"text": "", "touched": salvaged, "steps": 0, "tokens": 0}
             print(f"[proposer {label}] session exceeded {timeout}s; killed", file=sys.stderr, flush=True)
             raise TimeoutError(f"proposer session {label} exceeded {timeout}s and was killed") from exc
         last = ""
@@ -365,6 +391,12 @@ class MantisProposer:
             if line.startswith("{") and line.rstrip().endswith("}"):
                 last = line
         if proc.returncode != 0 or not last:
+            salvaged = _harvest_changed()
+            if salvaged:
+                touched.extend(salvaged)
+                print(f"[proposer {label}] session exited {proc.returncode}; salvaged {len(salvaged)} edited file(s)",
+                      file=sys.stderr, flush=True)
+                return {"text": "", "touched": salvaged, "steps": 0, "tokens": 0}
             raise RuntimeError(f"proposer session {label} failed (exit {proc.returncode}); see the log above")
         out = json.loads(last)
         touched.extend(str(p) for p in out.get("touched") or [])
@@ -436,7 +468,13 @@ def run_session_inproc(spec: Dict[str, Any]) -> Dict[str, Any]:
                         f"read={budget.get('served', 0):,} chars touched={len(touched)}")
         return out
 
-    return run_bounded(_run, timeout=timeout, label=label)
+    try:
+        return run_bounded(_run, timeout=timeout, label=label)
+    except TimeoutError:
+        if touched:
+            _log(label, t0, f"session timed out after writing {len(touched)} file(s); preserving partial edits")
+            return {"text": "", "steps": 0, "touched": list(touched), "read_chars": int(budget.get("served", 0)), "tokens": 0}
+        raise
 
 
 def _session_main(argv: List[str]) -> int:

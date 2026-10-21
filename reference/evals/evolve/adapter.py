@@ -233,7 +233,7 @@ def render_trajectory(events: Sequence[Dict[str, Any]], obs_trunc: int) -> str:
         node = f" ({ev.get('node')})" if ev.get("node") else ""
         kind = ev.get("type")
         if kind == "node":
-            lines.append(f"[STAGE]{node} entered" + (f" via route {ev['route']}" if ev.get("route") else ""))
+            lines.append(f"[STAGE {i}]{node} entered" + (f" via route {ev['route']}" if ev.get("route") else ""))
         elif kind == "tool_call":
             lines.append(f"[ACTION {i}]{node} {ev.get('name')} {truncate_with_marker(str(ev.get('args') or ''), obs_trunc, 'tool arguments')}")
         elif kind == "tool_response":
@@ -266,7 +266,8 @@ def _is_whole_file_read(args: Any) -> bool:
 # the stage those tools depend on because the call counts looked like use.
 _UNPRODUCTIVE_RESPONSE_RE = re.compile(
     r"^\s*(?:ERROR\b|Error\b|SANDBOX-ERROR|SANDBOX-UNAVAILABLE|FATAL|refused\b|NO_DATA\b|"
-    r"Structural index unavailable|no such file|not found\b|Unknown tool|Tool .* not found)",
+    r"Structural index unavailable|no such file|not found\b|Unknown tool|Tool .* not found|"
+    r'\{\s*"error"\s*:)',
     re.IGNORECASE,
 )
 
@@ -333,7 +334,7 @@ def render_digest(events: Sequence[Dict[str, Any]], body: str = "") -> str:
     if body:
         first_idx = {st["first_event"]: name for name, st in per_stage.items() if st["first_event"] is not None}
         for line_no, line in enumerate(body.split("\n"), 1):
-            m = re.match(r"\[(?:ACTION|OBSERVATION|ERROR|MESSAGE) (\d+)\]", line)
+            m = re.match(r"\[(?:STAGE|ACTION|OBSERVATION|ERROR|MESSAGE) (\d+)\]", line)
             if m:
                 name = first_idx.get(int(m.group(1)))
                 if name and name not in starts:
@@ -730,7 +731,7 @@ class MantisEvalAdapter(MantisAdapterBase):
             self._gen.write_target(full, seed, self._size)
             # The pipeline must never see the answer key: copy without it.
             from evals.research_eval import GROUND_TRUTH_BASENAME
-            shutil.copytree(full, jail, ignore=shutil.ignore_patterns(GROUND_TRUTH_BASENAME, "__pycache__"))
+            shutil.copytree(full, jail, dirs_exist_ok=True, ignore=shutil.ignore_patterns(GROUND_TRUTH_BASENAME, "__pycache__"))
         return jail
 
     def ground_truth_path(self, task_id: str) -> Path:
