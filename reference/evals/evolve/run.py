@@ -148,7 +148,7 @@ def evolve_task(task_id: str, *, adapter, proposer, selector, work_dir: Path, k:
         "diff": hsurface.diff_summary(base_tree, chosen_tree),
         "unified_diff": unified_diff(base_tree, chosen_tree),
         "cost": rollouts_per_iteration(k),
-        "warnings": _warnings(result, sel, kept_base),
+        "warnings": _warnings(result, sel, kept_base, proposer=proposer),
         "at": time.time(),
     }
     if sel.ok and not kept_base:
@@ -169,11 +169,20 @@ def _trees_equal(surface, a: Dict[str, str], b: Dict[str, str]) -> bool:
     return not (d["added"] or d["removed"] or d["modified"])
 
 
-def _warnings(result, sel, kept_base: bool) -> List[str]:
+def _warnings(result, sel, kept_base: bool, proposer=None) -> List[str]:
     out: List[str] = []
     fell = [s.label for s in result.stages if s.fell_back]
     if fell:
         out.append(f"stages fell back to the inherited harness after an invalid proposal: {fell}")
+    # A session that died after writing files leaves edits with no rationale;
+    # the reply text says so (proposer.salvage_note) and the record repeats it
+    # where the person deciding on `adopt --yes` will see it.
+    from evals.evolve.proposer import SALVAGED_MARKER
+    salvaged = sorted({getattr(r, "label", "?") for r in (getattr(proposer, "_calls", None) or [])
+                       if SALVAGED_MARKER in str(getattr(r, "text", "") or "")})
+    if salvaged:
+        out.append(f"partial proposals salvaged from sessions that ended early, with no rationale recorded: {salvaged}; "
+                   "read those edits in the diff with extra care")
     if kept_base:
         out.append("the adopted harness equals the base: the proposer found nothing the evidence supported (KEEP_BASE)")
     if not sel.ok:

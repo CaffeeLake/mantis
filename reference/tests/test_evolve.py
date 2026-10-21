@@ -627,6 +627,53 @@ class ProposerTest(unittest.TestCase):
                 self.assertLess(time.time() - t0, 5, "the child was killed, not waited for")
                 self.assertIn("killed", str(cm.exception))
 
+    def test_a_salvaged_partial_proposal_says_so_in_its_reply_and_in_the_warnings(self):
+        import evals.evolve.proposer as P
+        from evals.evolve import run as ev_run
+        load_harness2()
+        from harness2.core.spec import ChannelSpec
+        note = P.salvage_note("inv1.a1", 3, "exceeded 60s")
+        self.assertTrue(note.startswith("<notes>"))
+        self.assertIn(P.SALVAGED_MARKER, note)
+        self.assertIn("3 file(s)", note)
+        self.assertIn("no rationale", note)
+
+        # The subprocess launcher: a child that writes a file and then hangs is killed and salvaged, with the note.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Path(tmp) / "context"; (ctx / "harness" / "prompts").mkdir(parents=True)
+            (ctx / "harness" / "prompts" / "researcher.md").write_text("base\n")
+            prop = MantisProposer(ChannelSpec("opencode", "m"), surface_workflow={"nodes": []})
+            fake_child = Path(tmp) / "child.py"
+            fake_child.write_text(
+                "import json, sys, time, pathlib\n"
+                "spec = json.load(open(sys.argv[sys.argv.index('--session') + 1]))\n"
+                "root = pathlib.Path(spec['context_root']) / 'harness' / 'prompts'\n"
+                "(root / 'researcher.md').write_text('edited\\n')\n"
+                "time.sleep(30)\n")
+            real_run = P.subprocess.run
+            with unittest.mock.patch.object(P.subprocess, "run",
+                                            side_effect=lambda cmd, **kw: real_run([cmd[0], str(fake_child), *cmd[3:]], **kw)), \
+                    unittest.mock.patch.object(P, "SESSION_UNWIND_GRACE_SECONDS", 0.2):
+                touched = []
+                out = prop._run_session_subprocess(mission="m", system="s", context_root=ctx, touched=touched,
+                                                   label="inv1.a1", timeout=1, read_only=False)
+            self.assertTrue(out.get("salvaged"))
+            self.assertEqual(touched, ["prompts/researcher.md"])
+            self.assertIn(P.SALVAGED_MARKER, out["text"])
+
+        # And the driver surfaces it next to the other warnings.
+        class _Reply:  # the shape _warnings reads from proposer._calls
+            def __init__(self, label, text): self.label, self.text = label, text
+        class _Prop:
+            _calls = [_Reply("dom1.a1", "<notes>fine</notes>"), _Reply("inv1.a1", note)]
+        class _Res:
+            stages = []; k = 1
+        class _Sel:
+            ok = True; error = ""
+        warns = ev_run._warnings(_Res(), _Sel(), False, proposer=_Prop())
+        self.assertTrue(any("salvaged" in w and "['inv1.a1']" in w for w in warns), warns)
+        self.assertFalse(any("dom1" in w for w in warns))
+
     def test_the_session_entry_point_reports_a_failed_session_without_a_traceback(self):
         import evals.evolve.proposer as P
         with tempfile.TemporaryDirectory() as tmp:

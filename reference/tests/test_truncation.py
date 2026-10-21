@@ -418,15 +418,62 @@ class EvidenceCheckerTruncationTest(unittest.TestCase):
 
 
 class _FakeSandbox:
-    def __init__(self, stdout: str, stderr: str = "", exit_code: int = 0):
+    def __init__(self, stdout: str, stderr: str = "", exit_code: int = 0, files=None):
         from google.adk.environment import ExecutionResult
         self._res = ExecutionResult(stdout=stdout, stderr=stderr, exit_code=exit_code, timed_out=False)
+        self.files = dict(files or {})   # guest path -> bytes
+        self.writes = []
 
     async def execute(self, command):
         return self._res
 
     async def read_file(self, path):
+        key = str(path)
+        if key in self.files:
+            return self.files[key]
         raise FileNotFoundError(path)
+
+    async def write_file(self, path, content):
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        self.files[str(path)] = data
+        self.writes.append((str(path), data))
+
+
+class StaleSentinelTest(unittest.IsolatedAsyncioTestCase):
+    """A sentinel left by an earlier attempt must not satisfy this one -- and clearing it
+    must not become a way to blank whatever file the model names."""
+
+    def _ctx(self, sandbox):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_sentinel_")
+        ctx = RunContext(jail_dir=self.tmp, db_path=str(Path(self.tmp) / "k.db"), target_file="", run_id="s")
+        ctx.sandbox = sandbox
+        ctx.active_node = "reproducer"
+        tok = current_run_context.set(ctx)
+        self.addCleanup(current_run_context.reset, tok)
+        return ctx
+
+    async def test_a_stale_sentinel_is_cleared_before_the_run(self):
+        sb = _FakeSandbox(stdout="exit=1\npayload rejected\n", files={"sentinel_7": b"MANTIS_REACHED_ENTRYPOINT\n"})
+        self._ctx(sb)
+        res = await sandbox_tools.run_sandbox_with_evidence("python3 poc.py", sentinel_path="sentinel_7", sink_symbol="sink")
+        self.assertFalse(res["evidence_present"], "last attempt's sentinel did not prove this attempt")
+        self.assertEqual(sb.writes, [("sentinel_7", b"")])
+
+    async def test_a_file_that_is_not_a_sentinel_is_left_alone(self):
+        app = b"from flask import Flask\napp = Flask(__name__)\n"
+        sb = _FakeSandbox(stdout="exit=0\nok\n", files={"app.py": app})
+        self._ctx(sb)
+        res = await sandbox_tools.run_sandbox_with_evidence("python3 poc.py", sentinel_path="app.py", sink_symbol="sink")
+        self.assertEqual(sb.writes, [], "a model-named path that is not a stale sentinel is never written")
+        self.assertEqual(sb.files["app.py"], app)
+        self.assertFalse(res["evidence_present"])
+
+    async def test_a_missing_sentinel_path_is_fine(self):
+        sb = _FakeSandbox(stdout="exit=0\nMANTIS_REACHED_ENTRYPOINT\n")
+        self._ctx(sb)
+        res = await sandbox_tools.run_sandbox_with_evidence("python3 poc.py", sentinel_path="sentinel_9", sink_symbol="sink")
+        self.assertEqual(sb.writes, [])
+        self.assertTrue(res["evidence_present"], "the token in the trace still counts")
 
 
 class RunSandboxWithEvidenceTruncationTest(unittest.IsolatedAsyncioTestCase):

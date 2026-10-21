@@ -383,7 +383,8 @@ class MantisProposer:
                 touched.extend(salvaged)
                 print(f"[proposer {label}] session exceeded {timeout}s; salvaged {len(salvaged)} edited file(s)",
                       file=sys.stderr, flush=True)
-                return {"text": "", "touched": salvaged, "steps": 0, "tokens": 0}
+                return {"text": salvage_note(label, len(salvaged), f"exceeded {timeout}s"), "touched": salvaged,
+                        "steps": 0, "tokens": 0, "salvaged": True}
             print(f"[proposer {label}] session exceeded {timeout}s; killed", file=sys.stderr, flush=True)
             raise TimeoutError(f"proposer session {label} exceeded {timeout}s and was killed") from exc
         last = ""
@@ -396,7 +397,8 @@ class MantisProposer:
                 touched.extend(salvaged)
                 print(f"[proposer {label}] session exited {proc.returncode}; salvaged {len(salvaged)} edited file(s)",
                       file=sys.stderr, flush=True)
-                return {"text": "", "touched": salvaged, "steps": 0, "tokens": 0}
+                return {"text": salvage_note(label, len(salvaged), f"exited {proc.returncode}"), "touched": salvaged,
+                        "steps": 0, "tokens": 0, "salvaged": True}
             raise RuntimeError(f"proposer session {label} failed (exit {proc.returncode}); see the log above")
         out = json.loads(last)
         touched.extend(str(p) for p in out.get("touched") or [])
@@ -473,7 +475,8 @@ def run_session_inproc(spec: Dict[str, Any]) -> Dict[str, Any]:
     except TimeoutError:
         if touched:
             _log(label, t0, f"session timed out after writing {len(touched)} file(s); preserving partial edits")
-            return {"text": "", "steps": 0, "touched": list(touched), "read_chars": int(budget.get("served", 0)), "tokens": 0}
+            return {"text": salvage_note(label, len(touched), f"timed out after {timeout}s"), "steps": 0,
+                    "touched": list(touched), "read_chars": int(budget.get("served", 0)), "tokens": 0, "salvaged": True}
         raise
 
 
@@ -491,6 +494,23 @@ def _session_main(argv: List[str]) -> int:
         return 1
     print(json.dumps(out, default=str), flush=True)
     return 0
+
+
+SALVAGED_MARKER = "[SALVAGED PARTIAL PROPOSAL]"
+
+
+def salvage_note(label: str, n_files: int, how: str) -> str:
+    """The reply text for a session that ended before it could explain itself.
+
+    A session that wrote files and then died (timed out, crashed, was cut off)
+    leaves a proposal with no <notes>. The files are each complete -- writes
+    are per file -- but the set is partial and the rationale is missing, so
+    the reply says so, where the aggregator, the audit and adoption.json all
+    read it, instead of an empty string that reads as "nothing to say".
+    """
+    return (f"<notes>\n{SALVAGED_MARKER} session {label} {how} after editing {n_files} file(s); "
+            "no rationale was recorded. Treat these edits as unexplained: keep one only if the "
+            "trajectories justify it on their own.\n</notes>")
 
 
 def _log(label: str, t0: float, line: str) -> None:

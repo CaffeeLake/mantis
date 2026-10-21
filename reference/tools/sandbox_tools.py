@@ -339,12 +339,21 @@ async def run_sandbox_with_evidence(
 ) -> Dict[str, Any]:
     """Executes a sandbox command and evaluates reached-sink evidence deterministically."""
     if sentinel_path:
+        # A sentinel left by an earlier attempt must not satisfy this one. But
+        # sentinel_path is model-controlled: blanking whatever file it names
+        # would be a truncate-anything primitive inside the sandbox (a slip, or
+        # a steer from the target, and the file under test is emptied before
+        # the PoC runs). So: read first, and clear ONLY a file that already
+        # carries the sentinel token -- i.e. is a stale sentinel. Anything
+        # else is left alone; a file without the token cannot be evidence.
         ctx_pre = current_run_context.get()
         if ctx_pre and ctx_pre.sandbox:
             try:
-                await ctx_pre.sandbox.write_file(Path(sentinel_path), "")
+                existing = await ctx_pre.sandbox.read_file(Path(sentinel_path))
+                if MANTIS_SENTINEL_TOKEN in existing.decode("utf-8", errors="replace"):
+                    await ctx_pre.sandbox.write_file(Path(sentinel_path), "")
             except Exception:
-                pass
+                pass  # no file: nothing stale to clear
 
     raw_res = await run_sandbox(command)
     exit_code = 0
