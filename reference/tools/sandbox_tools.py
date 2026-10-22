@@ -217,6 +217,60 @@ def _note_dynamic_evidence(
         pass
 
 
+_SENTINEL_FINDING_ID = re.compile(r"sentinel[_-](\d+)(?:\.\w+)?$")
+
+
+def finding_id_from_sentinel_path(sentinel_path: Optional[str]) -> Optional[int]:
+    """The finding id a sentinel path names, by the convention the reproducer
+    prompt gives (`sentinel_<finding_id>`), or None."""
+    if not sentinel_path:
+        return None
+    m = _SENTINEL_FINDING_ID.search(Path(str(sentinel_path)).name)
+    return int(m.group(1)) if m else None
+
+
+def _record_finding_evidence(
+    ctx,
+    finding_id: Optional[int],
+    evidence_present: bool,
+    reason: str,
+    sink_symbol: str = "",
+) -> None:
+    """Attributes one evidence verdict to one finding on ctx.finding_evidence.
+
+    `sandbox_executed` answers "did any PoC in this campaign reach a sink";
+    the completion stamp used to turn that one bit into `dynamic_confirmed`
+    for every finding in the campaign, so in a whole-tree run one sentinel
+    upgraded sixteen findings. This records which finding each verdict was
+    about, so the stamp can upgrade only those.
+
+    Outside the patcher the record is monotonic like the flag: a finding
+    once reproduced is not un-reproduced by a later failed attempt. In the
+    patcher the LAST re-attack counts: a patch that is re-attacked, fixed
+    again and re-attacked again is judged by the final run. A verdict with
+    no finding id is left unattributed; it still moves `sandbox_executed`.
+    """
+    if ctx is None or finding_id is None:
+        return
+    try:
+        key = str(int(finding_id))
+        entries = getattr(ctx, "finding_evidence", None)
+        if entries is None:
+            return
+        entry = entries.setdefault(key, {"reproduced": False, "reattacked": False,
+                                         "reattack_present": False, "sink_symbol": "", "reason": ""})
+        if getattr(ctx, "active_node", "") == "patcher":
+            entry["reattacked"] = True
+            entry["reattack_present"] = bool(evidence_present)
+        elif evidence_present:
+            entry["reproduced"] = True
+        if sink_symbol:
+            entry["sink_symbol"] = str(sink_symbol)
+        entry["reason"] = str(reason or "")
+    except Exception:
+        pass  # bookkeeping; never fails a run (and never sets anything on error)
+
+
 async def run_sandbox(command: str) -> str:
     """Executes a command securely inside the configured sandbox. Use this to compile or run the reproduction script."""
     ctx = current_run_context.get()
@@ -336,8 +390,21 @@ async def run_sandbox_with_evidence(
     command: str,
     sentinel_path: Optional[str] = None,
     sink_symbol: str = "",
+    finding_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Executes a sandbox command and evaluates reached-sink evidence deterministically."""
+    """Executes a sandbox command and evaluates reached-sink evidence deterministically.
+
+    `finding_id` is the database id of the finding this PoC is for (from
+    get_findings). The verdict is recorded against that finding, and only
+    findings with their own evidence are later marked dynamically confirmed.
+    When omitted it is read from a `sentinel_<finding_id>` sentinel path."""
+    if finding_id is None:
+        finding_id = finding_id_from_sentinel_path(sentinel_path)
+    else:
+        try:
+            finding_id = int(finding_id)
+        except (TypeError, ValueError):
+            finding_id = finding_id_from_sentinel_path(sentinel_path)
     if sentinel_path:
         # A sentinel left by an earlier attempt must not satisfy this one. But
         # sentinel_path is model-controlled: blanking whatever file it names
@@ -403,6 +470,10 @@ async def run_sandbox_with_evidence(
             sink_symbol=sink_symbol,
             sentinel_content=sentinel_content,
         )
+    # Which finding this verdict was about -- present or absent, both are
+    # recorded: an absent re-attack is what verifies a patch.
+    _record_finding_evidence(current_run_context.get(), finding_id, evidence_present, reason,
+                             sink_symbol=sink_symbol)
 
     return {
         "raw": raw_res,
@@ -410,6 +481,7 @@ async def run_sandbox_with_evidence(
         "output": output,
         "evidence_present": evidence_present,
         "evidence_reason": reason,
+        "finding_id": finding_id,
     }
 
 

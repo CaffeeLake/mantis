@@ -408,8 +408,8 @@ SCENARIOS = {
     # ---- Status integrity: stamps, dismissals, case folds ----
     'status_revert_run_wide_stamp': [
         ('core/database.py',
-         '              AND {scope_clause}\n              {terminal_clause}\n        """, (status, run_id, *scope_params))',
-         '              {terminal_clause}\n        """, (status, run_id))  # NEUTERED: one slice\'s stamp launders every other slice\'s findings'),
+         '              AND {scope_clause}\n              {id_clause}\n              {terminal_clause}\n        """, (status, run_id, *scope_params, *id_params))',
+         '              {id_clause}\n              {terminal_clause}\n        """, (status, run_id, *id_params))  # NEUTERED: one slice\'s stamp launders every other slice\'s findings'),
     ],
     'status_revert_addressless_stamp': [
         ('core/database.py',

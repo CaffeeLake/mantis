@@ -22,7 +22,7 @@ import json
 import uuid
 import re
 from contextlib import contextmanager
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Sequence
 import yaml
 
 from core.paths import resolve_db_path
@@ -756,7 +756,8 @@ def resolve_ancestor_lineage(
 
 
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
-                   verified_evidence: Optional[bool] = None):
+                   verified_evidence: Optional[bool] = None,
+                   finding_evidence: Optional[Dict[str, dict]] = None):
     """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, lineages, and RCA summaries.
 
     `verified_evidence` is the harness's own record of whether this run has
@@ -765,6 +766,12 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
     VERIFICATION_INCOMPLETE: both fields the old gate compared were filled in
     by the same model, so a static-only run could export a "verified" patch.
     None keeps the old behaviour for callers that have no run context.
+
+    `finding_evidence` is the same record per finding (RunContext
+    .finding_evidence). When it is non-empty, VERIFIED_SECURE additionally
+    requires THIS finding to have been reproduced and then re-attacked
+    without reaching the sink; a finding with no record of its own is
+    VERIFICATION_INCOMPLETE however the campaign as a whole fared.
     """
     with _db(db_path) as conn:
         cursor = conn.cursor()
@@ -912,6 +919,21 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     finding_status = existing_status
                 elif existing_status in ("false_positive", "duplicate_merged", "non_viable", "sample_or_test") and finding_status in ("reported", "static_confirmed"):
                     finding_status = existing_status
+
+            # ... and, when the harness attributed evidence to findings, this
+            # finding's own: reproduced, then re-attacked without reaching
+            # the sink. The campaign bit above cannot tell one finding's
+            # re-attack from another's; one patched finding must not verify
+            # the rest. The id is the model's (scoped to this run below) or
+            # the row this report is updating.
+            if patch_status == "VERIFIED_SECURE" and finding_evidence:
+                own_id = finding.get("id") if isinstance(finding.get("id"), int) else None
+                if own_id is None and existing_row:
+                    own_id = existing_row[0]
+                own = finding_evidence.get(str(own_id)) if own_id is not None else None
+                if not (own and own.get("reproduced") and own.get("reattacked")
+                        and not own.get("reattack_present")):
+                    patch_status = "VERIFICATION_INCOMPLETE"
 
             # Check if updating an existing record by explicit ID or exact composite key
             target_id = None
@@ -1123,7 +1145,8 @@ def archive_finding(db_path: str, lineage_id: str, note: str = "") -> int:
         return 0
 
 
-def update_status(db_path: str, filepath: str, run_id: str, status: str):
+def update_status(db_path: str, filepath: str, run_id: str, status: str,
+                  finding_ids: Optional[Sequence[int]] = None):
     """Update status for active candidate findings under `filepath` in a given run
     (preserving terminal/suppressed statuses and preventing downgrades).
 
@@ -1137,11 +1160,25 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
     needs neither: for a file path the prefix pattern matches nothing and the
     exact match carries it, so there is no directory test at all.
 
+    `finding_ids`, when given, narrows the stamp further to those rows (still
+    within the campaign and the run): the dynamic statuses are earned one
+    finding at a time, by that finding's own PoC. None means the whole
+    campaign, as before; an empty sequence means no finding earned the
+    status and nothing is written.
+
     Status comparisons are case-folded on both sides. The finding schema spells
     statuses UPPERCASE and historical rows may carry either; a terminal status
     that stops protecting a finding because of its case silently un-dismisses it.
     """
     status = (status or "").strip().lower()
+    id_clause = ""
+    id_params: list = []
+    if finding_ids is not None:
+        ids = sorted({int(i) for i in finding_ids})
+        if not ids:
+            return
+        id_clause = f" AND id IN ({','.join('?' * len(ids))})"
+        id_params = ids
     with _db(db_path) as conn:
         cursor = conn.cursor()
         norm_fp = canonical_filepath(filepath, target_file=filepath)
@@ -1160,8 +1197,9 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
                 UPDATE findings
                 SET status = ?
                 WHERE run_id = ?
+                  {id_clause}
                   {terminal_clause}
-            """, (status, run_id))
+            """, (status, run_id, *id_params))
             return
 
         scope_clause, scope_params = _campaign_scope_clause(norm_fp)
@@ -1170,8 +1208,9 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str):
             SET status = ?
             WHERE run_id = ?
               AND {scope_clause}
+              {id_clause}
               {terminal_clause}
-        """, (status, run_id, *scope_params))
+        """, (status, run_id, *scope_params, *id_params))
 
         # Upgrade OKF concepts trust tier on dynamic sandbox confirmation strictly for this specific resource
         if status in ("dynamic_confirmed", "patch_verified") and norm_fp and not os.path.isdir(norm_fp):

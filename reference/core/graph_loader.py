@@ -367,6 +367,91 @@ def _derive_campaign_route(entries: list[dict]) -> str:
     return max(order, key=lambda r: counts[r])
 
 
+def _active_campaign_finding_ids(db_path: str, target_file: str, run_id: str) -> list[int]:
+    """Ids of the campaign's findings that a stamp could still move."""
+    from core.database import read_findings
+
+    closed = {"false_positive", "duplicate_merged", "non_viable", "sample_or_test", "mitigated", "patch_verified"}
+    try:
+        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
+    except Exception:
+        return []
+    return [int(r["id"]) for r in rows
+            if r.get("id") is not None and str(r.get("status") or "").lower() not in closed]
+
+
+def stamp_finding_ids(rc, new_status: str) -> Optional[list[int]]:
+    """Which findings a completion stamp of `new_status` may touch.
+
+    None: the whole campaign (the coverage statuses: a reviewer that finished
+    reviewed everything in scope). A list: only those ids. An empty list:
+    nothing earned it.
+
+    The dynamic statuses are earned per finding, by that finding's own PoC
+    (RunContext.finding_evidence, written by run_sandbox_with_evidence). The
+    stamp used to read one campaign-wide bit, `sandbox_executed`, so in a
+    whole-tree run one reached sink marked every finding dynamically
+    confirmed -- a reader of the report could not tell the fifteen that were
+    reproduced from the one that was not. With evidence attributed to
+    findings, only those are stamped. Evidence that reached a sink but named
+    no finding (a PoC run without finding_id or a sentinel_<id> path) is
+    attributed only when the campaign has exactly one open finding, where it
+    cannot mean anything else; otherwise it stamps nothing, and the note the
+    caller prints says so.
+    """
+    status = str(new_status or "").lower().strip()
+    if status not in ("dynamic_confirmed", "patch_verified"):
+        return None
+    evidence = dict(getattr(rc, "finding_evidence", None) or {})
+    if status == "dynamic_confirmed":
+        earned = [int(k) for k, v in evidence.items() if isinstance(v, dict) and v.get("reproduced")]
+    else:
+        earned = [int(k) for k, v in evidence.items()
+                  if isinstance(v, dict) and v.get("reproduced") and v.get("reattacked")
+                  and not v.get("reattack_present")]
+    if earned:
+        return sorted(set(earned))
+    if status == "dynamic_confirmed" and getattr(rc, "sandbox_executed", False):
+        open_ids = _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id)
+        if len(open_ids) == 1:
+            return open_ids
+    return []
+
+
+def apply_completion_stamp(rc, new_status: str, node_id: str = "") -> Optional[list[int]]:
+    """Writes a node's completion status for the campaign in `rc`, per finding
+    where the status is per finding. Returns the ids stamped (None when the
+    stamp was campaign-wide). Best-effort: a DB hiccup must not kill the
+    campaign, so errors are reported, not raised."""
+    from core.database import update_status
+
+    status = str(new_status or "").lower().strip()
+    if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
+        return []
+    if status in ("dynamic_confirmed", "patch_verified") and not getattr(rc, "sandbox_executed", False):
+        return []
+    ids = stamp_finding_ids(rc, status)
+    try:
+        if ids is None:
+            update_status(rc.db_path, rc.target_file, rc.run_id, status)
+        else:
+            if ids:
+                update_status(rc.db_path, rc.target_file, rc.run_id, status, finding_ids=ids)
+            if status in ("dynamic_confirmed", "patch_verified"):
+                left = [i for i in _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id)
+                        if i not in set(ids)]
+                tag = f"[{node_id}] " if node_id else ""
+                shown = ", ".join(str(i) for i in ids) if ids else "none"
+                print(f"{tag}{status}: finding(s) {shown} by their own reached-sink evidence; "
+                      f"{len(left)} other(s) keep their earlier status"
+                      + (" (evidence was not attributed to a finding: pass finding_id or a "
+                         "sentinel_<finding_id> path)" if not ids else ""),
+                      file=sys.stderr)
+    except Exception as exc:
+        print(f"[{node_id or 'stamp'}] could not stamp completion status '{status}': {exc}", file=sys.stderr)
+    return ids
+
+
 def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
     """Builds an after-agent callback that stamps coverage on SUCCESS only.
 
@@ -387,7 +472,9 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
     ctx.sandbox_executed -- a node that never reached a sandbox cannot claim
     dynamic proof, INV-1 -- and persistence stays best-effort: a DB hiccup
     must not kill the campaign. Statuses are lowercase; update_status
-    enforces the vocabulary and its own monotonic terminal clauses.
+    enforces the vocabulary and its own monotonic terminal clauses. The
+    dynamic statuses are then written per finding (apply_completion_stamp):
+    only findings whose own PoC reached a sink.
     """
     new_status = str(on_enter_status).lower().strip()
 
@@ -406,8 +493,7 @@ def _make_completion_stamp_callback(node_id: str, on_enter_status: str):
                 return None
             if new_status in ("dynamic_confirmed", "patch_verified") and not rc.sandbox_executed:
                 return None
-            from core.database import update_status
-            update_status(rc.db_path, rc.target_file, rc.run_id, new_status)
+            apply_completion_stamp(rc, new_status, node_id)
         except Exception as exc:
             print(
                 f"[{node_id}] could not stamp completion status '{new_status}': {exc}",

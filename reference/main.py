@@ -244,6 +244,11 @@ async def execute_sub_task(
                     ctx = current_run_context.get()
                     if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
                         pass
+                    elif ctx is not None:
+                        # Per finding for the dynamic statuses: the same
+                        # rule as the completion stamp in graph_loader.
+                        from core.graph_loader import apply_completion_stamp
+                        apply_completion_stamp(ctx, new_status, node_name)
                     else:
                         update_status(db_path, filepath, run_id, new_status)
 
@@ -2051,6 +2056,10 @@ async def pipeline(
                 target_file=scan_item,
                 sandbox=sandbox,
                 budget_controller=budget_ctrl,
+                # replace() copies field values, so a dict field would be one
+                # object shared by every campaign; the evidence ledger is per
+                # campaign, like sandbox_executed.
+                finding_evidence={},
             )
             current_run_context.set(branch_ctx)
             # Tell this campaign what the survey found here and which sibling areas are

@@ -653,7 +653,8 @@ def report_findings(report: VulnerabilityReport) -> str:
             )
 
         write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id,
-                       verified_evidence=bool(getattr(ctx, "sandbox_executed", False)))
+                       verified_evidence=bool(getattr(ctx, "sandbox_executed", False)),
+                       finding_evidence=dict(getattr(ctx, "finding_evidence", None) or {}))
         return f"SUCCESS: Saved {len(findings)} finding(s) to database."
     except Exception as e:
         return f"ERROR SAVING DB: {e}"
