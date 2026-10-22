@@ -336,6 +336,27 @@ Execute the reproduction stage under these constraints:
        `repro_status = "failed_to_reproduce"` with details citing
        `"Internal Invariant Protection"`.
 
+   - **HARNESS INTEGRITY (Observe, Never Alter):**
+
+     - Prefer evidence the payload itself produces at the sink: the injected
+       command writes the sentinel file, the traversal write lands at the
+       escaped path, the deserialised object's `__reduce__` writes it, the
+       injected SQL returns a row only it could.
+     - A hook or wrapper around the sink is a last resort for effects the
+       sandbox cannot show (an outbound request with no network) and may only
+       observe: call the original with the same arguments and write the sentinel
+       on the condition that the attacker-controlled value arrived. Never change
+       the sink's arguments, defaults, filters, environment, permissions or
+       exception handling. A harness that alters the sink reproduces a different
+       program; its sentinel is fabricated evidence.
+     - A safeguard in the runtime or a library that stops the payload (an
+       extraction filter, a parser that rejects it, a framework that escapes it)
+       is a result, not an obstacle to route around. Record
+       `repro_status = "failed_to_reproduce"` with details citing
+       `"Mitigated by runtime: <safeguard> (<component and version>)"`, so the
+       report says exploitability depends on the deployed version. Do not
+       disable, downgrade or monkeypatch the safeguard to make the payload land.
+
    - *Attempt Cap Accounting & Local Retries:*
 
      - **Sub-Tier-3 Stepping-Stone Sub-Budget:** Internal Tier-1 and Tier-2
