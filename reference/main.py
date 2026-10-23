@@ -164,49 +164,141 @@ async def execute_sub_task(
     if resumed_invocation_id:
         new_message = None
     else:
-        # SECURITY: literal substitution, not str.format(). A template containing a
-        # format spec such as "{filepath:>9999999999}" would otherwise be evaluated
-        # here, and conversion/attribute syntax would traverse object internals.
-        query_text = (
-            str(seed_prompt_template)
-            .replace("{filepath}", str(sanitized_filepath))
-            .replace("{run_id}", str(run_id))
+        new_message = _build_seed_message(
+            seed_prompt_template, sanitized_filepath, run_id,
+            slice_briefing, prior_memory, hypotheses, coverage_note, focus_directive,
         )
-        # Appended AFTER substitution, deliberately. The briefing is built from
-        # repository bytes, and a directory named "{filepath}" would otherwise be
-        # substituted into rather than merely quoted. Concatenating afterwards means
-        # repo content is never on the template side of an expansion.
-        if slice_briefing:
-            query_text += slice_briefing
-        # Prior-run evidence. Like the briefing it is LLM-written text carrying its own
-        # CP-4 fencing, so it sits with the briefing on the data side of the prompt,
-        # ahead of the operator instruction below.
-        if prior_memory:
-            query_text += prior_memory
-        # Cross-area leads. Derived mechanically from earlier findings' symbols and
-        # weakness classes, but the subject matter still originates in LLM output, so
-        # this carries its own CP-4 fencing and belongs on the data side too.
-        if hypotheses:
-            query_text += hypotheses
-        # The focus directive and the coverage note are operator-authored text chosen by
-        # a repository-derived key, so unlike the briefing they are not fenced as
-        # untrusted. They go LAST so they are not enclosed by the briefing's
-        # untrusted-data delimiters: inside them they would read as content the agent has
-        # been told to distrust, which is the opposite of an instruction. Same
-        # literal-concatenation rule as above.
-        if coverage_note:
-            query_text += coverage_note
-        if focus_directive:
-            query_text += focus_directive
 
-        new_message = types.Content(
-            parts=[types.Part.from_text(text=query_text)],
-            role="user"
-        )
-    
     print(f"\n[GRAPH EXECUTION] Triggered via: {filepath}")
     print("-" * 60)
-    
+
+    try:
+        return await _drive_campaign(
+            runner, session_id, new_message, resumed_invocation_id,
+            filepath=filepath, run_id=run_id, db_path=db_path, status_map=status_map,
+            budget_controller=budget_controller, transcript=transcript,
+        )
+    except Exception as exc:
+        # A campaign interrupted mid-stage resumes inside its old invocation,
+        # and ADK rebuilds that stage's context from everything the stage did
+        # before the interruption. When that history no longer fits the
+        # model's window the resume fails the same way every time, so the
+        # campaign would never finish under any number of --resume passes.
+        # Start it over instead: fresh session, the seed message, the full
+        # graph. Once only -- the second attempt is not a resume.
+        if not (resumed_invocation_id and _is_context_overflow(exc)):
+            raise
+        print(
+            f"\n[RESUME] {filepath}: the interrupted campaign's history no longer fits "
+            f"the model window ({type(exc).__name__}); starting the campaign over.",
+            file=sys.stderr,
+        )
+        await session_service.delete_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
+            state={"db_path": db_path, "run_id": run_id, "filepath": sanitized_filepath},
+        )
+        fresh = _build_seed_message(
+            seed_prompt_template, sanitized_filepath, run_id,
+            slice_briefing, prior_memory, hypotheses, coverage_note, focus_directive,
+        )
+        return await _drive_campaign(
+            runner, session_id, fresh, None,
+            filepath=filepath, run_id=run_id, db_path=db_path, status_map=status_map,
+            budget_controller=budget_controller, transcript=transcript,
+        )
+
+
+# Provider wording for "this request does not fit the model's window". Used
+# only to decide whether a RESUMED campaign starts over, so a false match
+# costs one fresh run of that campaign and nothing else.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "prompt is too long",
+    "context length",
+    "context_length_exceeded",
+    "contextwindowexceeded",
+    "maximum context",
+    "exceeds the maximum number of tokens",
+    "input token count",
+)
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    text = f"{name} {exc}".lower()
+    if "contextwindowexceeded" in name:
+        return True
+    return "badrequest" in name and any(m in text for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _build_seed_message(
+    seed_prompt_template: str,
+    sanitized_filepath: str,
+    run_id: str,
+    slice_briefing: str,
+    prior_memory: str,
+    hypotheses: str,
+    coverage_note: str,
+    focus_directive: str,
+) -> types.Content:
+    """The first node's seed: the operator template with the target substituted,
+    then the data-side context, then the operator-authored notes."""
+    # SECURITY: literal substitution, not str.format(). A template containing a
+    # format spec such as "{filepath:>9999999999}" would otherwise be evaluated
+    # here, and conversion/attribute syntax would traverse object internals.
+    query_text = (
+        str(seed_prompt_template)
+        .replace("{filepath}", str(sanitized_filepath))
+        .replace("{run_id}", str(run_id))
+    )
+    # Appended AFTER substitution, deliberately. The briefing is built from
+    # repository bytes, and a directory named "{filepath}" would otherwise be
+    # substituted into rather than merely quoted. Concatenating afterwards means
+    # repo content is never on the template side of an expansion.
+    if slice_briefing:
+        query_text += slice_briefing
+    # Prior-run evidence. Like the briefing it is LLM-written text carrying its own
+    # CP-4 fencing, so it sits with the briefing on the data side of the prompt,
+    # ahead of the operator instruction below.
+    if prior_memory:
+        query_text += prior_memory
+    # Cross-area leads. Derived mechanically from earlier findings' symbols and
+    # weakness classes, but the subject matter still originates in LLM output, so
+    # this carries its own CP-4 fencing and belongs on the data side too.
+    if hypotheses:
+        query_text += hypotheses
+    # The focus directive and the coverage note are operator-authored text chosen by
+    # a repository-derived key, so unlike the briefing they are not fenced as
+    # untrusted. They go LAST so they are not enclosed by the briefing's
+    # untrusted-data delimiters: inside them they would read as content the agent has
+    # been told to distrust, which is the opposite of an instruction. Same
+    # literal-concatenation rule as above.
+    if coverage_note:
+        query_text += coverage_note
+    if focus_directive:
+        query_text += focus_directive
+
+    return types.Content(
+        parts=[types.Part.from_text(text=query_text)],
+        role="user"
+    )
+
+
+async def _drive_campaign(
+    runner: Runner,
+    session_id: str,
+    new_message: Optional[types.Content],
+    resumed_invocation_id: Optional[str],
+    *,
+    filepath: str,
+    run_id: str,
+    db_path: str,
+    status_map: dict[str, str] | None,
+    budget_controller: Optional[BudgetController],
+    transcript: Optional["TranscriptWriter"],
+) -> bool:
+    """Streams one campaign's graph run and applies the per-event bookkeeping.
+    Returns True if an error was encountered."""
     errored: set[str] = set()
     stamped_nodes: set[str] = set()
     last_banner: tuple[str | None, str | None] = (None, None)

@@ -730,8 +730,8 @@ SCENARIOS = {
     ],
     "brief_revert_briefing_append": [
         ("main.py",
-         "        if slice_briefing:\n            query_text += slice_briefing",
-         "        pass  # NEUTERED: agent never receives the survey context"),
+         "    if slice_briefing:\n        query_text += slice_briefing",
+         "    pass  # NEUTERED: agent never receives the survey context"),
     ],
     "brief_revert_sibling_disclosure": [
         ("core/surveyor.py",
@@ -868,15 +868,15 @@ SCENARIOS = {
     ],
     "focus_never_reaches_prompt": [
         ("main.py",
-         "            query_text += focus_directive",
-         "            pass  # NEUTERED: agent never sees the directive"),
+         "        query_text += focus_directive",
+         "        pass  # NEUTERED: agent never sees the directive"),
     ],
     "focus_lands_inside_the_fence": [
         ("main.py",
-         "        if slice_briefing:\n            query_text += slice_briefing\n",
-         "        if focus_directive:\n            query_text += focus_directive\n"
-         "        if slice_briefing:\n            query_text += slice_briefing\n"
-         "        # NEUTERED: directive now precedes the briefing\n"),
+         "    if slice_briefing:\n        query_text += slice_briefing\n",
+         "    if focus_directive:\n        query_text += focus_directive\n"
+         "    if slice_briefing:\n        query_text += slice_briefing\n"
+         "    # NEUTERED: directive now precedes the briefing\n"),
     ],
     # --- M-2: what earlier runs found reaching the next run ---
     "memory_scoped_to_this_run": [
@@ -897,8 +897,8 @@ SCENARIOS = {
     ],
     "memory_never_reaches_prompt": [
         ("main.py",
-         "            query_text += prior_memory",
-         "            pass  # NEUTERED: agent never sees prior evidence"),
+         "        query_text += prior_memory",
+         "        pass  # NEUTERED: agent never sees prior evidence"),
     ],
     "memory_prose_unfenced": [
         ("core/memory.py",
@@ -1016,15 +1016,15 @@ SCENARIOS = {
     ],
     "planner_note_never_reaches_prompt": [
         ("main.py",
-         "            query_text += coverage_note",
-         "            pass  # NEUTERED: the agent is never told what was covered"),
+         "        query_text += coverage_note",
+         "        pass  # NEUTERED: the agent is never told what was covered"),
     ],
     "planner_note_lands_inside_the_fence": [
         ("main.py",
-         "        if slice_briefing:\n            query_text += slice_briefing\n",
-         "        if coverage_note:\n            query_text += coverage_note\n"
-         "        if slice_briefing:\n            query_text += slice_briefing\n"
-         "        # NEUTERED: note now precedes the briefing\n"),
+         "    if slice_briefing:\n        query_text += slice_briefing\n",
+         "    if coverage_note:\n        query_text += coverage_note\n"
+         "    if slice_briefing:\n        query_text += slice_briefing\n"
+         "    # NEUTERED: note now precedes the briefing\n"),
     ],
     "planner_failure_is_fatal": [
         ("core/planner.py",

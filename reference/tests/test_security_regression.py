@@ -5476,7 +5476,7 @@ class TestSliceBriefingReachesTheAgent(unittest.TestCase):
         """
         import main
 
-        source = inspect.getsource(main.execute_sub_task)
+        source = inspect.getsource(main._build_seed_message)
         substitution_at = source.index('.replace("{run_id}"')
         append_at = source.index("query_text += slice_briefing")
         self.assertLess(
@@ -6239,7 +6239,7 @@ class TestEachAreaIsToldWhatToHuntThere(unittest.TestCase):
 
         import main
 
-        appended = _prompt_appends_in_source_order(main.execute_sub_task)
+        appended = _prompt_appends_in_source_order(main._build_seed_message)
         self.assertIn(
             "focus_directive", appended,
             "the directive never reaches query_text, so the agent never sees it.",
@@ -6250,6 +6250,19 @@ class TestEachAreaIsToldWhatToHuntThere(unittest.TestCase):
             "the directive is concatenated before the briefing; it must come after so "
             "it is not swallowed by the briefing's untrusted-data fence.",
         )
+        # And the assembly is what execute_sub_task actually sends: every
+        # seed it builds -- first attempt or a restart -- goes through it
+        # with the directive in hand.
+        wiring = textwrap.dedent(inspect.getsource(main.execute_sub_task))
+        calls = [
+            node for node in ast.walk(ast.parse(wiring))
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_build_seed_message"
+        ]
+        self.assertTrue(calls, "execute_sub_task no longer builds its seed with _build_seed_message")
+        for call in calls:
+            names = {a.id for a in call.args if isinstance(a, ast.Name)}
+            self.assertIn("focus_directive", names)
+            self.assertIn("slice_briefing", names)
 
 
 class TestWhatEarlierRunsFoundReachesTheNextRun(unittest.TestCase):
@@ -6579,7 +6592,7 @@ class TestWhatEarlierRunsFoundReachesTheNextRun(unittest.TestCase):
         """Order matters: fenced evidence before the operator instruction."""
         import main
 
-        appended = _prompt_appends_in_source_order(main.execute_sub_task)
+        appended = _prompt_appends_in_source_order(main._build_seed_message)
         self.assertIn(
             "prior_memory", appended,
             "memory never reaches query_text, so the agent never sees it.",
@@ -7094,7 +7107,7 @@ class TestExaminedAndCleanIsNotTheSameAsNeverExamined(unittest.TestCase):
         """
         import main
 
-        appended = _prompt_appends_in_source_order(main.execute_sub_task)
+        appended = _prompt_appends_in_source_order(main._build_seed_message)
         self.assertIn(
             "coverage_note", appended,
             "the coverage note never reaches query_text, so the agent never sees it.",
@@ -7564,7 +7577,7 @@ class TestLeadsFromOneAreaReachAnother(unittest.TestCase):
         """
         import main
 
-        appended = _prompt_appends_in_source_order(main.execute_sub_task)
+        appended = _prompt_appends_in_source_order(main._build_seed_message)
         self.assertIn(
             "hypotheses", appended,
             "hypotheses never reach query_text, so the agent never sees them.",
