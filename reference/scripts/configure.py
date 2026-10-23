@@ -1092,6 +1092,15 @@ async def ensure_configured_async(
                     save=save,
                     save_tracked=save_tracked,
                 )
+                if overrides and not persist_overrides:
+                    # The persisted auto-resolution was reloaded from disk
+                    # without the one-shot overrides; put them back on top
+                    # (together with the updates, in case save=False kept
+                    # those in memory only) so the returned config is the
+                    # one this run uses.
+                    wf_data = update_workflow_config(
+                        target_wf, {**all_updates, **overrides}, save=False, save_tracked=save_tracked
+                    )
                 return wf_data.get("config", {})
 
     return cfg

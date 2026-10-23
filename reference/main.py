@@ -548,6 +548,47 @@ _CAMPAIGN_GUARDS = frozenset({
 })
 
 
+class _PatientSqliteSessionService(SqliteSessionService):
+    """ADK's session store with the run's busy timeout and WAL.
+
+    The stock service opens aiosqlite with SQLite's default five-second lock
+    wait and rollback journal. Every campaign appends its events to the one
+    sessions database; under --parallel N, N writers contend for it, and a
+    wait past five seconds surfaces as "database is locked" out of
+    runner.run_async -- a campaign abort for a campaign whose findings were
+    already saved. The knowledge database already waits MANTIS_DB_TIMEOUT
+    seconds (raised with parallelism); the session store now waits the
+    same, and WAL lets readers proceed while a writer holds the lock.
+    """
+
+    def _get_db_connection(self):
+        from contextlib import asynccontextmanager
+
+        import aiosqlite
+        from google.adk.sessions import sqlite_session_service as _s
+
+        from core.database import db_timeout
+
+        @asynccontextmanager
+        async def _conn():
+            async with aiosqlite.connect(
+                self._db_connect_path, uri=self._db_connect_uri, timeout=max(5.0, float(db_timeout()))
+            ) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute("PRAGMA journal_mode = WAL")
+                    await db.execute("PRAGMA synchronous = NORMAL")
+                except Exception:
+                    pass
+                await db.execute(_s.PRAGMA_FOREIGN_KEYS)
+                if not self._schema_ready:
+                    await db.executescript(_s.CREATE_SCHEMA_SQL)
+                    self._schema_ready = True
+                yield db
+
+        return _conn()
+
+
 def _record_guard_failure(db_path: str, run_id: str, scan_item: str, scan_mode: str, trigger: str,
                           harness_fingerprint: str = "") -> None:
     """A campaign stopped by its own runaway guard leaves a FAILED ledger row
@@ -1647,6 +1688,7 @@ async def pipeline(
     no_budget: bool = False,
     enable_replan: Optional[bool] = None,
     parallel: int = 1,
+    parallel_ramp_seconds: float = 0.0,
     focus: str = "",
     seed_report_path: str = "",
     path_root: str = "",
@@ -2458,7 +2500,7 @@ async def pipeline(
         config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "",
         default_name="sessions.db",
     )
-    session_service = SqliteSessionService(db_path=sessions_db_path)
+    session_service = _PatientSqliteSessionService(db_path=sessions_db_path)
     runner = Runner(
         app=run_app,
         session_service=session_service
@@ -2953,11 +2995,24 @@ async def pipeline(
     # worker's auth failure (return 1) surfaces exactly where the sequential
     # loop's `return 1` always did -- before any post-loop reporting.
     worker_count = max(1, int(parallel or 1))
+    ramp = max(0.0, float(parallel_ramp_seconds or 0.0))
     if worker_count > 1:
-        print(f"⚡ Parallel campaigns: up to {worker_count} in flight.")
+        print(f"⚡ Parallel campaigns: up to {worker_count} in flight."
+              + (f" Workers start {ramp:g}s apart." if ramp else ""))
+
+    async def _staggered_worker(index: int):
+        # The herd: N workers starting at once means N guests booting, N
+        # checkouts staging and N first model calls in the same second,
+        # against the same database and the same quota. Worker i waits
+        # i*ramp before its first campaign; after that, campaigns of
+        # different lengths keep the pool spread out on their own.
+        if ramp and index:
+            await asyncio.sleep(index * ramp)
+        return await _campaign_worker()
+
     try:
         worker_results = await asyncio.gather(
-            *[_campaign_worker() for _ in range(worker_count)]
+            *[_staggered_worker(i) for i in range(worker_count)]
         )
     finally:
         await runner.close()

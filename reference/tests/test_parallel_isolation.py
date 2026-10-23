@@ -298,5 +298,66 @@ class CampaignGuardTest(unittest.TestCase):
         self.assertIn("len(targets_to_scan) > 1", handler, "a single-campaign run still pauses")
 
 
+class PatientSessionStoreTest(unittest.IsolatedAsyncioTestCase):
+    """ADK's session store is the one database every campaign writes to on
+    every event. Its stock five-second lock wait aborted campaigns under
+    --parallel ("database is locked" out of runner.run_async) after their
+    findings were already saved. The store now waits as long as the
+    knowledge database does and runs in WAL."""
+
+    async def test_the_session_store_waits_like_the_knowledge_db_and_uses_wal(self):
+        import sqlite3
+        from unittest import mock
+
+        import aiosqlite
+
+        import main
+        from core.database import DB_TIMEOUT_ENV
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "sessions.db")
+        seen = {}
+        real_connect = aiosqlite.connect
+
+        def spy(*args, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {DB_TIMEOUT_ENV: "300"}), mock.patch.object(aiosqlite, "connect", spy):
+            service = main._PatientSqliteSessionService(db_path=path)
+            session = await service.create_session(app_name="mantis", user_id="u")
+            got = await service.get_session(app_name="mantis", user_id="u", session_id=session.id)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, session.id)
+        self.assertEqual(seen["timeout"], 300.0, "the run's --db-timeout, not aiosqlite's 5s")
+        with sqlite3.connect(path) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+
+        # Never shorter than the stock wait, whatever the run asked for.
+        with mock.patch.dict(os.environ, {DB_TIMEOUT_ENV: "0"}), mock.patch.object(aiosqlite, "connect", spy):
+            async with main._PatientSqliteSessionService(db_path=path)._get_db_connection():
+                pass
+        self.assertEqual(seen["timeout"], 5.0)
+
+
+class ParallelRampTest(unittest.TestCase):
+    def test_the_ramp_flag_reaches_the_pipeline_and_staggers_the_workers(self):
+        import inspect
+
+        import main
+        from scripts.launch import build_parser, run_launch
+
+        self.assertEqual(build_parser().parse_args(["target"]).parallel_ramp, 0.0, "off by default")
+        args = build_parser().parse_args(["target", "--parallel", "8", "--parallel-ramp", "10"])
+        self.assertEqual(args.parallel_ramp, 10.0)
+        self.assertIn("parallel_ramp", inspect.signature(run_launch).parameters)
+        self.assertIn("parallel_ramp_seconds=parallel_ramp", inspect.getsource(run_launch))
+        self.assertIn("parallel_ramp_seconds", inspect.signature(main.pipeline).parameters)
+        src = inspect.getsource(main.pipeline)
+        self.assertIn("await asyncio.sleep(index * ramp)", src, "worker i waits i*ramp before its first campaign")
+        self.assertIn("_staggered_worker(i) for i in range(worker_count)", src)
+
+
 if __name__ == "__main__":
     unittest.main()

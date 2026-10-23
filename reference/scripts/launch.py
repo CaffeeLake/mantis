@@ -185,6 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--parallel-ramp",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "With --parallel N, start worker i after i*SECONDS instead of all at once, "
+            "so N guests, N stagings and N first model calls do not land in the same "
+            "second (default: 0, all at once)."
+        ),
+    )
+    parser.add_argument(
         "--db-timeout",
         type=float,
         default=None,
@@ -397,6 +408,7 @@ def run_launch(
     no_budget: bool = False,
     no_replan: bool = False,
     parallel: int = 1,
+    parallel_ramp: float = 0.0,
     db_timeout: Optional[float] = None,
     focus: str = "",
     seed_report: str = "",
@@ -719,6 +731,7 @@ def run_launch(
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
                 enable_replan=False if no_replan else None,
                 parallel=parallel,
+                parallel_ramp_seconds=parallel_ramp,
                 db_timeout=db_timeout,
                 focus=focus,
                 seed_report_path=seed_report,
@@ -796,6 +809,7 @@ def main() -> int:
             no_budget=args.no_budget,
             no_replan=args.no_replan,
             parallel=args.parallel,
+            parallel_ramp=args.parallel_ramp,
             db_timeout=args.db_timeout,
             focus=args.focus,
             seed_report=args.seed_report,

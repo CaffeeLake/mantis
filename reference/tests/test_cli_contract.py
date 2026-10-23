@@ -89,6 +89,24 @@ class ConfigPersistenceTest(unittest.TestCase):
             SENTINEL_MODEL, self.wf.read_text(encoding="utf-8")
         )
 
+    def test_overrides_survive_an_auto_resolution_that_persists(self):
+        # First run on a host that can run microsandbox: the tracked
+        # static-only floor is promoted and that promotion is persisted.
+        # The persisted config is reloaded from disk -- the one-shot
+        # override must still be the live one in what comes back.
+        caps = {
+            "available_sandboxes": ["static-only", "microsandbox"],
+            "recommended_sandbox": "microsandbox",
+            "microsandbox_image": "mantis-sandbox:latest",
+        }
+        with patch("scripts.configure.detect_capabilities", return_value=caps):
+            cfg = self._run()
+        self.assertEqual(cfg.get("default_model"), SENTINEL_MODEL)
+        self.assertEqual(cfg.get("sandbox", {}).get("type"), "microsandbox")
+        local = json.loads(self._local_text())
+        self.assertEqual(local["config"]["sandbox"]["type"], "microsandbox")
+        self.assertNotIn(SENTINEL_MODEL, self._local_text())
+
 
 class PathRootHardFailTest(unittest.TestCase):
     """An impossible --path-root exits 1 before any budget is spent."""
