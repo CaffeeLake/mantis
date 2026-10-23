@@ -228,15 +228,31 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
             pass
 
     if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and clean_path:
-        req_target = os.path.realpath(os.path.join(ctx.jail_dir, clean_path))
+        # A single-file campaign reads its one file. The guest holds the
+        # whole tree (a PoC needs the module around the file), and it
+        # resolves paths against ITS workdir: "../../../workspace/x" climbs
+        # out of the host jail -- where the old gate therefore let it pass --
+        # and lands on /workspace/x in the guest. So the request is judged
+        # as the guest will resolve it: absolute under the workdir, or
+        # relative to it, normalized; only the scanned file's own spelling
+        # is allowed through, and host existence is not consulted at all.
         real_target = os.path.realpath(ctx.target_file)
         jail_real = os.path.realpath(ctx.jail_dir)
-        inside_jail = req_target == jail_real or req_target.startswith(jail_real + os.sep)
-        # Containment before existence: a path outside the jail gets the
-        # sandbox's "escapes the workspace" answer whether or not it exists
-        # on the host, so the two messages cannot be used to probe the host.
-        if inside_jail and req_target != real_target and os.path.exists(req_target):
-            return f"Error: Permission denied. Single-file scans may only read the scanned file '{os.path.basename(real_target)}'."
+        try:
+            target_rel = os.path.relpath(real_target, jail_real).replace(os.sep, "/")
+        except ValueError:
+            target_rel = os.path.basename(real_target)
+        workdir = str(getattr(ctx.sandbox, "working_dir", "") or "/workspace").replace("\\", "/").rstrip("/") or "/workspace"
+        requested = clean_path.replace("\\", "/")
+        guest_abs = posixpath.normpath(requested if requested.startswith("/") else posixpath.join(workdir, requested))
+        if guest_abs == workdir or guest_abs.startswith(workdir + "/"):
+            guest_rel = posixpath.relpath(guest_abs, workdir)
+        else:
+            guest_rel = None  # outside the guest workdir: the sandbox refuses it below
+        if guest_rel is not None and guest_rel != target_rel and guest_rel != os.path.basename(real_target):
+            return (f"Error: Permission denied. Single-file scans may only read the scanned file "
+                    f"'{target_rel}'. For other files use find_symbol, find_callers, find_callees and "
+                    "get_function_boundary, which answer from the whole tree.")
 
     sandbox = ctx.sandbox
     if sandbox is None or not hasattr(sandbox, "read_file"):
@@ -991,6 +1007,25 @@ async def list_files(directory: str = "") -> str:
                 items.add("workspace/plan.json")
                 items.add("workspace/kb/THREAT_MODEL.md")
         return _bounded_listing(sorted(items), clean_dir)
+
+    # A single-file campaign sees its own directory, once, and no further:
+    # the tree is the structural index's to answer for (find_symbol,
+    # find_callers, find_callees, get_function_boundary). Listing the tree a
+    # directory at a time is how an architect spent two hundred tool calls
+    # mapping a repository it was asked about one file of.
+    if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and os.path.isdir(ctx.jail_dir):
+        jail_real = os.path.realpath(ctx.jail_dir)
+        own_dir = os.path.dirname(os.path.realpath(ctx.target_file))
+        try:
+            names = sorted(n for n in os.listdir(own_dir) if not n.startswith("."))
+        except OSError:
+            names = [os.path.basename(ctx.target_file)]
+        rel_dir = os.path.relpath(own_dir, jail_real).replace(os.sep, "/")
+        rels = [n if rel_dir == "." else f"{rel_dir}/{n}" for n in names]
+        rels = _without_excluded(ctx, rels)
+        return (_bounded_listing(sorted(rels), rel_dir if rel_dir != "." else "")
+                + "\nNOTE: single-file campaign: this is the scanned file's own directory. The rest of the "
+                "tree is reachable through find_symbol, find_callers, find_callees and get_function_boundary.")
 
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:

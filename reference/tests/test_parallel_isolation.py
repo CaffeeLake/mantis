@@ -208,5 +208,95 @@ class HostPathOracleTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("y = 2", sibling)
 
 
+class SingleFileScopeTest(unittest.IsolatedAsyncioTestCase):
+    """A one-file campaign over a tree reads its file and no other, however
+    the path is spelled, and lists only its own directory. The guest holds
+    the whole tree (a PoC needs the module), so the gate judges the request
+    the way the guest resolves it, not the way the host jail does."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mantis_scope_")
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, "cmd", "a"))
+        os.makedirs(os.path.join(self.repo, "internal", "b"))
+        self.target = os.path.join(self.repo, "cmd", "a", "main.go")
+        Path(self.target).write_text("package main\n")
+        Path(self.repo, "cmd", "a", "helper.go").write_text("package main // helper\n")
+        Path(self.repo, "internal", "b", "secret.go").write_text("package b // SECRET-B\n")
+        self.reads = []
+
+        class WholeTreeGuest:
+            """Serves the whole tree under /workspace, like the microVM does."""
+            is_initialized = True
+            working_dir = Path("/workspace")
+
+            def __init__(s, repo):
+                s.repo = repo
+
+            async def read_file(s, p):
+                p = Path(p)
+                rel = p.relative_to("/workspace") if p.is_absolute() else p
+                norm = os.path.normpath(os.path.join(s.repo, str(rel)))
+                if not norm.startswith(s.repo + os.sep):
+                    raise PermissionError(f"Path '{p}' escapes the sandbox workspace '/workspace'.")
+                self.reads.append(norm)
+                return Path(norm).read_bytes()
+
+        self.ctx = RunContext(jail_dir=self.repo, db_path="", target_file=self.target, run_id=RUN,
+                              sandbox=WholeTreeGuest(self.repo), active_node="architect")
+        self.token = current_run_context.set(self.ctx)
+
+    async def asyncTearDown(self):
+        current_run_context.reset(self.token)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_only_the_scanned_file_is_readable_whatever_the_spelling(self):
+        import tools.research_tools as rt
+
+        own = await rt.read_file("cmd/a/main.go")
+        self.assertIn("package main", own)
+        for spelling in ("internal/b/secret.go", "/workspace/internal/b/secret.go",
+                         "../../../../workspace/internal/b/secret.go", "cmd/a/helper.go", "./internal/b/secret.go"):
+            out = await rt.read_file(spelling)
+            self.assertNotIn("SECRET-B", out, spelling)
+            self.assertNotIn("helper", out, spelling)
+            self.assertIn("Single-file scans may only read the scanned file 'cmd/a/main.go'", out, spelling)
+        self.assertEqual({os.path.basename(r) for r in self.reads}, {"main.go"}, "the guest was never asked for another file")
+
+    async def test_list_files_shows_the_own_directory_only(self):
+        import tools.research_tools as rt
+
+        out = await rt.list_files("")
+        self.assertIn("cmd/a/main.go", out)
+        self.assertIn("cmd/a/helper.go", out)
+        self.assertNotIn("secret.go", out)
+        self.assertIn("single-file campaign", out)
+        out = await rt.list_files("internal/b")
+        self.assertNotIn("secret.go", out, "no other directory is listed, whatever is asked for")
+
+
+class CampaignGuardTest(unittest.TestCase):
+    def test_per_campaign_guards_fail_the_campaign_and_the_sweep_continues(self):
+        import ast
+        import inspect
+        import textwrap
+
+        import main
+
+        self.assertEqual(main._CAMPAIGN_GUARDS, {"node_tool_calls_ceiling", "node_visits_ceiling", "graph_steps"})
+        for run_level in ("wall_clock", "token_budget", "llm_calls_limit"):
+            self.assertNotIn(run_level, main._CAMPAIGN_GUARDS)
+        src = inspect.getsource(main.pipeline)
+        handler = src[src.index("except BudgetExceededError as be:"):]
+        handler = handler[:handler.index("except MantisAuthError")]
+        self.assertIn("_CAMPAIGN_GUARDS", handler)
+        self.assertIn("_record_guard_failure(", handler)
+        self.assertNotIn("record_spend(", handler, "no cost observation from a cut-off campaign")
+        self.assertIn("continue", handler)
+        self.assertIn('"failed": True', inspect.getsource(main._record_guard_failure))
+        self.assertIn("tokens=0", inspect.getsource(main._record_guard_failure))
+        self.assertIn("len(targets_to_scan) > 1", handler, "a single-campaign run still pauses")
+
+
 if __name__ == "__main__":
     unittest.main()

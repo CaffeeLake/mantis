@@ -536,6 +536,34 @@ _SCAN_MODES = (
     SCAN_MODE_CHANGED,
 )
 
+# Budget triggers that describe ONE campaign's behaviour rather than the run's
+# spend (core.budget.BudgetController, and the per-campaign ADK call limit).
+# In a multi-campaign run such a trip fails that campaign and the sweep goes
+# on; wall_clock and token_budget are the operator's ceilings and pause the
+# run. See the BudgetExceededError handler in the campaign worker.
+_CAMPAIGN_GUARDS = frozenset({
+    "node_tool_calls_ceiling",
+    "node_visits_ceiling",
+    "graph_steps",
+})
+
+
+def _record_guard_failure(db_path: str, run_id: str, scan_item: str, scan_mode: str, trigger: str,
+                          harness_fingerprint: str = "") -> None:
+    """A campaign stopped by its own runaway guard leaves a FAILED ledger row
+    -- so it covers nothing and --resume retries it -- but no cost
+    observation: tokens are recorded as zero, which the cost model's average
+    ignores, because a campaign cut off by a guard did not cost what a
+    campaign costs and would skew every later estimate."""
+    try:
+        from core.cost import record_spend
+
+        record_spend(db_path, run_id, scan_item, scan_mode, tokens=0, llm_calls=0, graph_steps=0,
+                     elapsed_seconds=0.0, metadata={"failed": True, "guard": str(trigger or "")},
+                     harness_fingerprint=harness_fingerprint)
+    except Exception as exc:
+        print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
+
 
 def normalize_scan_mode(value: Any) -> str:
     """Maps a configured scan mode onto its current spelling.
@@ -2856,6 +2884,27 @@ async def pipeline(
                     finally:
                         replan_lock.release()
             except BudgetExceededError as be:
+                # Two kinds of ceiling. The run-level ones -- wall clock, tokens
+                # -- are the operator's budget: the whole run pauses, resumably.
+                # The per-campaign guards -- tool calls per node visit, node
+                # visits, graph steps -- exist to stop ONE runaway campaign. In a multi-campaign sweep they
+                # used to pause the run too, so one architect that would not
+                # stop listing directories drained a twelve-wide pool and left
+                # hundreds of files unexamined. That campaign is now recorded as
+                # failed (retry-eligible under --resume, covering nothing) and
+                # the sweep goes on; a single-campaign run still pauses, since
+                # there is nothing to go on to.
+                campaign_guard = str(be.trigger or "") in _CAMPAIGN_GUARDS
+                if campaign_guard and len(targets_to_scan) > 1:
+                    failures += 1
+                    print(
+                        f"\n⚠️  Campaign {scan_item} stopped by its own guard ({be.trigger}: {be.details}); "
+                        "recorded as failed, the sweep continues.",
+                        file=sys.stderr,
+                    )
+                    _record_guard_failure(db_path, run_id, scan_item, scan_mode, str(be.trigger or ""),
+                                          harness_fingerprint=harness_fingerprint)
+                    continue
                 # The first ceiling to trip names the pause; the ADK-raised
                 # call limit never passes through check_budget(), so it is
                 # recorded here rather than there.
