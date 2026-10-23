@@ -480,6 +480,15 @@ DEFAULT_SCAN_SLICES = 10
 #                    contains the bug. This is the only mode the workflow synthesizer
 #                    has anything to work with.
 #
+#   changed          One campaign over the whole target whose SCOPE is the files no
+#                    completed campaign has covered in their present content: new
+#                    files, and files edited since they were last covered (the
+#                    content ledger, core.cost.coverage_files). The tree stays
+#                    readable and indexed so the agent can follow a changed sink
+#                    back to its routes and callers; what it is asked about is the
+#                    change. The scan-fix-rescan loop; nothing changed means
+#                    nothing to scan.
+#
 # A cross-functional scan is therefore NOT a better version of a whole-repository scan,
 # and an earlier revision of this function was wrong to frame it as the thing you do
 # once the whole-repository view "breaks". The two modes find different defects.
@@ -492,6 +501,7 @@ SCAN_MODE_AUTO = "auto"
 SCAN_MODE_WHOLE = "whole"
 SCAN_MODE_FILE_BY_FILE = "file-by-file"
 SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
+SCAN_MODE_CHANGED = "changed"
 
 # Superseded spellings. Accepted forever on input so existing workflow.json files and
 # saved recipes keep working (INV-6), but never emitted.
@@ -499,6 +509,8 @@ _SCAN_MODE_ALIASES = {
     "file-sweep": SCAN_MODE_FILE_BY_FILE,
     "file_sweep": SCAN_MODE_FILE_BY_FILE,
     "slices": SCAN_MODE_CROSS_FUNCTIONAL,
+    "changed-files": SCAN_MODE_CHANGED,
+    "incremental": SCAN_MODE_CHANGED,
 }
 
 _SCAN_MODES = (
@@ -506,6 +518,7 @@ _SCAN_MODES = (
     SCAN_MODE_WHOLE,
     SCAN_MODE_FILE_BY_FILE,
     SCAN_MODE_CROSS_FUNCTIONAL,
+    SCAN_MODE_CHANGED,
 )
 
 
@@ -691,6 +704,7 @@ def resolve_scan_targets(
     *,
     token_budget: int = 0,
     db_path: str = "",
+    scope_out: Optional[dict] = None,
 ) -> tuple[list[str], Optional[dict], str]:
     """Chooses what the campaign scans. Returns `(targets, astm, mode)`.
 
@@ -700,6 +714,11 @@ def resolve_scan_targets(
 
     `token_budget` and `db_path` size the slice count in `auto` mode -- see below.
     Both are optional: without them the function behaves exactly as it did before.
+
+    `scope_out`, when given, receives what a mode decided beyond its targets:
+    `changed` writes `focus_files` (the files the one campaign is about) and
+    `nothing_changed` (True when there was nothing to scan, and `targets` is
+    empty). The return shape is unchanged for every caller that does not ask.
 
     `precomputed_astm` is an already-computed map for this same target. Workflow
     synthesis needs the map too, and it runs before the pipeline; surveying chromium
@@ -776,10 +795,29 @@ def resolve_scan_targets(
         # what the alternative costs, in numbers.
         if len(discovered_files) <= threshold:
             mode = SCAN_MODE_WHOLE
+            # A small repository is rescanned whole every run; that is the
+            # historical behaviour and stays so. But when the ledger shows the
+            # tree covered and some of it edited since, say so, and name the
+            # mode that examines only the edits (issue #15).
+            try:
+                from core.cost import changed_files, uncovered_files
+
+                from core.config import normalize_model_id
+
+                run_model = normalize_model_id(str(config.get("default_model") or ""))
+                never = uncovered_files(db_path, discovered_files, model=run_model, rescan_changed_files=False)
+                edited = changed_files(db_path, discovered_files, model=run_model)
+                if never is not None and not never and edited and edited.get("files"):
+                    print(
+                        _changed_files_hint(len(edited["files"]), len(discovered_files)),
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
         else:
             uncovered = None
             try:
-                from core.cost import harness_mismatches, uncovered_files
+                from core.cost import changed_files, harness_mismatches, uncovered_files
 
                 # Coverage is asked per model: the sweep is of what THIS
                 # model has not seen, so knowledge built by several models
@@ -806,6 +844,16 @@ def resolve_scan_targets(
                             len(stale["files"]), stale.get("fingerprints") or {},
                             harness_fp, rescan_changed,
                         ),
+                        file=sys.stderr,
+                    )
+                # And per content: a covered file edited since it was covered
+                # is in `uncovered` already; the count is stated so the
+                # operator can tell "new" from "changed" in the sweep.
+                edited = changed_files(db_path, discovered_files, model=run_model)
+                if edited and edited.get("files"):
+                    print(
+                        f"{len(edited['files'])} file(s) changed since a recorded campaign "
+                        "covered them; re-examining them.",
                         file=sys.stderr,
                     )
             except Exception as exc:
@@ -866,6 +914,79 @@ def resolve_scan_targets(
 
     if mode == SCAN_MODE_WHOLE:
         return whole
+
+    if mode == SCAN_MODE_CHANGED:
+        # The files no completed campaign has covered in their present
+        # content, for this model: never covered, or covered and edited
+        # since. One campaign over the whole target with these as its scope,
+        # so the agent can read the routes and callers around a changed file
+        # (a single-file campaign is jailed to the file's directory and
+        # cannot). A missing ledger makes every file new, which is the whole
+        # target by a longer route; an unreadable one is said and scanned
+        # whole, the safe direction. Nothing changed means nothing to scan,
+        # and the caller is told so through scope_out.
+        if target_path.is_file():
+            return whole
+        focus: Optional[list] = None
+        known = 0
+        try:
+            from core.config import normalize_model_id
+            from core.cost import changed_files, content_recorded_for, uncovered_files
+
+            run_model = normalize_model_id(str(config.get("default_model") or ""))
+            harness_fp = str(config.get("harness_fingerprint") or "")
+            focus = uncovered_files(
+                db_path, discovered_files, model=run_model,
+                harness_fingerprint=harness_fp,
+                rescan_changed_harness=bool(config.get("rescan_changed_harness")),
+            )
+            edited = changed_files(db_path, discovered_files, model=run_model) or {"files": []}
+            known = content_recorded_for(db_path, discovered_files, model=run_model)
+        except Exception as exc:
+            print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
+            focus = None
+            edited = {"files": []}
+        if focus is None:
+            print(
+                f"Scan mode {SCAN_MODE_CHANGED}: the coverage ledger cannot be read, so which "
+                "files changed is unknown; scanning the whole target.",
+                file=sys.stderr,
+            )
+            return whole
+        if not focus and not known:
+            # Covered, but by campaigns that recorded no content (a ledger
+            # from before this existed): which files changed cannot be
+            # told. One whole scan records it; the next changed run knows.
+            print(
+                f"Scan mode {SCAN_MODE_CHANGED}: the ledger covers this target but recorded no "
+                "file content (it predates content recording), so which files changed is "
+                "unknown; scanning the whole target once to record it.",
+                file=sys.stderr,
+            )
+            return whole
+        if not focus:
+            print(
+                f"Scan mode {SCAN_MODE_CHANGED}: every one of {len(discovered_files)} source "
+                "file(s) is covered in its present content; nothing to scan. Pass "
+                f"--scan-mode {SCAN_MODE_WHOLE} to examine everything again.",
+                file=sys.stderr,
+            )
+            if scope_out is not None:
+                scope_out["focus_files"] = []
+                scope_out["nothing_changed"] = True
+            return [], None, SCAN_MODE_CHANGED
+        n_edited = len(set(edited.get("files") or []) & set(focus))
+        n_new = len(focus) - n_edited
+        print(
+            f"Scan mode {SCAN_MODE_CHANGED}: {len(focus)} of {len(discovered_files)} source "
+            f"file(s) to examine ({n_edited} changed since last covered, {n_new} never covered); "
+            "one campaign over the target, scoped to them.",
+            file=sys.stderr,
+        )
+        if scope_out is not None:
+            scope_out["focus_files"] = list(focus)
+            scope_out["nothing_changed"] = False
+        return [str(target_path)], None, SCAN_MODE_CHANGED
 
     if mode == SCAN_MODE_FILE_BY_FILE:
         # discover_files already produced this list and, until now, nothing consumed it:
@@ -959,6 +1080,52 @@ def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
     return counts
 
 
+def _render_change_focus(focus_files: list[str], target_root: str) -> str:
+    """The directive for a `changed` campaign: which files this run is about.
+
+    The instruction is operator-authored (the operator chose the mode); the
+    file list is repository-derived -- file names are repository bytes -- so
+    it is fenced as data, the way list_files output is. Paths are shown
+    relative to the target. Narrowing is the mode's purpose, but it is
+    stated as where to start and what to report on, not as a ban on reading
+    elsewhere: a changed sink is only exploitable through its callers.
+    """
+    from core.llm_gateway import wrap_untrusted_content
+
+    root = os.path.realpath(str(target_root))
+    rels = []
+    for f in focus_files:
+        try:
+            rel = os.path.relpath(os.path.realpath(str(f)), root)
+        except ValueError:
+            rel = str(f)
+        rels.append(rel.replace(os.sep, "/"))
+    shown = rels[:200]
+    more = f"\n... and {len(rels) - len(shown)} more" if len(rels) > len(shown) else ""
+    listing = wrap_untrusted_content("\n".join(shown) + more, filename="changed_files")
+    return (
+        "\n\nCHANGE-SCOPED RUN. This run examines only the files below: they are new, or "
+        "were edited since a completed scan last covered them. The rest of the target "
+        "is unchanged since it was examined, stays readable and indexed, and is there "
+        "for context: follow a changed function to its callers and the routes that "
+        "reach it, and read whatever those paths need. Plan, research and report on "
+        "defects in these files or on paths through them; do not sweep unchanged files "
+        "for their own sake. If an earlier run reported a finding in one of these files, "
+        "say whether it is still present.\n" + listing
+    )
+
+
+def _changed_files_hint(changed: int, total: int) -> str:
+    """The small-repository notice: the tree is covered, part of it was
+    edited since, and the whole of it is about to be rescanned anyway. Names
+    the mode that examines only the edits; changes nothing by itself."""
+    return (
+        f"{changed} of {total} source file(s) changed since a recorded campaign covered "
+        f"them; scanning the whole target as usual. Pass --scan-mode {SCAN_MODE_CHANGED} "
+        "to examine only the changed files."
+    )
+
+
 def _changed_harness_notice(count: int, fingerprints: dict, current: str, rescanning: bool) -> str:
     """The one line a run prints about ground an earlier harness covered.
 
@@ -980,6 +1147,36 @@ def _changed_harness_notice(count: int, fingerprints: dict, current: str, rescan
     if rescanning:
         return f"{head}; re-examining them (--rescan-changed-harness)."
     return f"{head}; pass --rescan-changed-harness to re-examine them."
+
+
+def _campaign_scope_files(group: dict, scan_item: str, discovered_files: list[str]) -> list[str]:
+    """The source files a campaign examines: each group member that is a
+    file, and every discovered file under each member that is a directory.
+    What the content ledger records at campaign start (core.cost
+    .scope_identities), so a later run can tell these files unchanged from
+    edited. Never raises; an unresolvable member contributes nothing."""
+    members = [str(m) for m in (group.get("targets") or [scan_item]) if str(m).strip()] or [scan_item]
+    out: list[str] = []
+    seen: set = set()
+    try:
+        files = [str(f) for f in discovered_files or []]
+        for member in members:
+            try:
+                real = os.path.realpath(member)
+            except (OSError, ValueError):
+                continue
+            if os.path.isfile(real):
+                picks = [member]
+            else:
+                prefix = real.rstrip(os.sep) + os.sep
+                picks = [f for f in files if os.path.realpath(f).startswith(prefix)]
+            for p in picks:
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+    except Exception:
+        return out
+    return out
 
 
 def _stamp_member_coverage(
@@ -1453,6 +1650,7 @@ async def pipeline(
         if recorded_mode:
             config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
             print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
+    scan_scope: dict = {}
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
         config,
@@ -1460,7 +1658,15 @@ async def pipeline(
         precomputed_astm=precomputed_astm,
         token_budget=resolved_budget.max_tokens,
         db_path=db_path,
+        scope_out=scan_scope,
     )
+    # `changed` with nothing changed is a complete answer, not an empty plan:
+    # the resolver printed it, and a run that scans nothing must not confirm
+    # a work plan, open campaigns, or write an empty report.
+    if scan_mode == SCAN_MODE_CHANGED and not targets_to_scan:
+        return 0
+    focus_files: list[str] = list(scan_scope.get("focus_files") or [])
+    change_focus = _render_change_focus(focus_files, str(target_path)) if focus_files else ""
 
     # H-3: the LLM planning pass. When this run resolved to a cross-functional scan
     # and the knowledge base holds history -- coverage, spend, or prior findings --
@@ -1670,6 +1876,24 @@ async def pipeline(
                     completed -= {_key(t) for t in stale}
             remaining = [t for t in planned if _key(t) not in completed]
             n_failed = sum(1 for t in remaining if _key(t) in failed)
+            # Files this run covered that were edited since. A resumed run
+            # continues on the code as it was (INV-5): it does not rescan
+            # them under the old run id, where pre-edit and post-edit
+            # results would be indistinguishable, and it does not pretend
+            # not to have noticed. It names the run that examines the edits.
+            try:
+                from core.cost import changed_files as _changed_since
+
+                drifted = _changed_since(db_path, discovered_files, run_id=run_id)
+                if drifted and drifted.get("files"):
+                    print(
+                        f"[RESUME] {len(drifted['files'])} file(s) this run covered changed on "
+                        "disk since; a resumed run continues on the code as it was. To examine "
+                        f"the edits, start a new run with --scan-mode {SCAN_MODE_CHANGED}.",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             # Re-examined ground is its own count: it neither failed nor
             # went unstarted, and folding it into either would misstate
             # what the earlier process did.
@@ -2060,6 +2284,10 @@ async def pipeline(
                 # object shared by every campaign; the evidence ledger is per
                 # campaign, like sandbox_executed.
                 finding_evidence={},
+                # What this campaign is about, when narrower than its target.
+                # Reaches every node through its instructions: the seed
+                # message below is seen by the first node only.
+                campaign_directive=change_focus,
             )
             current_run_context.set(branch_ctx)
             # Tell this campaign what the survey found here and which sibling areas are
@@ -2080,6 +2308,8 @@ async def pipeline(
                     # Context is an enhancement; a campaign without it is the behaviour
                     # that shipped before, so this must never cost the scan.
                     print(f"[SURVEY CONTEXT WARNING] {exc}", file=sys.stderr)
+            # The change-scoped directive is not appended to the seed: it is
+            # delivered to every node through campaign_directive below.
 
             # What earlier runs established here. Findings and learnings have always
             # accumulated across runs, but nothing assembled them for the node that
@@ -2155,6 +2385,19 @@ async def pipeline(
             steps_before = budget_ctrl.graph_steps
             llm_calls_before = budget_ctrl.llm_calls
             reads_before = budget_ctrl.audit_code_reads
+            # What this campaign is about to examine, as content: taken now,
+            # before the graph runs, and written to the ledger only if the
+            # campaign earns coverage credit below.
+            scope_content: list = []
+            try:
+                from core.cost import scope_identities
+                # A change-scoped campaign examined the changed files; the
+                # rest of the tree keeps the content it was covered as.
+                scope_files = focus_files if (scan_mode == SCAN_MODE_CHANGED and focus_files) \
+                    else _campaign_scope_files(group, scan_item, discovered_files)
+                scope_content = scope_identities(scope_files)
+            except Exception as exc:
+                print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
             try:
                 task_failed = await execute_sub_task(
                     runner,
@@ -2223,6 +2466,15 @@ async def pipeline(
                             db_path, run_id, group, scan_item, scan_mode,
                             harness_fingerprint=harness_fingerprint,
                         )
+                        # And as what content. Same gate as the stamps: a
+                        # campaign that read nothing examined no version of
+                        # these files, and recording one would let the next
+                        # run skip an unexamined file as "unchanged".
+                        try:
+                            from core.cost import record_coverage_files
+                            record_coverage_files(db_path, run_id, scan_item, scope_content)
+                        except Exception as exc:
+                            print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
                     else:
                         print(
                             f"[COVERAGE GUARD] '{scan_item}': campaign finished without "

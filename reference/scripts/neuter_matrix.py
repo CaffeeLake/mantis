@@ -321,6 +321,7 @@ SCENARIOS = {
          "        precomputed_astm=precomputed_astm,\n"
          "        token_budget=resolved_budget.max_tokens,\n"
          "        db_path=db_path,\n"
+         "        scope_out=scan_scope,\n"
          "    )",
          "    targets_to_scan, astm, scan_mode = [str(target_path)], None, \"whole\"  # NEUTERED"),
     ],
@@ -344,8 +345,8 @@ SCENARIOS = {
     ],
     "scope_revert_small_repo_passthrough": [
         ("main.py",
-         "        if len(discovered_files) <= threshold:\n            mode = SCAN_MODE_WHOLE\n        else:\n            uncovered = None",
-         "        if False:  # NEUTERED: every repository is split, however small\n            mode = SCAN_MODE_WHOLE\n        else:\n            uncovered = None"),
+         "        if len(discovered_files) <= threshold:\n            mode = SCAN_MODE_WHOLE\n            # A small repository is rescanned whole every run",
+         "        if False:  # NEUTERED: every repository is split, however small\n            mode = SCAN_MODE_WHOLE\n            # A small repository is rescanned whole every run"),
     ],
     "scope_revert_empty_slice_fallback": [
         ("main.py",
@@ -359,8 +360,8 @@ SCENARIOS = {
     ],
     "scope_revert_auto_sweep_guard": [
         ("main.py",
-         "        if len(discovered_files) <= threshold:\n            mode = SCAN_MODE_WHOLE\n        else:",
-         "        if False:  # NEUTERED: auto now picks the expensive per-file mode by itself\n            mode = SCAN_MODE_FILE_BY_FILE\n        else:"),
+         "        if len(discovered_files) <= threshold:\n            mode = SCAN_MODE_WHOLE\n            # A small repository is rescanned whole every run",
+         "        if False:  # NEUTERED: auto now picks the expensive per-file mode by itself\n            mode = SCAN_MODE_FILE_BY_FILE\n            # A small repository is rescanned whole every run"),
     ],
     "scope_revert_sweep_advisory": [
         ("main.py",

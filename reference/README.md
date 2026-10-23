@@ -245,12 +245,13 @@ The two modes answer different questions and are **complementary, not a quality
 ladder**. Their names describe *coverage* (how much of the tree is looked at)
 and *reach* (how much context one question spans), which vary independently.
 
-| Mode               | Coverage          | Reach        | What it is for                                                                                                                                                                                                                       |
-| ------------------ | ----------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `whole`            | one campaign      | whole target | Small targets that fit in a single listing.                                                                                                                                                                                          |
-| `file-by-file`     | every source file | one file     | Localized defects: the bad `memcpy`, the unchecked index, the missing authz call. Nothing is skipped for being unglamorous. Cost scales with file count.                                                                             |
-| `cross-functional` | ranked subsystems | many files   | Defects that span files, repositories or systems — invisible to a per-file pass by construction, because no single file contains the bug.                                                                                            |
-| `auto`             | —                 | —            | Whole target if it fits. Past that: `file-by-file` over every file no recorded campaign has covered — all files on a first scan, only the gap after a partial one — else `cross-functional`. An unreadable ledger counts as covered. |
+| Mode               | Coverage           | Reach        | What it is for                                                                                                                                                                                                                       |
+| ------------------ | ------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `whole`            | one campaign       | whole target | Small targets that fit in a single listing.                                                                                                                                                                                          |
+| `file-by-file`     | every source file  | one file     | Localized defects: the bad `memcpy`, the unchecked index, the missing authz call. Nothing is skipped for being unglamorous. Cost scales with file count.                                                                             |
+| `cross-functional` | ranked subsystems  | many files   | Defects that span files, repositories or systems — invisible to a per-file pass by construction, because no single file contains the bug.                                                                                            |
+| `auto`             | —                  | —            | Whole target if it fits. Past that: `file-by-file` over every file no recorded campaign has covered — all files on a first scan, only the gap after a partial one — else `cross-functional`. An unreadable ledger counts as covered. |
+| `changed`          | new + edited files | whole target | The scan-fix-rescan loop: one campaign scoped to the files no completed scan has covered *in their present content*, with the rest of the tree readable for callers and routes. Nothing changed means nothing to scan.               |
 
 ```bash
 # Ask one researcher about every file, then dedupe downstream.
@@ -261,7 +262,22 @@ and *reach* (how much context one question spans), which vary independently.
 
 # Skip the work-plan confirmation (CI, cron, nohup).
 ./run.sh /path/to/repo --scan-mode file-by-file --yes
+
+# Scan, fix what it found, then examine only what you changed.
+./run.sh /path/to/repo
+#   ... edit storage.py and dal/repo.py ...
+./run.sh /path/to/repo --scan-mode changed
+#   Scan mode changed: 2 of 29 source file(s) to examine (2 changed since last
+#   covered, 0 never covered); one campaign over the target, scoped to them.
 ```
+
+The ledger records the content of every file a completed campaign examined, so
+"covered" means covered *as it is now*: a file edited since is uncovered again
+in every mode that consults coverage (`auto` on a large tree re-examines it
+automatically; a small tree is rescanned whole as before, with a note naming
+`--scan-mode changed`). `--resume` is different on purpose: it continues a run
+on the code as it was and says when that code has moved. Files covered before
+content was recorded count as covered until they are scanned once more.
 
 Running `file-by-file` first gives a later `cross-functional` pass real evidence
 to plan from, and `auto` encodes exactly that workflow, file by file: it sweeps

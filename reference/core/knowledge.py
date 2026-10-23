@@ -382,8 +382,33 @@ def _export_coverage(conn: sqlite3.Connection, repo_root: Optional[str]) -> Dict
         scanned[(rel, model)] = {"path": rel, "scan_mode": _scrub(r.get("scan_mode"), MAX_SHORT_CHARS),
                                  "last_run_id": run_id, "model": model,
                                  "harness_fingerprint": _scrub(r.get("harness_fingerprint"), MAX_SHORT_CHARS)}
+    # What content each covered file was examined as (core.cost
+    # .coverage_files), so an importing checkout can tell a file edited
+    # since from one that merely moved machines. mtime is not exported: it
+    # is this machine's; the importer hashes once instead.
+    files: List[Dict[str, Any]] = []
+    try:
+        from core.cost import has_coverage_files_table
+
+        if has_coverage_files_table(conn):
+            latest: Dict[tuple, Dict[str, Any]] = {}
+            for row in conn.execute(
+                    "SELECT path, run_id, content_hash, size FROM coverage_files ORDER BY id ASC").fetchall():
+                r = dict(row)
+                rel = _relativize(str(r.get("path") or ""), repo_root)
+                run_id = _scrub(r.get("run_id"), MAX_SHORT_CHARS)
+                digest = _scrub(r.get("content_hash"), MAX_SHORT_CHARS)
+                if not rel or not digest:
+                    continue
+                latest[(rel, models.get(run_id, ""))] = {
+                    "path": rel, "run_id": run_id, "model": models.get(run_id, ""),
+                    "content_hash": digest,
+                    "size": int(r["size"]) if r.get("size") is not None else None}
+            files = [latest[k] for k in sorted(latest)]
+    except sqlite3.Error:
+        files = []
     return {"schema_version": SCHEMA_VERSION, "runs": runs,
-            "scanned": [scanned[k] for k in sorted(scanned)]}
+            "scanned": [scanned[k] for k in sorted(scanned)], "files": files}
 
 
 def _git_head(repo_root: Optional[str]) -> str:
@@ -745,6 +770,42 @@ def _import_coverage(db_path: str, path: Path, repo_root: str, targets: List[str
                         metadata={"imported": True}, harness_fingerprint=fingerprint):
             already.add((abs_path, run_id))
             paths += 1
+    # The content each file was covered as. Bounded to the exporter's shape;
+    # an entry without a well-formed hash imports as nothing, which leaves
+    # the file covered as it was (INV-6). No mtime: the importer's files are
+    # a different checkout, and the first probe hashes them once.
+    try:
+        from core.cost import CONTENT_HASH_CHARS, record_coverage_files
+
+        have: set = set()
+        try:
+            conn = _connect(db_path)
+            try:
+                have = {(r[0], str(r[1] or ""), str(r[2] or "")) for r in conn.execute(
+                    "SELECT path, run_id, content_hash FROM coverage_files").fetchall()}
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            have = set()
+        by_run: Dict[str, list] = {}
+        for entry in (data.get("files") or [])[:100_000]:
+            if not isinstance(entry, dict):
+                continue
+            rel = _clean_rel_path(entry.get("path"))
+            digest = _short(entry.get("content_hash")).lower()
+            if not rel or not re.match(r"^[0-9a-f]{%d}$" % CONTENT_HASH_CHARS, digest):
+                continue
+            run_id = _short(entry.get("run_id")) or "imported"
+            abs_path = os.path.join(root, rel)
+            if (abs_path, run_id, digest) in have:
+                continue
+            size = entry.get("size")
+            by_run.setdefault(run_id, []).append(
+                (abs_path, digest, int(size) if isinstance(size, int) and size >= 0 else None, None))
+        for run_id, rows in by_run.items():
+            record_coverage_files(db_path, run_id, root, rows)
+    except Exception:
+        pass
     return runs, paths
 
 

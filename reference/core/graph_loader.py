@@ -1140,6 +1140,49 @@ def _make_stage_experience_before_model_callback(node_id: str):
     return _before_model
 
 
+CAMPAIGN_DIRECTIVE_MARKER = "[CAMPAIGN DIRECTIVE]"
+
+
+def _make_campaign_directive_before_model_callback(node_id: str):
+    """Appends the campaign's directive (RunContext.campaign_directive) to
+    every model request of this node.
+
+    Nodes run with include_contents="none": each sees its instruction and
+    the previous node's reply, and only the first node sees the seed
+    message. A directive that says what this campaign is about -- the
+    change-scoped run's file list -- therefore cannot ride in the seed; it
+    has to be appended to each node's instructions, the way stage
+    experience is. Idempotent per request (the marker is checked), bounded
+    like every appended block, and never the reason a request fails.
+    """
+
+    def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
+        try:
+            if llm_request is None:
+                return None
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            directive = str(getattr(ctx, "campaign_directive", "") or "") if ctx is not None else ""
+            if not directive:
+                return None
+            sys_inst = str(
+                getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
+            )
+            if CAMPAIGN_DIRECTIVE_MARKER in sys_inst:
+                return None
+            block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
+            if len(block) > MAX_APPENDED_INSTRUCTION_CHARS:
+                block = block[:MAX_APPENDED_INSTRUCTION_CHARS] + "\n[directive truncated]"
+            if hasattr(llm_request, "append_instructions"):
+                llm_request.append_instructions([block])
+        except Exception:
+            pass
+        return None
+
+    return _before_model
+
+
 def _make_reflector_after_model_callback(node_id: str):
     """Parses and persists the <experience> blocks emitted by the reflector.
 
@@ -2078,9 +2121,10 @@ def load_workflow_from_json(
                 node_id, node_cfg.tools, model=node_model_id
             )
 
-            agent_kwargs["before_model_callback"] = (
-                _make_stage_experience_before_model_callback(node_id)
-            )
+            agent_kwargs["before_model_callback"] = [
+                _make_stage_experience_before_model_callback(node_id),
+                _make_campaign_directive_before_model_callback(node_id),
+            ]
             if node_id == "reflector" or (
                 node_cfg.skill and "mantis-reflect" in node_cfg.skill
             ):

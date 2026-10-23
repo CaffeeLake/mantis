@@ -86,11 +86,12 @@ WHICH HARNESS COVERED IT
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -219,6 +220,229 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     # column from the CREATE above.
     if not has_fingerprint_column(conn):
         conn.execute("ALTER TABLE campaign_spend ADD COLUMN harness_fingerprint TEXT")
+    # What content a completed campaign examined, file by file. The spend
+    # row says a target was covered; this says covered AS WHAT, so a later
+    # run can tell an unchanged file from one edited since (issue #15). A
+    # ledger without this table reads as "content unknown", which covers
+    # (INV-6).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coverage_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            campaign_target TEXT,
+            path TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            size INTEGER,
+            mtime_ns INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_coverage_files_path ON coverage_files(path)")
+
+
+def has_coverage_files_table(conn: sqlite3.Connection) -> bool:
+    """Whether this ledger records what content it covered. Readers ask
+    rather than migrate, for the reason has_fingerprint_column gives."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'coverage_files'").fetchone()
+    return bool(row)
+
+
+#: Hex digits of SHA-256 kept per file: enough to never collide inside one
+#: repository, short enough to export in bulk.
+CONTENT_HASH_CHARS = 16
+
+
+def file_identity(path: str) -> Optional[tuple[str, int, int]]:
+    """`(content_hash, size, mtime_ns)` of a regular file, or None when it
+    cannot be read. The hash is of the bytes; size and mtime are kept so a
+    later check can skip the read when neither moved."""
+    try:
+        st = os.stat(path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:CONTENT_HASH_CHARS], int(st.st_size), int(st.st_mtime_ns)
+    except (OSError, ValueError):
+        return None
+
+
+def scope_identities(files: Iterable[str]) -> list[tuple[str, str, int, int]]:
+    """`(path, content_hash, size, mtime_ns)` for every readable file in
+    `files`. Taken at campaign START, since that is the content the campaign
+    examines; a file edited while the scan runs is recorded as it was read."""
+    out = []
+    for f in files:
+        ident = file_identity(str(f))
+        if ident is not None:
+            out.append((str(f), *ident))
+    return out
+
+
+def record_coverage_files(db_path: str, run_id: str, campaign_target: str,
+                          identities: Iterable[tuple[str, str, int, int]]) -> int:
+    """Records which content a completed campaign covered. Returns rows
+    written. Never raises: bookkeeping, like record_spend (INV-6)."""
+    rows = [(str(run_id), str(campaign_target), str(p), str(h),
+             int(s) if s is not None else None, int(m) if m is not None else None)
+            for p, h, s, m in identities if p and h]
+    if not db_path or not rows:
+        return 0
+    conn = None
+    try:
+        conn = _connect(db_path)
+        with conn:
+            _ensure_table(conn)
+            conn.executemany(
+                "INSERT INTO coverage_files (run_id, campaign_target, path, content_hash, size, mtime_ns) "
+                "VALUES (?, ?, ?, ?, ?, ?)", rows)
+        return len(rows)
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def _covered_identities(db_path: str, model: str = "", run_id: str = "") -> dict:
+    """Every path with recorded content, mapped to the identities
+    `(content_hash, size | None, mtime_ns | None)` it was covered as -- by
+    this model and by unknown models when `model` is given (the rule
+    _completed_coverage follows), by one run when `run_id` is given. `{}`
+    when the ledger records no content. Raises when it exists but cannot be
+    read; callers decide what that means."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    conn = _connect(db_path)
+    try:
+        if not has_coverage_files_table(conn):
+            return {}
+        rows = _content_rows(conn, model, run_id)
+    finally:
+        conn.close()
+    out: dict = {}
+    for path, content_hash, size, mtime_ns, _run in rows:
+        if path and content_hash:
+            out.setdefault(str(path), set()).add((str(content_hash), size, mtime_ns))
+    return out
+
+
+def _content_rows(conn: sqlite3.Connection, model: str = "", run_id: str = "") -> list:
+    """`(path, content_hash, size, mtime_ns, run_id)` rows of coverage_files
+    under the same model rule as _completed_coverage."""
+    if run_id:
+        return conn.execute(
+            "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files WHERE run_id = ?",
+            (str(run_id),)).fetchall()
+    has_runs = model and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+    if has_runs:
+        return conn.execute(
+            "SELECT c.path, c.content_hash, c.size, c.mtime_ns, c.run_id FROM coverage_files c "
+            "LEFT JOIN runs r ON r.run_id = c.run_id "
+            "WHERE r.model = ? OR r.model IS NULL OR r.model = ''", (str(model),)).fetchall()
+    return conn.execute(
+        "SELECT path, content_hash, size, mtime_ns, run_id FROM coverage_files").fetchall()
+
+
+def _coverage_runs(db_path: str, model: str = "") -> tuple[dict, set]:
+    """`(target -> run ids of completed campaigns over it, run ids that
+    recorded content)`, under the model rule of _completed_coverage. Lets a
+    reader tell a file that exists under a covered directory but was NOT
+    there when the covering campaign ran: that campaign recorded content
+    for its files and has none for this one. `({}, set())` when the ledger
+    has no table; raises when it cannot be read."""
+    if not db_path or not os.path.exists(db_path):
+        return {}, set()
+    conn = _connect(db_path)
+    try:
+        try:
+            has_runs = model and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+            if has_runs:
+                rows = conn.execute(
+                    "SELECT s.target, s.metadata_json, s.run_id FROM campaign_spend s "
+                    "LEFT JOIN runs r ON r.run_id = s.run_id "
+                    "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                    (str(model),)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT target, metadata_json, run_id FROM campaign_spend WHERE target IS NOT NULL"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return {}, set()
+            raise
+        recorded: set = set()
+        if has_coverage_files_table(conn):
+            recorded = {str(r[4]) for r in _content_rows(conn, model) if r[4]}
+    finally:
+        conn.close()
+    targets: dict = {}
+    for target, metadata_json, run in rows:
+        t = str(target or "").rstrip("/")
+        if t and run and not _row_failed(metadata_json):
+            targets.setdefault(t, set()).add(str(run))
+    return targets, recorded
+
+
+def content_changed(path: str, identities: Iterable[tuple]) -> bool:
+    """Whether `path` differs now from every identity it was covered as.
+
+    Size and mtime decide without reading when they both still match a
+    recorded pair (the git-index rule); otherwise the file is hashed once.
+    A file that cannot be read now is not reported as changed -- it is not
+    scannable either, and the caller's file list will not contain it.
+    """
+    ids = list(identities)
+    if not ids:
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    for _h, size, mtime_ns in ids:
+        if size is not None and mtime_ns is not None and int(size) == st.st_size and int(mtime_ns) == st.st_mtime_ns:
+            return False
+    ident = file_identity(path)
+    if ident is None:
+        return False
+    return all(ident[0] != str(h) for h, _s, _m in ids)
+
+
+def content_recorded_for(db_path: str, files, model: str = "") -> int:
+    """How many of `files` the ledger holds content for (for this model).
+    Zero on a ledger that predates content recording, which is how a caller
+    tells "nothing changed" from "nothing is known". Never raises."""
+    try:
+        covered = _covered_identities(db_path, model)
+    except Exception:
+        return 0
+    return sum(1 for f in files if str(f) in covered)
+
+
+def changed_files(db_path: str, files, model: str = "", run_id: str = "") -> Optional[dict]:
+    """`{"files": [...]}`: the subset of `files` whose content the ledger
+    recorded (for this model, or for one run) and that differs now. None
+    when the ledger cannot be read. Files with no recorded content are not
+    changed -- they are covered or uncovered, which uncovered_files says."""
+    if not db_path:
+        return None
+    try:
+        covered = _covered_identities(db_path, model, run_id=run_id)
+        if not covered:
+            return {"files": []}
+        return {"files": [str(f) for f in files if content_changed(str(f), covered.get(str(f), ()))]}
+    except Exception:
+        return None
 
 
 def has_fingerprint_column(conn: sqlite3.Connection) -> bool:
@@ -333,6 +557,7 @@ def uncovered_files(
     model: str = "",
     harness_fingerprint: str = "",
     rescan_changed_harness: bool = False,
+    rescan_changed_files: bool = True,
 ) -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
 
@@ -353,6 +578,16 @@ def uncovered_files(
     `rescan_changed_harness` it is uncovered and swept again. A row with no
     fingerprint covers the file for every harness, exactly as a row with no
     model covers it for every model (INV-6).
+
+    A covered file whose CONTENT differs from every version the ledger
+    recorded it as (coverage_files; see changed_files) was never examined
+    in its present form, and with `rescan_changed_files` -- the default --
+    it is uncovered. So is a file under a covered directory that the
+    covering campaign recorded no content for while recording it for its
+    other files: it was not there when that campaign ran. A file the ledger
+    recorded no content for because content was not being recorded (covered
+    before this existed, or by an import that did not carry it) is covered
+    as it always was (INV-6).
 
     A file counts as covered when some completed campaign's target was the
     file itself or an ancestor directory of it: scanning `repo/lib` covers
@@ -383,12 +618,27 @@ def uncovered_files(
         targets = _completed_coverage(db_path, model)
         if targets is None:
             return all_files  # Ledger never written: genuine first run.
+        covered_as = _covered_identities(db_path, model) if rescan_changed_files else {}
+        target_runs, recording_runs = _coverage_runs(db_path, model) if covered_as else ({}, set())
         current = str(harness_fingerprint or "")
         out = []
         for path in all_files:
             verdict = coverage_verdict(_covering_fingerprints(path, targets), current)
             if verdict == "uncovered" or (verdict == "mismatched" and rescan_changed_harness):
                 out.append(path)
+            elif covered_as:
+                ids = covered_as.get(path)
+                if ids:
+                    if content_changed(path, ids):
+                        out.append(path)
+                elif recording_runs:
+                    # Covered only by campaigns that recorded content, and
+                    # none recorded this file: it did not exist then. If any
+                    # covering campaign predates content recording nothing
+                    # can be told, and the file is covered (INV-6).
+                    covering = _covering_fingerprints(path, target_runs) or set()
+                    if covering and covering <= recording_runs:
+                        out.append(path)
         return out
     except Exception:
         return None

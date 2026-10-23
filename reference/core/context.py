@@ -63,6 +63,12 @@ class RunContext:
     # stamp, which upgrades only the findings named here. Empty means no
     # evidence was attributed to any finding.
     finding_evidence: dict[str, dict] = field(default_factory=dict)
+    # Operator-side text every agent node of this campaign must see: what
+    # the campaign is about when that is narrower than its target (a
+    # change-scoped run). Nodes run with include_contents="none", so only
+    # the first node sees the seed message; this is appended to each node's
+    # instructions instead (core.graph_loader). Empty means no directive.
+    campaign_directive: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None
