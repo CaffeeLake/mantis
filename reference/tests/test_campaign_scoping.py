@@ -246,6 +246,62 @@ class GetFindingsCampaignScopeTest(_DbTest):
         self.install_ctx(target_file="app/a.py", active_node="reviewer")
         self.assertEqual(self._titles(get_findings("other/b.py")), {"other-campaign"})
 
+    def _rows(self, raw):
+        import json
+        body = raw[raw.index("["):raw.rindex("]") + 1]
+        return {f["title"]: f for f in json.loads(body)}
+
+    def test_run_wide_stages_get_other_campaigns_as_an_index(self):
+        # The full record is the campaign's own; the rest of the run is an
+        # index (id, file, title, severity, status), one get_findings(filepath)
+        # away. A sweep's reporter otherwise read every campaign's description
+        # and root cause -- hundreds of thousands of tokens -- on every turn.
+        from tools.research_tools import get_findings
+        for stage in ("reporter", "chainer"):
+            self.install_ctx(target_file="app/a.py", active_node=stage)
+            rows = self._rows(get_findings())
+            self.assertIn("description", rows["mine"], stage)
+            self.assertNotIn("scope", rows["mine"], stage)
+            other = rows["other-campaign"]
+            self.assertEqual(other["scope"], "other_campaign", stage)
+            self.assertNotIn("description", other, stage)
+            self.assertEqual(other["filepath"], "other/b.py", stage)
+            self.assertIn("status", other, stage)
+            # The index entry names the way back to the record.
+            self.assertEqual(self._titles(get_findings("other/b.py")), {"other-campaign"})
+
+    def test_whole_repo_campaign_keeps_full_records(self):
+        from tools.research_tools import get_findings
+        self.install_ctx(target_file="", active_node="reporter")
+        rows = self._rows(get_findings())
+        self.assertTrue(all("description" in f and "scope" not in f for f in rows.values()))
+
+    def test_full_record_payload_is_capped_closed_findings_first(self):
+        from unittest import mock
+
+        import tools.research_tools as rt
+        from core.database import update_finding_status_by_id
+        big = "x" * 5000
+        write_findings(
+            self.db, "",
+            [_finding(f"f{i}", "app/a.py", description=big) for i in range(20)],
+            run_id="r1",
+        )
+        ids = {f["title"]: f["id"] for f in read_findings(self.db, run_id="r1")}
+        for i in range(10):
+            update_finding_status_by_id(self.db, ids[f"f{i}"], "r1", "false_positive")
+        self.install_ctx(target_file="app/a.py", active_node="reviewer")
+        with mock.patch.object(rt, "GET_FINDINGS_FULL_CHARS", 60_000):
+            rows = self._rows(rt.get_findings())
+        full = {t for t, f in rows.items() if "description" in f}
+        indexed = {t for t, f in rows.items() if f.get("scope") == "this_campaign"}
+        self.assertEqual(len(rows), 21, "nothing disappears; some rows shrink")
+        self.assertTrue({f"f{i}" for i in range(10)} <= indexed, "closed findings go to the index first")
+        self.assertTrue(full, "open findings stay full while they fit")
+        self.assertLessEqual(
+            len(rt.json.dumps([f for f in rows.values() if "description" in f], indent=2)), 60_000
+        )
+
 
 class PersistFindingDismissalsTest(_DbTest):
     def setUp(self):

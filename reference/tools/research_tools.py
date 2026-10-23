@@ -694,6 +694,56 @@ def report_findings(report: VulnerabilityReport) -> str:
 # other stage sees only its own campaign's findings.
 _RUN_WIDE_FINDINGS_NODES = frozenset({"reporter", "chainer"})
 
+# What a run-wide stage is shown of ANOTHER campaign's finding. The full
+# record (description, root-cause summary, patch, triage) is the campaign's
+# own; the rest of the run is an index. A file-by-file sweep records hundreds
+# of findings under one run id, and handing every reporter the full run --
+# half a million tokens by the hundred-and-fiftieth finding -- crossed the
+# session compaction threshold on every turn: the compactor replaced the
+# reporter's context, the reporter re-read the run, and the campaign never
+# ended. A finding in the index is one get_findings(filepath) away.
+_FINDING_INDEX_FIELDS = ("id", "filepath", "title", "severity", "status", "cwe", "mantis_risk_score")
+
+# A full-record payload larger than this falls back to the index for the
+# closed findings (dismissed, merged, mitigated), newest-first full records
+# for the rest. Characters of JSON, about a quarter of the compaction
+# threshold in tokens, so one tool response can never trip it alone.
+GET_FINDINGS_FULL_CHARS = 400_000
+
+_CLOSED_FINDING_STATUSES = frozenset({
+    "false_positive", "non_viable", "duplicate_merged", "mitigated", "archived",
+})
+
+
+def _finding_index_entry(finding: dict) -> dict:
+    entry = {k: finding.get(k) for k in _FINDING_INDEX_FIELDS if finding.get(k) is not None}
+    entry["scope"] = "other_campaign"
+    entry["detail"] = "index entry; get_findings(filepath) returns the full record"
+    return entry
+
+
+def _bounded_findings(own: list, others: list) -> list:
+    """Own findings in full, the run's others as index entries; the full
+    records trimmed to GET_FINDINGS_FULL_CHARS by indexing closed ones first,
+    then the oldest."""
+    full = list(own)
+    index = [_finding_index_entry(f) for f in others]
+    size = lambda rows: len(json.dumps(rows, indent=2, default=str))  # noqa: E731
+    if size(full) > GET_FINDINGS_FULL_CHARS:
+        keep = [f for f in full if str(f.get("status") or "") not in _CLOSED_FINDING_STATUSES]
+        demoted = [f for f in full if str(f.get("status") or "") in _CLOSED_FINDING_STATUSES]
+        while keep and size(keep) > GET_FINDINGS_FULL_CHARS:
+            demoted.insert(0, keep.pop(0))
+        for f in demoted:
+            e = _finding_index_entry(f)
+            e["scope"] = "this_campaign"
+            e["detail"] = "index entry (payload cap); get_findings(filepath) returns the full record"
+            index.append(e)
+        full = keep
+    rows = full + index
+    rows.sort(key=lambda f: int(f.get("id") or 0))
+    return rows
+
 
 def get_findings(filepath: str = "") -> str:
     """Retrieves recorded vulnerability findings for the current run context or target file."""
@@ -711,15 +761,19 @@ def get_findings(filepath: str = "") -> str:
         # every campaign shares one run_id, so an unscoped read returned other
         # campaigns' findings -- which downstream stages could not even open
         # under the single-file jail. Same subtree rule as update_status.
-        scope = None
-        if not clean_fp and getattr(ctx, "active_node", "") not in _RUN_WIDE_FINDINGS_NODES:
-            scope = getattr(ctx, "target_file", "") or None
-        findings = read_findings(
-            resolved_db,
-            filepath=clean_fp if clean_fp else None,
-            run_id=ctx.run_id,
-            scope_path=scope,
-        )
+        own_scope = getattr(ctx, "target_file", "") or None
+        run_wide = getattr(ctx, "active_node", "") in _RUN_WIDE_FINDINGS_NODES
+        if clean_fp:
+            # An explicit file: the full records for that file, as always.
+            findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
+        else:
+            own = read_findings(resolved_db, run_id=ctx.run_id, scope_path=own_scope)
+            others: list = []
+            if run_wide and own_scope:
+                own_ids = {f.get("id") for f in own}
+                others = [f for f in read_findings(resolved_db, run_id=ctx.run_id)
+                          if f.get("id") not in own_ids]
+            findings = _bounded_findings(own, others)
         if not findings:
             target_desc = f" for '{filepath}'" if filepath else ""
             return f"NO_DATA: Zero findings recorded in database{target_desc}."
@@ -728,7 +782,7 @@ def get_findings(filepath: str = "") -> str:
         # and reaches the reviewer, critic, calibrator and reporter. Fenced
         # like every other model-to-model channel (memory, correlator,
         # planner), not handed to the gate stages as bare text.
-        return wrap_untrusted_content(json.dumps(findings, indent=2), filename="recorded_findings")
+        return wrap_untrusted_content(json.dumps(findings, indent=2, default=str), filename="recorded_findings")
     except Exception as e:
         return f"ERROR RETRIEVING FINDINGS: {e}"
 
