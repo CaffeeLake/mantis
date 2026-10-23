@@ -249,7 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-compaction",
         action="store_true",
-        help="Disable ADK event compaction",
+        help=(
+            "Force ADK event compaction off for this run even when the workflow "
+            "config enables it (it is off by default: stages see only their own "
+            "events, and in-stage compaction rewrote a stage's working context)."
+        ),
     )
     parser.add_argument(
         "--no-context-cache",

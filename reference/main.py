@@ -2555,7 +2555,7 @@ async def pipeline(
         return 2
 
     compaction_config = None
-    use_compaction = config.get("enable_compaction", True) if enable_compaction is None else enable_compaction
+    use_compaction = config.get("enable_compaction", False) if enable_compaction is None else enable_compaction
     if use_compaction:
         comp_model_id = config.get("compaction_model") or config.get("default_model") or "vertex_ai/gemini-3.5-flash-lite"
         # Through the SAME kwargs resolution every other model uses: a bare

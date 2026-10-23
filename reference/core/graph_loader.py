@@ -147,7 +147,17 @@ class GlobalConfig(_Base):
     pin_snapshot: bool = True
     pass_number: int = 1
     snapshot_keep: int = 2
-    enable_compaction: bool = True
+    # Session compaction is off unless the operator turns it on. Every node
+    # runs with include_contents="none" and sees only its own events, so a
+    # summary of earlier events never reaches a prompt -- except by the one
+    # route that is harmful: the token-threshold compactor runs before a
+    # model call and summarises the CURRENT stage's own tool results out
+    # from under it. A stage whose working set it rewrote re-read that
+    # state and was compacted again, indefinitely; and models that bind
+    # reasoning to its prefix (preserved thinking) reject the rewritten
+    # request outright. The node context ceiling (graph_loader) bounds a
+    # stage's working set without editing anything already sent.
+    enable_compaction: bool = False
     compaction_token_threshold: int = Field(default=500000, gt=0)
     compaction_event_retention: int = Field(default=50, ge=0)
     enable_context_cache: bool = True
@@ -1136,6 +1146,103 @@ def _make_stage_experience_before_model_callback(node_id: str):
         except Exception:
             pass
         return None
+
+    return _before_model
+
+
+# Share of the model's input window a node's own context may reach before
+# the stage is ended. Below the pre-dispatch refusal (core.config, 0.9) so
+# the stage ends in order -- its findings, notes and evidence already
+# recorded -- instead of the campaign aborting on a request that cannot
+# fit. Above the tool-response cap (0.25 per response) so ordinary stages
+# never see it.
+NODE_CONTEXT_CEILING_RATIO = 0.8
+
+# Characters per token for the ceiling estimate. Denser than the fail-open
+# constant the request guard uses (4): the payloads that fill a context are
+# tool responses -- code and JSON -- and recorded findings measured 2.2
+# chars/token. A conservative estimate ends a stage a little early; a
+# generous one lets it reach the refusal.
+NODE_CONTEXT_CHARS_PER_TOKEN = 3
+
+NODE_CONTEXT_CEILING_TEXT = (
+    "[CONTEXT CEILING] This stage's working context has reached the model's "
+    "window. The stage ends here; everything it recorded through tools stands, "
+    "and the next stage reads it from the store."
+)
+
+
+def _request_chars(llm_request: Any) -> int:
+    """Characters in a request: instruction, every content part, tool schemas.
+    Counts the request as built -- what the model would be sent -- so it is
+    the same number whatever the session looks like."""
+    total = 0
+    config = getattr(llm_request, "config", None)
+    total += len(str(getattr(config, "system_instruction", "") or ""))
+    for content in getattr(llm_request, "contents", None) or []:
+        for part in getattr(content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            if text:
+                total += len(text)
+            call = getattr(part, "function_call", None)
+            if call is not None:
+                total += len(json.dumps(getattr(call, "args", None) or {}, default=str))
+            response = getattr(part, "function_response", None)
+            if response is not None:
+                total += len(json.dumps(getattr(response, "response", None) or {}, default=str))
+    tools = getattr(llm_request, "tools_dict", None) or {}
+    total += 2000 * len(tools)
+    return total
+
+
+def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = None):
+    """Ends a stage whose own context has reached the model's window.
+
+    Append-only by construction. Models that bind reasoning to its prefix
+    (preserved thinking) reject a request whose earlier messages, instruction
+    or tools changed under a retained thinking block, so the one thing this
+    must never do is edit the request: no trimming of old tool responses, no
+    summarisation in place. It returns a final response instead -- no model
+    call is made, nothing already sent is altered -- and the node ends the
+    way a node ends when the model stops calling tools. Runs last among the
+    before-model callbacks so the instruction it measures is the one sent.
+    """
+    limit_cache: dict[str, Optional[int]] = {}
+
+    def _limit() -> Optional[int]:
+        if "limit" not in limit_cache:
+            try:
+                from core.config import resolve_context_limit, resolve_input_token_cap
+                limits = [l for l in (resolve_context_limit(model) if model else None,
+                                      resolve_input_token_cap()) if l]
+                limit_cache["limit"] = min(limits) if limits else None
+            except Exception:
+                limit_cache["limit"] = None
+        return limit_cache["limit"]
+
+    def _before_model(callback_context: Any = None, llm_request: Any = None):
+        try:
+            if llm_request is None:
+                return None
+            limit = _limit()
+            if not limit:
+                return None
+            estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
+            ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
+            if estimated < ceiling:
+                return None
+            print(
+                f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
+                f"against a {limit:,}-token window (ceiling {ceiling:,}); ending the stage "
+                "with its recorded work in place.",
+                file=sys.stderr,
+            )
+            from google.adk.models import LlmResponse
+            return LlmResponse(
+                content=types.Content(role="model", parts=[types.Part.from_text(text=NODE_CONTEXT_CEILING_TEXT)])
+            )
+        except Exception:
+            return None
 
     return _before_model
 
@@ -2169,6 +2276,8 @@ def load_workflow_from_json(
             agent_kwargs["before_model_callback"] = [
                 _make_stage_experience_before_model_callback(node_id),
                 _make_campaign_directive_before_model_callback(node_id),
+                # Last: measures the request as the two above leave it.
+                _make_node_context_ceiling_before_model_callback(node_id, model=node_model_id),
             ]
             if node_id == "reflector" or (
                 node_cfg.skill and "mantis-reflect" in node_cfg.skill
