@@ -69,6 +69,14 @@ class RunContext:
     # the first node sees the seed message; this is appended to each node's
     # instructions instead (core.graph_loader). Empty means no directive.
     campaign_directive: str = ""
+    # Data-side context for the stages that decide where to look (the
+    # slice briefing, what earlier runs found here, cross-area leads, the
+    # coverage note, the survey's focus): the blocks main.py also places in
+    # the seed message, which only the first node reads. Appended, bounded,
+    # to the instructions of the architect, threat modeler, planner,
+    # researchers, reviewer and critic (core.graph_loader.CONTEXT_STAGES).
+    # Each block carries its own fencing. Empty means none.
+    campaign_context: str = ""
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

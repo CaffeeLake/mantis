@@ -88,8 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-effort",
         type=str,
-        choices=["low", "medium", "high"],
-        help="Reasoning effort override (low, medium, high)",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Reasoning effort override for every node (low, medium, high; xhigh and max "
+            "where the model offers them, as current Anthropic models do -- a model "
+            "without them is sent the nearest level it has)."
+        ),
     )
     parser.add_argument("--timeout", type=float, help="LLM request timeout in seconds")
     parser.add_argument("--db", "-d", type=str, help="Path to knowledge SQLite database")

@@ -255,6 +255,45 @@ def canonical_filepath(fp: str, target_file: str = "") -> str:
 
     return posixpath.normpath(raw)
 
+def _drop_artifact_uniqueness(cursor) -> None:
+    """Rebuilds campaign_artifacts without UNIQUE(run_id, filepath) on a
+    database that has it.
+
+    The constraint made one row per (run, path): the second campaign of a
+    run to write workspace/.structured/plan.json replaced the first's, and
+    under --parallel the first campaign's researcher then read the second's
+    plan. Rows now belong to campaigns (metadata.resource) and several may
+    share a path within a run, so the constraint has to go; SQLite cannot
+    drop it in place, so the table is rebuilt once, keeping every row and
+    id. A database created by this version never has it."""
+    try:
+        unique = any(
+            row[2] == 1 and row[3] != "pk"
+            for row in cursor.execute("PRAGMA index_list(campaign_artifacts)").fetchall()
+        )
+    except sqlite3.Error:
+        return
+    if not unique:
+        return
+    cursor.execute("""
+        CREATE TABLE campaign_artifacts__rebuilt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            artifact_type TEXT,
+            filepath TEXT,
+            content TEXT,
+            metadata_json TEXT DEFAULT '{}'
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO campaign_artifacts__rebuilt (id, run_id, timestamp, artifact_type, filepath, content, metadata_json)
+        SELECT id, run_id, timestamp, artifact_type, filepath, content, metadata_json FROM campaign_artifacts
+    """)
+    cursor.execute("DROP TABLE campaign_artifacts")
+    cursor.execute("ALTER TABLE campaign_artifacts__rebuilt RENAME TO campaign_artifacts")
+
+
 def init_db(db_path: str):
     """Initialize the SQLite database with tables, unique indexes, and enforce schema versioning."""
     with _db(db_path, check_version=False) as conn:
@@ -363,10 +402,11 @@ def init_db(db_path: str):
                 artifact_type TEXT,
                 filepath TEXT,
                 content TEXT,
-                metadata_json TEXT DEFAULT '{}',
-                UNIQUE(run_id, filepath)
+                metadata_json TEXT DEFAULT '{}'
             )
         """)
+        _drop_artifact_uniqueness(cursor)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaign_artifacts_run_path ON campaign_artifacts(run_id, filepath)")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS learnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1274,6 +1314,156 @@ def update_finding_status_by_id(db_path: str, finding_id: int, run_id: str, stat
         """, (status, fid, run_id))
 
 
+# --- Regression checks: what a later run decided about an earlier finding ---------
+
+REGRESSION_OUTCOMES = ("still_present", "fixed", "inconclusive")
+REGRESSION_EVIDENCE = ("dynamic", "static", "lineage", "none")
+OPEN_FINDING_STATUSES = ("reported", "static_confirmed", "dynamic_confirmed", "confirmed", "viable", "reproduced")
+
+
+def _ensure_regression_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS regression_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            prior_finding_id INTEGER NOT NULL,
+            prior_run_id TEXT,
+            lineage_id TEXT,
+            outcome TEXT NOT NULL,
+            evidence TEXT NOT NULL DEFAULT 'none',
+            reason TEXT,
+            node TEXT,
+            new_finding_id INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_regression_prior ON regression_checks(prior_finding_id)")
+
+
+def record_regression_check(db_path: str, run_id: str, prior_finding_id: int, outcome: str,
+                            reason: str = "", evidence: str = "none", node: str = "",
+                            new_finding_id: Optional[int] = None) -> Optional[int]:
+    """Records what run `run_id` decided about an earlier run's finding: it
+    is still present, it is fixed, or it could not be told. `evidence` says
+    on what: dynamic (the prior PoC re-run), static (a reviewer naming the
+    guard), lineage (the same finding was re-reported), none. Returns the
+    row id; None when the prior finding does not exist or the inputs are
+    out of vocabulary. Never raises: bookkeeping (INV-6)."""
+    outcome = str(outcome or "").strip().lower()
+    evidence = str(evidence or "none").strip().lower()
+    if outcome not in REGRESSION_OUTCOMES or evidence not in REGRESSION_EVIDENCE:
+        return None
+    try:
+        pid = int(prior_finding_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        with _db(db_path) as conn:
+            _ensure_regression_table(conn)
+            row = conn.execute("SELECT run_id, lineage_id FROM findings WHERE id = ?", (pid,)).fetchone()
+            if row is None:
+                return None
+            cur = conn.execute(
+                "INSERT INTO regression_checks (run_id, prior_finding_id, prior_run_id, lineage_id, outcome, "
+                "evidence, reason, node, new_finding_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(run_id), pid, str(row[0] or ""), str(row[1] or ""), outcome, evidence,
+                 str(reason or "")[:4000], str(node or ""),
+                 int(new_finding_id) if new_finding_id else None))
+            return int(cur.lastrowid)
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return None
+
+
+def read_regression_checks(db_path: str, run_id: Optional[str] = None,
+                           prior_finding_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """The checks recorded, newest first; filtered by the checking run and/or
+    the prior finding. [] when the table does not exist. Never raises."""
+    try:
+        with _db(db_path) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'regression_checks'").fetchone():
+                return []
+            q = "SELECT * FROM regression_checks WHERE 1=1"
+            params: list = []
+            if run_id:
+                q += " AND run_id = ?"
+                params.append(str(run_id))
+            if prior_finding_id is not None:
+                q += " AND prior_finding_id = ?"
+                params.append(int(prior_finding_id))
+            q += " ORDER BY id DESC"
+            return [dict(r) for r in conn.execute(q, params).fetchall()]
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return []
+
+
+def prior_findings_touching(db_path: str, current_run_id: str, rel_paths: Sequence[str],
+                            scope_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Open findings from runs other than `current_run_id` that sit in one of
+    `rel_paths` (target-relative, as findings store them) or cite one in
+    their code_paths. What a change-scoped run must say something about.
+    Oldest first, one entry per finding. Never raises."""
+    wanted = {str(p).replace("\\", "/").lstrip("./") for p in rel_paths if str(p).strip()}
+    if not wanted:
+        return []
+    try:
+        rows = read_findings(db_path, scope_path=scope_path)
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for f in rows:
+        if str(f.get("run_id") or "") == str(current_run_id):
+            continue
+        if str(f.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
+            continue
+        fp = str(f.get("filepath") or "").replace("\\", "/")
+        cited: set = set()
+        raw = f.get("code_paths")
+        try:
+            paths = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        except ValueError:
+            paths = []
+        for entry in paths if isinstance(paths, list) else []:
+            if isinstance(entry, str):
+                cited.add(entry.split(":")[0].replace("\\", "/"))
+            elif isinstance(entry, dict):
+                for key in ("file", "filepath", "path"):
+                    if entry.get(key):
+                        cited.add(str(entry[key]).split(":")[0].replace("\\", "/"))
+        if fp in wanted or cited & wanted:
+            out.append(f)
+    return out
+
+
+def mitigate_finding(db_path: str, finding_id: int, reason: str, by_run_id: str = "") -> bool:
+    """Closes an earlier finding as mitigated -- the defect was fixed -- the
+    way the MCP server's resolve_finding does, with the reason kept on the
+    row. Allowed over any open status including machine-confirmed ones:
+    fixing confirmed findings is the point. Returns whether the status
+    changed. Never raises."""
+    try:
+        fid = int(finding_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with _db(db_path) as conn:
+            row = conn.execute("SELECT run_id, status, triage_reasoning FROM findings WHERE id = ?", (fid,)).fetchone()
+            if row is None:
+                return False
+            prior_status = str(row[1] or "").lower()
+        update_finding_status_by_id(db_path, fid, str(row[0] or ""), "mitigated")
+        with _db(db_path) as conn:
+            now = str(conn.execute("SELECT status FROM findings WHERE id = ?", (fid,)).fetchone()[0] or "").lower()
+            if now != "mitigated" or prior_status == "mitigated":
+                return False
+            note = f"[mitigated by run {str(by_run_id)[:8] or 'later'}] {str(reason or '').strip()}"[:2000]
+            existing = str(row[2] or "")
+            conn.execute("UPDATE findings SET triage_reasoning = ? WHERE id = ?",
+                         ((existing + "\n" if existing else "") + note, fid))
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
 def read_findings(
     db_path: str,
     filepath: Optional[str] = None,
@@ -1788,14 +1978,38 @@ def import_okf_bundle(
     return imported_count
 
 
+def _artifact_resource(metadata_json: Any) -> str:
+    """The campaign an artifact row belongs to (`metadata.resource`, the
+    campaign's target path), '' for run-level rows and rows written before
+    campaigns recorded it."""
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(meta.get("resource") or "") if isinstance(meta, dict) else ""
+
+
 def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str, content: str, metadata: Optional[dict] = None):
-    """Record a campaign artifact in the database, replacing prior rows for the same filepath in this run."""
+    """Record a campaign artifact in the database, replacing prior rows for the
+    same filepath in this run AND the same campaign.
+
+    Campaigns of one run share the run id, and under --parallel several are
+    in flight at once. A plan, threat model or summary written at a fixed
+    path by campaign B must not replace campaign A's: the row's campaign is
+    `metadata.resource` (the campaign target, which the tools record), and
+    only rows of that campaign are replaced. Run-level artifacts (no
+    resource) replace run-level rows, as before."""
+    resource = str((metadata or {}).get("resource") or "")
     with _db(db_path) as conn:
         cursor = conn.cursor()
         meta_str = json.dumps(metadata or {})
-        cursor.execute("DELETE FROM campaign_artifacts WHERE run_id = ? AND filepath = ?", (run_id, filepath))
+        rows = cursor.execute("SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ? AND filepath = ?",
+                              (run_id, filepath)).fetchall()
+        doomed = [r[0] for r in rows if _artifact_resource(r[1]) == resource]
+        if doomed:
+            cursor.execute(f"DELETE FROM campaign_artifacts WHERE id IN ({','.join('?' * len(doomed))})", doomed)
         cursor.execute("""
-            INSERT OR REPLACE INTO campaign_artifacts (run_id, artifact_type, filepath, content, metadata_json)
+            INSERT INTO campaign_artifacts (run_id, artifact_type, filepath, content, metadata_json)
             VALUES (?, ?, ?, ?, ?)
         """, (run_id, artifact_type, filepath, content, meta_str))
 
@@ -1877,17 +2091,23 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
         except Exception:
             pass
 
-def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[str]:
-    """Retrieve an artifact's content from the database by filepath or artifact_type strictly scoped to run_id when provided."""
-    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None,
+                  resource: Optional[str] = None) -> Optional[str]:
+    """Retrieve an artifact's content from the database by filepath or artifact_type strictly scoped to run_id when provided.
+
+    `resource` is the reading campaign's target: with it, the row returned
+    is that campaign's own, or a run-level row (no resource), never a
+    sibling campaign's -- see read_artifact_record."""
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id, resource=resource)
     return rec["content"] if rec else None
 
 
-def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> bool:
+def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None,
+                         resource: Optional[str] = None) -> bool:
     """Whether the artifact a read would return came from a knowledge import
     rather than from this run's own tools. Imported text is a repository's
     file: it is read as untrusted content, fenced, not as the run's memory."""
-    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id, resource=resource)
     if not rec:
         return False
     try:
@@ -1897,8 +2117,17 @@ def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = 
     return isinstance(meta, dict) and bool(meta.get("imported"))
 
 
-def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[dict]:
-    """The latest matching artifact row as {content, metadata_json}, or None."""
+def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None,
+                         resource: Optional[str] = None) -> Optional[dict]:
+    """The latest matching artifact row as {content, metadata_json}, or None.
+
+    With `resource` (the reading campaign's target), only that campaign's
+    rows and run-level rows (no resource) qualify, the campaign's own first.
+    Campaigns of one run share the run id and, under --parallel, the clock:
+    without this a researcher's get_plan() returned whichever campaign's
+    planner wrote last, and read_file("workspace/notes.md") returned a
+    sibling campaign's agent-written text. None keeps the old behaviour for
+    callers outside a campaign (imports, cross-run reads)."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         query = "SELECT content, metadata_json FROM campaign_artifacts WHERE 1=1"
@@ -1912,12 +2141,25 @@ def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = 
         if run_id:
             query += " AND run_id = ?"
             params.append(run_id)
-        query += " ORDER BY id DESC LIMIT 1"
+        query += " ORDER BY id DESC"
+        if resource is None:
+            query += " LIMIT 1"
         cursor.execute(query, params)
-        row = cursor.fetchone()
-        if row:
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+        if resource is None:
+            row = rows[0]
             return {"content": row["content"], "metadata_json": row["metadata_json"]}
-        return None
+        want = str(resource)
+        fallback = None
+        for row in rows:
+            owner = _artifact_resource(row["metadata_json"])
+            if owner == want:
+                return {"content": row["content"], "metadata_json": row["metadata_json"]}
+            if owner == "" and fallback is None:
+                fallback = {"content": row["content"], "metadata_json": row["metadata_json"]}
+        return fallback
 
 
 def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:

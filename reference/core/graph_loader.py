@@ -1141,20 +1141,56 @@ def _make_stage_experience_before_model_callback(node_id: str):
 
 
 CAMPAIGN_DIRECTIVE_MARKER = "[CAMPAIGN DIRECTIVE]"
+CAMPAIGN_CONTEXT_MARKER = "[CAMPAIGN CONTEXT]"
+#: Characters of campaign context appended per node. Larger than the stage
+#: experience cap: the memory block alone lists every earlier finding here.
+MAX_CAMPAIGN_CONTEXT_CHARS = 8000
+#: Characters of campaign directive appended per node: the change-scoped
+#: file list, the prior-findings brief and the PoC re-run note together.
+MAX_CAMPAIGN_DIRECTIVE_CHARS = 12000
+#: The stages that decide where to look. Matched by node id prefix, so
+#: `researcher_2` in a parallel archetype counts. The reproducer, patcher,
+#: calibrator, reflector and reporter work from this run's findings through
+#: tools, and earlier runs' findings in their instructions would be a way
+#: for history to leak into this run's report.
+CONTEXT_STAGES = ("architect", "threat_modeler", "planner", "researcher", "reviewer", "critic")
+
+
+def _wants_campaign_context(node_id: str) -> bool:
+    nid = str(node_id or "")
+    return any(nid == s or nid.startswith(s + "_") or nid.startswith(s + "-") for s in CONTEXT_STAGES)
+
+
+def _close_open_fence(text: str) -> str:
+    """A cut that fell inside an untrusted-data block gets the closing
+    delimiter back, so the fence never stays open over the instruction
+    that follows (the same rule bound_appended_instruction keeps)."""
+    from core.llm_gateway import UNTRUSTED_DATA_END, UNTRUSTED_DATA_START
+
+    opened = text.count(UNTRUSTED_DATA_START.split(" ")[0])
+    closed = text.count(UNTRUSTED_DATA_END)
+    if opened > closed:
+        return text + "\n" + UNTRUSTED_DATA_END
+    return text
 
 
 def _make_campaign_directive_before_model_callback(node_id: str):
-    """Appends the campaign's directive (RunContext.campaign_directive) to
-    every model request of this node.
+    """Appends the campaign's directive and context (RunContext
+    .campaign_directive / .campaign_context) to this node's model requests.
 
     Nodes run with include_contents="none": each sees its instruction and
     the previous node's reply, and only the first node sees the seed
-    message. A directive that says what this campaign is about -- the
-    change-scoped run's file list -- therefore cannot ride in the seed; it
-    has to be appended to each node's instructions, the way stage
-    experience is. Idempotent per request (the marker is checked), bounded
-    like every appended block, and never the reason a request fails.
+    message. What a campaign is about (a change-scoped run's file list),
+    and what earlier runs established here (the memory block, the leads,
+    the slice briefing), therefore cannot ride in the seed; they are
+    appended to each node's instructions, the way stage experience is.
+    The directive reaches every node; the context reaches the stages that
+    decide where to look (CONTEXT_STAGES). Data before instruction, so the
+    directive is never enclosed by a context block's untrusted-data fence.
+    Idempotent per request (markers), bounded, never the reason a request
+    fails.
     """
+    wants_context = _wants_campaign_context(node_id)
 
     def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
         try:
@@ -1163,19 +1199,28 @@ def _make_campaign_directive_before_model_callback(node_id: str):
             from core.context import current_run_context
 
             ctx = current_run_context.get()
-            directive = str(getattr(ctx, "campaign_directive", "") or "") if ctx is not None else ""
-            if not directive:
+            if ctx is None:
+                return None
+            directive = str(getattr(ctx, "campaign_directive", "") or "")
+            context = str(getattr(ctx, "campaign_context", "") or "") if wants_context else ""
+            if not directive and not context:
                 return None
             sys_inst = str(
                 getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
             )
-            if CAMPAIGN_DIRECTIVE_MARKER in sys_inst:
-                return None
-            block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
-            if len(block) > MAX_APPENDED_INSTRUCTION_CHARS:
-                block = block[:MAX_APPENDED_INSTRUCTION_CHARS] + "\n[directive truncated]"
-            if hasattr(llm_request, "append_instructions"):
-                llm_request.append_instructions([block])
+            blocks = []
+            if context and CAMPAIGN_CONTEXT_MARKER not in sys_inst:
+                block = f"\n\n{CAMPAIGN_CONTEXT_MARKER}{context}"
+                if len(block) > MAX_CAMPAIGN_CONTEXT_CHARS:
+                    block = _close_open_fence(block[:MAX_CAMPAIGN_CONTEXT_CHARS]) + "\n[campaign context truncated]"
+                blocks.append(block)
+            if directive and CAMPAIGN_DIRECTIVE_MARKER not in sys_inst:
+                block = f"\n\n{CAMPAIGN_DIRECTIVE_MARKER}{directive}"
+                if len(block) > MAX_CAMPAIGN_DIRECTIVE_CHARS:
+                    block = _close_open_fence(block[:MAX_CAMPAIGN_DIRECTIVE_CHARS]) + "\n[directive truncated]"
+                blocks.append(block)
+            if blocks and hasattr(llm_request, "append_instructions"):
+                llm_request.append_instructions(blocks)
         except Exception:
             pass
         return None

@@ -31,6 +31,9 @@ from core.truncation import truncate_with_marker
 # trace for the reached-sink sentinel, and a silent cut before the sentinel
 # reads as "the PoC never got there".
 MAX_OUTPUT = 16000
+#: Hard lifetime of one guest, enforced by the runtime: six hours is longer
+#: than any campaign and bounds what a missed close() can cost.
+MAX_GUEST_LIFETIME_SECONDS = 6 * 3600
 
 
 class MicrosandboxEnvironment(BaseEnvironment):
@@ -48,6 +51,8 @@ class MicrosandboxEnvironment(BaseEnvironment):
         image: str = "mantis-sandbox:latest",
         timeout_seconds: float = 30.0,
         workdir: str = "/workspace",
+        memory: Optional[int] = None,
+        cpus: Optional[int] = None,
     ):
         super().__init__()
         if sys.platform.startswith("linux") and not os.access("/dev/kvm", os.R_OK | os.W_OK):
@@ -58,6 +63,12 @@ class MicrosandboxEnvironment(BaseEnvironment):
         self.target_path = os.path.abspath(target_path) if target_path else ""
         self.image = image
         self.timeout = timeout_seconds
+        # Guest sizing (sandbox.options.memory in MiB, sandbox.options.cpus).
+        # None leaves the runtime's defaults; a compiled target's PoCs (a Go
+        # or Rust build) need more than a script's. Bounded so a workflow
+        # file cannot ask one VM for the host.
+        self.memory = min(int(memory), 16384) if memory else None
+        self.cpus = min(int(cpus), 16) if cpus else None
         self._workdir = Path(workdir)
         self._sb: Optional[MsbSandbox] = None
         self._name: Optional[str] = None
@@ -72,12 +83,22 @@ class MicrosandboxEnvironment(BaseEnvironment):
             raise self._stage_error
         if self._sb is None:
             name = f"mantis-msb-{uuid.uuid4().hex[:12]}"
+            sizing = {}
+            if self.memory:
+                sizing["memory"] = self.memory
+            if self.cpus:
+                sizing["cpus"] = self.cpus
             sb = await MsbSandbox.create(
                 name=name,
                 image=self.image,
                 network=Network.none(),
                 pull_policy=PullPolicy.NEVER,
                 replace=True,
+                # A guest outlives no campaign: whatever close() misses, the
+                # runtime reaps. Longer than any campaign, shorter than a
+                # forgotten weekend.
+                max_duration=float(MAX_GUEST_LIFETIME_SECONDS),
+                **sizing,
             )
             await sb.fs.mkdir(str(self._workdir))
 
@@ -119,11 +140,20 @@ class MicrosandboxEnvironment(BaseEnvironment):
                 timed_out=False,
             )
         except Exception as e:
+            # The SDK's timeout error says "exec timed out" (ExecTimeoutError),
+            # which "timeout" did not match; a hung PoC then read as exit 1,
+            # not as a timeout, and a caller that treats "ran but no evidence"
+            # as a result (the regression re-run) would have called it fixed.
+            text = str(e).lower()
+            timed_out = (
+                "timeout" in text or "timed out" in text
+                or type(e).__name__.lower().endswith("timeouterror")
+            )
             return ExecutionResult(
                 stdout="",
                 stderr=f"SANDBOX-ERROR: {type(e).__name__}: {e}",
-                exit_code=1,
-                timed_out="timeout" in str(e).lower(),
+                exit_code=124 if timed_out else 1,
+                timed_out=timed_out,
             )
 
     def _confine_to_workdir(self, candidate: Path, original: Union[Path, str]) -> Path:
@@ -256,16 +286,27 @@ class MicrosandboxEnvironment(BaseEnvironment):
             )
 
     async def close(self) -> None:
+        """Stops and removes the guest. A stop that fails (a PoC that ignores
+        SIGTERM, a stuck exec) is followed by a kill and a forced destroy, so
+        a campaign never leaves a running VM behind: over a thousand
+        campaigns a one-percent leak is ten resident VMs."""
         if self._sb is not None:
+            sb, name = self._sb, self._name
             try:
-                await self._sb.stop()
+                await sb.stop(timeout=30)
+            except Exception:
+                try:
+                    await sb.kill(timeout=15)
+                except Exception:
+                    pass
+            try:
+                await sb.destroy(force=True, timeout=30)
             except Exception:
                 pass
             try:
-                if self._name:
-                    await MsbSandbox.remove(self._name)
+                if name:
+                    await MsbSandbox.remove(name)
             except Exception:
                 pass
-            finally:
-                self._sb = None
-                self.is_initialized = False
+            self._sb = None
+            self.is_initialized = False

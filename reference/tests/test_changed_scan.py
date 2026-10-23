@@ -415,6 +415,94 @@ class DirectiveReachesEveryNodeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.appended, [])
         cb(None, None)  # no request: no error
 
+    def _req(self, sys_inst="base"):
+        class Req:
+            def __init__(self, s):
+                self.config = type("C", (), {"system_instruction": s})()
+                self.appended = []
+
+            def append_instructions(self, items):
+                self.appended.extend(items)
+                self.config.system_instruction += "".join(items)
+        return Req(sys_inst)
+
+    def _run_cb(self, node, ctx):
+        from core.context import current_run_context
+        from core.graph_loader import _make_campaign_directive_before_model_callback
+
+        req = self._req()
+        token = current_run_context.set(ctx)
+        try:
+            _make_campaign_directive_before_model_callback(node)(None, req)
+        finally:
+            current_run_context.reset(token)
+        return req
+
+    async def test_context_reaches_the_deciding_stages_and_not_the_reporter(self):
+        """What earlier runs found here used to ride only in the seed, which
+        the history node alone reads. It now reaches the stages that choose
+        where to look; the reporter and the stages after reproduction work
+        from this run's findings and must not have earlier runs' findings in
+        their instructions."""
+        from core.context import RunContext
+        from core.graph_loader import CAMPAIGN_CONTEXT_MARKER, CAMPAIGN_DIRECTIVE_MARKER
+
+        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\n<memory>prior finding X</memory>",
+                         campaign_directive="\nCHANGE-SCOPED RUN: b.py")
+        for node in ("architect", "threat_modeler", "planner", "researcher", "researcher_2", "reviewer", "critic"):
+            req = self._run_cb(node, ctx)
+            joined = "".join(req.appended)
+            self.assertIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
+            self.assertIn("prior finding X", joined, node)
+            self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
+            self.assertLess(joined.index(CAMPAIGN_CONTEXT_MARKER), joined.index(CAMPAIGN_DIRECTIVE_MARKER),
+                            "data before instruction")
+        for node in ("history", "reproducer", "patcher", "calibrator", "reflector", "reporter"):
+            req = self._run_cb(node, ctx)
+            joined = "".join(req.appended)
+            self.assertNotIn(CAMPAIGN_CONTEXT_MARKER, joined, node)
+            self.assertIn(CAMPAIGN_DIRECTIVE_MARKER, joined, node)
+
+    async def test_context_is_bounded_and_a_cut_fence_is_closed(self):
+        from core.context import RunContext
+        from core.graph_loader import MAX_CAMPAIGN_CONTEXT_CHARS
+        from core.llm_gateway import UNTRUSTED_DATA_END, wrap_untrusted_content
+
+        big = wrap_untrusted_content("x" * (MAX_CAMPAIGN_CONTEXT_CHARS * 2), filename="memory")
+        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\n" + big, campaign_directive="\nD")
+        req = self._run_cb("planner", ctx)
+        context_block, directive_block = req.appended
+        self.assertLess(len(context_block), MAX_CAMPAIGN_CONTEXT_CHARS + 200)
+        self.assertIn("[campaign context truncated]", context_block)
+        self.assertTrue(context_block.rstrip().endswith("[campaign context truncated]"))
+        self.assertIn(UNTRUSTED_DATA_END, context_block, "the fence a cut opened is closed before the directive")
+        self.assertLess(context_block.index(UNTRUSTED_DATA_END), context_block.index("[campaign context truncated]"))
+
+    async def test_appending_is_idempotent_per_request(self):
+        from core.context import RunContext, current_run_context
+        from core.graph_loader import _make_campaign_directive_before_model_callback
+
+        ctx = RunContext(jail_dir="/tmp", db_path="", campaign_context="\nC", campaign_directive="\nD")
+        req = self._req()
+        token = current_run_context.set(ctx)
+        try:
+            cb = _make_campaign_directive_before_model_callback("planner")
+            cb(None, req)
+            cb(None, req)
+        finally:
+            current_run_context.reset(token)
+        self.assertEqual(len(req.appended), 2)
+
+    def test_execute_sub_task_sets_the_context_on_both_paths(self):
+        import inspect
+
+        import main
+
+        src = inspect.getsource(main.execute_sub_task)
+        self.assertIn("campaign_context = ", src)
+        self.assertLess(src.index("campaign_context = "), src.index("if resumed_invocation_id:"),
+                        "a resumed invocation sends no seed; the context must be set before the branch")
+
 
 class ExportImportTest(_Repo):
     def test_content_hashes_round_trip_through_a_knowledge_export(self):

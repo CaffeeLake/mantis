@@ -55,6 +55,8 @@ class MicrosandboxCreationTest(unittest.TestCase):
         env.target_path = ""
         env.image = "mantis-sandbox:latest"
         env.timeout = 30.0
+        env.memory = None
+        env.cpus = None
         env._workdir = Path("/workspace")
         env._sb = None
         env._name = None
@@ -91,6 +93,34 @@ class MicrosandboxCreationTest(unittest.TestCase):
         self.assertEqual(kwargs.get("pull_policy"), __import__("microsandbox").PullPolicy.NEVER,
                          "a run must not fetch images; the operator pulls what the guest runs")
         self.assertTrue(str(kwargs["name"]).startswith("mantis-msb-"))
+
+    def test_sizing_is_optional_and_bounded(self):
+        from core.environments import microsandbox_env as M
+
+        env = M.MicrosandboxEnvironment.__new__(M.MicrosandboxEnvironment)
+        with mock.patch.object(M.os, "access", return_value=True):
+            M.MicrosandboxEnvironment.__init__(env, target_path="", memory=4096, cpus=4)
+        self.assertEqual((env.memory, env.cpus), (4096, 4))
+        with mock.patch.object(M.os, "access", return_value=True):
+            M.MicrosandboxEnvironment.__init__(env, target_path="", memory=10**9, cpus=10**3)
+        self.assertEqual((env.memory, env.cpus), (16384, 16), "a workflow file cannot ask one VM for the host")
+        with mock.patch.object(M.os, "access", return_value=True):
+            M.MicrosandboxEnvironment.__init__(env, target_path="")
+        self.assertEqual((env.memory, env.cpus), (None, None), "defaults stay the runtime's")
+        env.memory, env.cpus = 2048, 2
+        env._sb = None; env._name = None; env._stage_error = None; env.is_initialized = False
+        env._workdir = Path("/workspace")
+        seen: dict = {}
+
+        async def fake_create(name, **kwargs):
+            seen.update(kwargs)
+            return _FakeSandbox()
+
+        with mock.patch.object(M.MsbSandbox, "create", side_effect=fake_create):
+            asyncio.run(env.initialize())
+        self.assertEqual((seen.get("memory"), seen.get("cpus")), (2048, 2))
+        self.assertEqual(seen["network"], __import__("microsandbox.types", fromlist=["Network"]).Network.none(),
+                         "sizing never changes the network")
 
     def test_the_source_says_the_same_thing(self):
         """A second, independent witness: the literal call site. If someone

@@ -92,6 +92,14 @@ def _resolve_entry_cap(env_var: str, default: int) -> int:
     return default
 
 
+def _own_resource(ctx) -> str:
+    """The campaign an artifact read belongs to: this campaign's target.
+    Campaigns of one run share the run id; under --parallel they share the
+    clock too, so a read scoped by run alone can return a sibling's plan or
+    notes. '' when the context has no target (outside a campaign)."""
+    return str(getattr(ctx, "target_file", "") or "")
+
+
 def _resolve_context_db(ctx: Any) -> Optional[str]:
     """Safely resolves and anchors the context db_path before existence checks or opens."""
     if ctx is None or not getattr(ctx, "db_path", None):
@@ -138,7 +146,7 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
         resolved_db = _resolve_context_db(ctx)
         if resolved_db and os.path.exists(resolved_db):
             # Check campaign_artifacts by exact filepath first (returns documents written via write_file)
-            art = read_artifact(resolved_db, filepath=clean_path, run_id=ctx.run_id)
+            art = read_artifact(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx))
             if art is None and clean_path.startswith("workspace/"):
                 art = read_artifact(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id)
             if art is None:
@@ -147,13 +155,13 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
             # Fallback for structured harness artifacts if no document exists at this exact path
             if art is None:
                 if clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md"):
-                    art = read_artifact(resolved_db, artifact_type="threat_model", run_id=ctx.run_id)
+                    art = read_artifact(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
                 elif clean_path in ("mantis-summary.md", "workspace/mantis-summary.md"):
-                    art = read_artifact(resolved_db, artifact_type="summary", run_id=ctx.run_id)
+                    art = read_artifact(resolved_db, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
                 elif clean_path in ("workspace/plan.json", "plan.json"):
-                    art = read_artifact(resolved_db, artifact_type="plan", run_id=ctx.run_id)
+                    art = read_artifact(resolved_db, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
                 elif clean_path.startswith("workspace/report/review_packet") or clean_path in ("workspace/review_packet.md", "review_packet-latest.md"):
-                    art = read_artifact(resolved_db, artifact_type="report", run_id=ctx.run_id)
+                    art = read_artifact(resolved_db, artifact_type="report", run_id=ctx.run_id, resource=_own_resource(ctx))
 
             if art is not None:
                 # The marker rides outside the untrusted fence (when one is
@@ -164,10 +172,10 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
                 # from the repository, not this run's own notes: it is read
                 # the way any repository file is, fenced as untrusted.
                 from core.database import artifact_is_imported
-                if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id) or \
+                if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id, resource=_own_resource(ctx)) or \
                         artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
                         (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
-                         and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id)):
+                         and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))):
                     return wrap_untrusted_content(art, filename=clean_path) + cut_note
                 return art + cut_note
 
@@ -222,7 +230,12 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
     if ctx.target_file and os.path.isfile(ctx.target_file) and ctx.jail_dir and clean_path:
         req_target = os.path.realpath(os.path.join(ctx.jail_dir, clean_path))
         real_target = os.path.realpath(ctx.target_file)
-        if os.path.exists(req_target) and req_target != real_target:
+        jail_real = os.path.realpath(ctx.jail_dir)
+        inside_jail = req_target == jail_real or req_target.startswith(jail_real + os.sep)
+        # Containment before existence: a path outside the jail gets the
+        # sandbox's "escapes the workspace" answer whether or not it exists
+        # on the host, so the two messages cannot be used to probe the host.
+        if inside_jail and req_target != real_target and os.path.exists(req_target):
             return f"Error: Permission denied. Single-file scans may only read the scanned file '{os.path.basename(real_target)}'."
 
     sandbox = ctx.sandbox
@@ -950,10 +963,17 @@ async def list_files(directory: str = "") -> str:
                 with _db(resolved_db) as conn:
                     cursor = conn.cursor()
                     if ctx.run_id:
-                        cursor.execute("SELECT filepath FROM campaign_artifacts WHERE run_id = ?", (ctx.run_id,))
+                        cursor.execute("SELECT filepath, metadata_json FROM campaign_artifacts WHERE run_id = ?", (ctx.run_id,))
                     else:
-                        cursor.execute("SELECT filepath FROM campaign_artifacts WHERE run_id = ''")
-                    for (fp,) in cursor.fetchall():
+                        cursor.execute("SELECT filepath, metadata_json FROM campaign_artifacts WHERE run_id = ''")
+                    from core.database import _artifact_resource
+                    own = _own_resource(ctx)
+                    for fp, meta in cursor.fetchall():
+                        # This campaign's rows and run-level rows; a sibling
+                        # campaign's notes are not this campaign's workspace.
+                        owner = _artifact_resource(meta)
+                        if owner and own and owner != own:
+                            continue
                         fp_norm = fp.replace("\\", "/").removeprefix("./")
                         # Filter out internal structured metadata from user-facing directory list
                         if "workspace/.structured" in fp_norm:
@@ -1047,9 +1067,9 @@ def get_plan() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="plan", run_id=ctx.run_id)
+    art = read_artifact(ctx.db_path, artifact_type="plan", run_id=ctx.run_id, resource=_own_resource(ctx))
     if not art:
-        art = read_artifact(ctx.db_path, filepath="workspace/plan.json", run_id=ctx.run_id)
+        art = read_artifact(ctx.db_path, filepath="workspace/plan.json", run_id=ctx.run_id, resource=_own_resource(ctx))
     if art:
         # Model-written after reading the target: fenced like get_findings.
         return wrap_untrusted_content(art, filename="recorded_plan")
@@ -1096,9 +1116,9 @@ def get_threat_model() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="threat_model", run_id=ctx.run_id)
+    art = read_artifact(ctx.db_path, artifact_type="threat_model", run_id=ctx.run_id, resource=_own_resource(ctx))
     if not art:
-        art = read_artifact(ctx.db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=ctx.run_id)
+        art = read_artifact(ctx.db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=ctx.run_id, resource=_own_resource(ctx))
     if art:
         return wrap_untrusted_content(art, filename="recorded_threat_model")
     return "NO_DATA: No threat model recorded in database."
@@ -1124,9 +1144,9 @@ def get_summary() -> str:
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
         return "Error: No active execution context or database path."
-    art = read_artifact(ctx.db_path, artifact_type="summary", run_id=ctx.run_id)
+    art = read_artifact(ctx.db_path, artifact_type="summary", run_id=ctx.run_id, resource=_own_resource(ctx))
     if not art:
-        art = read_artifact(ctx.db_path, filepath="mantis-summary.md", run_id=ctx.run_id)
+        art = read_artifact(ctx.db_path, filepath="mantis-summary.md", run_id=ctx.run_id, resource=_own_resource(ctx))
 
     is_empty_summary = False
     if art:
@@ -1139,9 +1159,9 @@ def get_summary() -> str:
                 is_empty_summary = True
 
     if not art or is_empty_summary:
-        kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/architecture.md", run_id=ctx.run_id)
+        kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/architecture.md", run_id=ctx.run_id, resource=_own_resource(ctx))
         if not kb_arch:
-            kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/index.md", run_id=ctx.run_id)
+            kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/index.md", run_id=ctx.run_id, resource=_own_resource(ctx))
         if kb_arch:
             return wrap_untrusted_content(kb_arch, filename="recorded_summary")
         if art and not is_empty_summary:
@@ -1275,6 +1295,107 @@ def get_security_guidance(filepath: str = "") -> str:
         return guidance.get("guidance_summary", "")
     except Exception as e:
         return f"ERROR RETRIEVING SECURITY GUIDANCE: {e}"
+
+
+def record_regression_check(prior_finding_id: int, outcome: str, reason: str, new_finding_id: int = 0) -> str:
+    """Records what this run decided about a finding an EARLIER run reported in a file this run examines: 'still_present', 'fixed', or 'inconclusive'. A finding re-run through its PoC is judged by that run's evidence."""
+    from core.database import OPEN_FINDING_STATUSES, REGRESSION_OUTCOMES, read_findings
+    from core.database import record_regression_check as _record
+
+    ctx = current_run_context.get()
+    if ctx is None or not ctx.db_path:
+        return "Error: No active execution context or database path."
+    verdict = str(outcome or "").strip().lower()
+    if verdict not in REGRESSION_OUTCOMES:
+        return f"Error: outcome must be one of {list(REGRESSION_OUTCOMES)}, got {outcome!r}."
+    if not str(reason or "").strip():
+        return "Error: a non-empty reason is required: it is the audit trail for the decision."
+    try:
+        pid = int(prior_finding_id)
+    except (TypeError, ValueError):
+        return f"Error: prior_finding_id must be an integer, got {prior_finding_id!r}."
+    resolved_db = _resolve_context_db(ctx) or ctx.db_path
+    prior = next((f for f in read_findings(resolved_db) if f.get("id") == pid), None)
+    if prior is None:
+        return f"Error: no finding with id {pid}."
+    if str(prior.get("run_id") or "") == str(ctx.run_id or ""):
+        return (f"Error: finding {pid} belongs to THIS run. A regression check is about a finding an earlier "
+                "run reported; this run's own findings are judged by review and reproduction.")
+    if str(prior.get("status") or "").lower() not in OPEN_FINDING_STATUSES:
+        return f"Error: finding {pid} is already closed ({prior.get('status')}); nothing to check."
+
+    # The evidence is the harness's, not the caller's word. A re-run of the
+    # prior PoC under this finding id is on the per-finding ledger; a
+    # re-report of the same finding carries its lineage; otherwise the
+    # decision is a reading of the code.
+    evidence = "static"
+    own = dict(getattr(ctx, "finding_evidence", {}) or {}).get(str(pid))
+    linked = None
+    if new_finding_id:
+        linked = next((f for f in read_findings(resolved_db, run_id=ctx.run_id) if f.get("id") == int(new_finding_id)), None)
+        if linked is None:
+            return f"Error: new_finding_id {new_finding_id} is not a finding of this run."
+    if own is not None:
+        evidence = "dynamic"
+        if verdict == "fixed" and own.get("reproduced"):
+            return (f"Error: the PoC for finding {pid} reached its sink in this run (evidence_present=True); "
+                    "that is 'still_present', not 'fixed'.")
+        if verdict == "still_present" and not own.get("reproduced") and linked is None:
+            return (f"Error: the PoC for finding {pid} did not reach its sink in this run. Record "
+                    "'still_present' with the new_finding_id that re-reports it, or 'inconclusive' "
+                    "if the PoC no longer runs.")
+    elif linked is not None:
+        evidence = "lineage"
+    if verdict == "inconclusive":
+        evidence = "none" if own is None else "dynamic"
+    row_id = _record(resolved_db, ctx.run_id or "", pid, verdict, reason=str(reason).strip(),
+                     evidence=evidence, node=str(getattr(ctx, "active_node", "") or ""),
+                     new_finding_id=int(new_finding_id) if new_finding_id else None)
+    if row_id is None:
+        return "Error: the check could not be recorded."
+    return (f"SUCCESS: recorded {verdict} for earlier finding {pid} ('{str(prior.get('title') or '')[:80]}') "
+            f"with {evidence} evidence.")
+
+
+async def get_prior_poc(prior_finding_id: int) -> str:
+    """Fetches the proof-of-concept an EARLIER run wrote for one of its findings (workspace/repro_<id>.py) into this run's workspace as workspace/repro_prior_<id>.py, so it can be re-run UNCHANGED against the current code."""
+    from core.database import read_artifact, read_findings
+
+    ctx = current_run_context.get()
+    if ctx is None or not ctx.db_path:
+        return "Error: No active execution context or database path."
+    try:
+        pid = int(prior_finding_id)
+    except (TypeError, ValueError):
+        return f"Error: prior_finding_id must be an integer, got {prior_finding_id!r}."
+    resolved_db = _resolve_context_db(ctx) or ctx.db_path
+    prior = next((f for f in read_findings(resolved_db) if f.get("id") == pid), None)
+    if prior is None:
+        return f"Error: no finding with id {pid}."
+    prior_run = str(prior.get("run_id") or "")
+    if prior_run == str(ctx.run_id or ""):
+        return f"Error: finding {pid} is this run's own; its PoC is in workspace/ already."
+    content = None
+    source = ""
+    for ext in ("py", "sh", "c", "js", "txt"):
+        candidate = f"workspace/repro_{pid}.{ext}"
+        content = read_artifact(resolved_db, filepath=candidate, run_id=prior_run)
+        if content:
+            source = candidate
+            break
+    if not content:
+        return (f"NO_DATA: the run that reported finding {pid} left no PoC artifact (workspace/repro_{pid}.*). "
+                "Judge it from the code and the entry point instead, and record the check as 'static' reasoning.")
+    ext = source.rsplit(".", 1)[-1]
+    dest = f"workspace/repro_prior_{pid}.{ext}"
+    res = await write_file(dest, content)
+    if not str(res).startswith("SUCCESS"):
+        return f"Error: could not place the prior PoC in this workspace: {res}"
+    head = "\n".join(str(content).splitlines()[:12])
+    return (f"SUCCESS: prior PoC for finding {pid} (from run {prior_run[:8]}, {len(content)} chars) placed at {dest}. "
+            f"Run it UNCHANGED with run_sandbox_with_evidence(command=..., finding_id={pid}, "
+            f"sentinel_path='sentinel_{pid}', sink_symbol=...). Its sentinel path was whatever it wrote before; "
+            f"read {dest} if unsure.\n" + wrap_untrusted_content(head, filename=dest))
 
 
 def query_lineage(signature: str = "", lineage_id: str = "", filepath: str = "") -> str:

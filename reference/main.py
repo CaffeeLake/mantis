@@ -146,6 +146,21 @@ async def execute_sub_task(
                     resumed_invocation_id = inv_id
                 break
 
+    # The briefing, memory, leads, coverage note and focus, for the stages
+    # that decide where to look. The seed message below is read by the first
+    # node only (each node runs with include_contents="none", and ADK starts
+    # a node's turn at the previous node's reply), so these are also handed
+    # to the architect, threat modeler, planner, researchers, reviewer and
+    # critic through their instructions (core.graph_loader.CONTEXT_STAGES).
+    # Set on both paths: a resumed invocation sends no seed at all. Same
+    # order as the seed: data first, operator-authored notes last and
+    # outside any fence.
+    _ctx_for_context = current_run_context.get()
+    if _ctx_for_context is not None:
+        _ctx_for_context.campaign_context = "".join(
+            part for part in (slice_briefing, prior_memory, hypotheses, coverage_note, focus_directive) if part
+        )
+
     if resumed_invocation_id:
         new_message = None
     else:
@@ -1080,6 +1095,221 @@ def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
     return counts
 
 
+#: Output that means a re-run PoC never got as far as attacking: the harness
+#: cannot say whether the bug is fixed from such a run. An AssertionError or
+#: an application error is NOT in this list: those are the exploit failing.
+_POC_SETUP_FAILURE_MARKERS = (
+    "ModuleNotFoundError",
+    "ImportError",
+    "SyntaxError",
+    "No such file or directory",
+    "command not found",
+    "SANDBOX-UNAVAILABLE",
+    "SANDBOX-ERROR",
+)
+
+
+async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict]) -> str:
+    """Re-runs, unchanged, the PoC each prior finding's run left behind,
+    against the code as it is now, and records what happened as a dynamic
+    regression check. Returns a note for the campaign directive.
+
+    Done by the harness before the graph runs: it does not depend on which
+    stages a campaign reaches (a run that finds nothing goes straight to the
+    report), and the guest is still the operator's code, before any patch
+    the patcher may apply. The PoC must have proved the finding before (the
+    finding is dynamic_confirmed) for its silence to mean anything now:
+    then reaching the sink is still_present, not reaching it when the PoC
+    ran is fixed, and a PoC that did not run (traceback, missing module,
+    exit 127) is inconclusive and left to the stages. A static-only sandbox
+    re-runs nothing. Never raises.
+    """
+    from core.database import read_artifact, record_regression_check
+    from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence
+
+    sandbox = getattr(ctx, "sandbox", None)
+    if sandbox is None or type(sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
+        return ""
+    results: list[str] = []
+    for p in prior:
+        pid = int(p["id"])
+        if str(p.get("status") or "").lower() != "dynamic_confirmed":
+            continue
+        content = None
+        ext = "py"
+        for cand in ("py", "sh"):
+            content = read_artifact(db_path, filepath=f"workspace/repro_{pid}.{cand}", run_id=str(p.get("run_id") or ""))
+            if content:
+                ext = cand
+                break
+        if not content:
+            continue
+        guest_path = f"workspace/repro_prior_{pid}.{ext}"
+        sentinel = f"sentinel_{pid}"
+        outcome, why = "inconclusive", "PoC did not run"
+        try:
+            await sandbox.write_file(Path(guest_path), content)
+            try:
+                existing = await sandbox.read_file(Path(sentinel))
+                if MANTIS_SENTINEL_TOKEN in existing.decode("utf-8", errors="replace"):
+                    await sandbox.write_file(Path(sentinel), "")
+            except Exception:
+                pass
+            runner = "sh" if ext == "sh" else "python3"
+            res = await sandbox.execute(f"PYTHONPATH=. {runner} {guest_path}")
+            output = f"{getattr(res, 'stdout', '')}{getattr(res, 'stderr', '')}"
+            exit_code = int(getattr(res, "exit_code", 1) or 0)
+            sentinel_content = ""
+            try:
+                sentinel_content = (await sandbox.read_file(Path(sentinel))).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            present, reason = check_reached_sink_evidence(
+                output=output, exit_code=exit_code, sentinel_content=sentinel_content)
+            # Did the PoC run at all? A missing module, a missing file, a
+            # shell that cannot find the interpreter, a syntax error: no.
+            # An AssertionError, a 500 from the app, a non-zero exit after
+            # the request went out: yes -- that is the exploit failing,
+            # which is what a fix looks like from the PoC's side.
+            ran = (
+                exit_code not in (126, 127)
+                and not bool(getattr(res, "timed_out", False))
+                and not any(m in output for m in _POC_SETUP_FAILURE_MARKERS)
+            )
+            if present:
+                outcome, why = "still_present", f"prior PoC re-run reached the sink: {reason}"
+            elif ran:
+                outcome, why = "fixed", f"prior PoC re-run no longer reaches the sink (exit {exit_code}): {reason}"
+            else:
+                outcome, why = "inconclusive", f"prior PoC did not run (exit {exit_code})"
+        except Exception as exc:
+            outcome, why = "inconclusive", f"prior PoC could not be re-run: {type(exc).__name__}"
+        record_regression_check(db_path, run_id, pid, outcome, reason=why, evidence="dynamic",
+                                node="harness", new_finding_id=None)
+        results.append(f"#{pid}: {outcome} ({why[:120]})")
+    if not results:
+        return ""
+    return (
+        "\nThe harness already re-ran the earlier PoCs, unchanged, against the current code:\n  "
+        + "\n  ".join(results)
+        + "\nA 'still_present' result is the finding to report again; a 'fixed' result needs no "
+        "re-report; an 'inconclusive' one is for the stages to decide from the code.\n"
+    )
+
+
+def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: str,
+                      scope_path: str) -> tuple[list[dict], str]:
+    """The open findings earlier runs reported in the files a change-scoped
+    run examines, and the directive text that asks this run to decide about
+    each. `(prior_findings, text)`; `([], "")` when there is nothing.
+
+    The list is model-written text from earlier runs, so it is fenced; the
+    instruction around it is operator-authored. Which prior findings have a
+    PoC artifact is looked up here so the reproducer knows what it can
+    re-run.
+    """
+    from core.database import prior_findings_touching, read_artifact
+    from core.llm_gateway import wrap_untrusted_content
+
+    real_root = os.path.realpath(str(root))
+    rels = []
+    for f in focus_files:
+        try:
+            rels.append(os.path.relpath(os.path.realpath(str(f)), real_root).replace(os.sep, "/"))
+        except ValueError:
+            continue
+    try:
+        prior = prior_findings_touching(db_path, run_id, rels, scope_path=scope_path)
+    except Exception as exc:
+        print(f"[REGRESSION BRIEF WARNING] {exc}", file=sys.stderr)
+        return [], ""
+    if not prior:
+        return [], ""
+    lines = []
+    for f in prior[:60]:
+        has_poc = False
+        try:
+            for ext in ("py", "sh", "c", "js", "txt"):
+                if read_artifact(db_path, filepath=f"workspace/repro_{f['id']}.{ext}", run_id=str(f.get("run_id") or "")):
+                    has_poc = True
+                    break
+        except Exception:
+            has_poc = False
+        f["_has_poc"] = has_poc
+        lines.append(
+            f"#{f['id']} [{f.get('status')}] {f.get('filepath')}:{f.get('line_numbers') or '?'} "
+            f"{str(f.get('title') or '')[:120]} (run {str(f.get('run_id') or '')[:8]}, PoC: {'yes' if has_poc else 'no'})"
+        )
+    more = f"\n... and {len(prior) - len(lines)} more" if len(prior) > len(lines) else ""
+    listing = wrap_untrusted_content("\n".join(lines) + more, filename="prior_findings")
+    text = (
+        "\n\nPRIOR FINDINGS IN THE CHANGED FILES. Earlier runs of this database reported the findings below in "
+        "files this run examines. This run must decide about each one:\n"
+        "- still present: the researcher reports it again at the same location (its lineage links the two); "
+        "the reviewer then calls record_regression_check(<id>, 'still_present', <reason>, new_finding_id=<the "
+        "new finding's id>).\n"
+        "- fixed: whoever establishes it calls record_regression_check(<id>, 'fixed', <reason naming the code "
+        "that now stops the path>) -- the researcher when it finds the path closed and reports nothing there, "
+        "the reviewer otherwise. The reproducer, for a finding with PoC: yes that the harness did not already "
+        "settle, calls get_prior_poc(<id>) and runs the PoC UNCHANGED with run_sandbox_with_evidence("
+        "finding_id=<id>, ...): evidence present means still present; absent, when the PoC ran, means fixed; a "
+        "PoC that no longer runs means 'inconclusive'. Then records the check.\n"
+        "A finding nobody decides about is reported as unverified, not as fixed.\n" + listing
+    )
+    return prior, text
+
+
+def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> dict:
+    """After a change-scoped campaign: one decision per prior finding, from
+    the checks the stages recorded and from lineage, and the closures that
+    follow. Precedence: a PoC that reached its sink again, or a re-report
+    carrying the lineage, means still present whatever else was said; then
+    a fixed check (dynamic before static); then nothing, which is
+    unverified. A fixed finding is closed as mitigated -- the operator
+    chose this -- with the evidence kind on the record. Returns the summary
+    `{"still_present": [...], "fixed": [...], "unverified": [...]}` of ids.
+    """
+    from core.database import mitigate_finding, read_findings, read_regression_checks
+    from core.database import record_regression_check as _record
+
+    summary = {"still_present": [], "fixed": [], "unverified": []}
+    if not prior:
+        return summary
+    try:
+        current = read_findings(db_path, run_id=run_id)
+    except Exception:
+        current = []
+    by_lineage: dict = {}
+    for f in current:
+        if f.get("lineage_id"):
+            by_lineage.setdefault(str(f["lineage_id"]), []).append(f)
+    for p in prior:
+        pid = int(p["id"])
+        checks = read_regression_checks(db_path, run_id=run_id, prior_finding_id=pid)
+        rereported = by_lineage.get(str(p.get("lineage_id") or ""), [])
+        dyn_present = any(c["outcome"] == "still_present" and c["evidence"] == "dynamic" for c in checks)
+        fixed = [c for c in checks if c["outcome"] == "fixed"]
+        fixed.sort(key=lambda c: 0 if c["evidence"] == "dynamic" else 1)
+        if dyn_present or rereported:
+            summary["still_present"].append(pid)
+            if not any(c["outcome"] == "still_present" for c in checks):
+                _record(db_path, run_id, pid, "still_present",
+                        reason="re-reported by this run under the same lineage", evidence="lineage",
+                        node="harness", new_finding_id=rereported[0]["id"] if rereported else None)
+        elif fixed:
+            c = fixed[0]
+            if mitigate_finding(db_path, pid, f"{c['evidence']} evidence: {c.get('reason') or ''}", by_run_id=run_id):
+                summary["fixed"].append(pid)
+            else:
+                summary["unverified"].append(pid)
+        else:
+            summary["unverified"].append(pid)
+            if not checks:
+                _record(db_path, run_id, pid, "inconclusive", reason="no stage decided about this finding",
+                        evidence="none", node="harness")
+    return summary
+
+
 def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     """The directive for a `changed` campaign: which files this run is about.
 
@@ -1667,6 +1897,15 @@ async def pipeline(
         return 0
     focus_files: list[str] = list(scan_scope.get("focus_files") or [])
     change_focus = _render_change_focus(focus_files, str(target_path)) if focus_files else ""
+    # What earlier runs reported in those files, for this run to decide about.
+    prior_in_scope: list[dict] = []
+    if focus_files:
+        prior_in_scope, brief = _regression_brief(
+            db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path))
+        change_focus += brief
+        if prior_in_scope:
+            print(f"{len(prior_in_scope)} earlier finding(s) sit in the changed files; this run will say "
+                  "whether each is still present.", file=sys.stderr)
 
     # H-3: the LLM planning pass. When this run resolved to a cross-functional scan
     # and the knowledge base holds history -- coverage, spend, or prior findings --
@@ -2274,7 +2513,14 @@ async def pipeline(
             # budget_ctrl means THIS campaign: deltas, guards, the ledger.
             # Run-level spend flows through to run_budget by mirroring.
             budget_ctrl = CampaignBudgetScope(run_budget)
-            sandbox = build_sandbox(config.get("sandbox", {}), scan_item)
+            # The guest holds the whole target when the target is a tree, even
+            # for a one-file campaign: a PoC against one Go or Rust file needs
+            # the module around it (go.mod, vendor/, package siblings) to
+            # build at all, and the jail already spans the tree. A single
+            # FILE target keeps its one-file guest: that is the per-file scan
+            # whose contract is to read nothing else.
+            sandbox_root = str(target_path) if target_path.is_dir() else scan_item
+            sandbox = build_sandbox(config.get("sandbox", {}), sandbox_root)
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,
@@ -2399,6 +2645,21 @@ async def pipeline(
             except Exception as exc:
                 print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
             try:
+                # A change-scoped run: the earlier PoCs are re-run by the
+                # harness now, against the operator's code as staged, and
+                # the outcome joins the directive every stage reads. Inside
+                # the try whose finally closes the sandbox: the guest this
+                # boots must not outlive a cancellation here.
+                if scan_mode == SCAN_MODE_CHANGED and prior_in_scope:
+                    try:
+                        rerun_note = await _rerun_prior_pocs(branch_ctx, db_path, run_id, prior_in_scope)
+                        if rerun_note:
+                            branch_ctx.campaign_directive = (branch_ctx.campaign_directive or "") + rerun_note
+                            for line in rerun_note.strip().splitlines()[1:]:
+                                if line.strip().startswith("#"):
+                                    print(f"[REGRESSION] earlier PoC {line.strip()}", file=sys.stderr)
+                    except Exception as exc:
+                        print(f"[REGRESSION WARNING] {exc}", file=sys.stderr)
                 task_failed = await execute_sub_task(
                     runner,
                     session_service,
@@ -2679,6 +2940,25 @@ async def pipeline(
 
     findings = read_findings(db_path, run_id=run_id)
     scores = read_risk_scores(db_path, run_id=run_id)
+
+    # A change-scoped run answers for the findings earlier runs reported in
+    # the files it examined: still present, fixed (closed as mitigated), or
+    # unverified. Settled from the recorded checks and lineage, never from
+    # silence alone.
+    if prior_in_scope:
+        try:
+            settled = _settle_regression_checks(db_path, run_id, prior_in_scope)
+            def _ids(key):
+                return ", ".join(f"#{i}" for i in settled[key]) or "none"
+            print(
+                f"\n🔁 Earlier findings in the changed files: {len(settled['still_present'])} still present "
+                f"({_ids('still_present')}); {len(settled['fixed'])} fixed and closed as mitigated "
+                f"({_ids('fixed')}); {len(settled['unverified'])} unverified ({_ids('unverified')})."
+            )
+            if settled["unverified"]:
+                print("   Unverified findings keep their status; a whole scan or a manual review settles them.")
+        except Exception as exc:
+            print(f"[REGRESSION CHECK WARNING] {exc}", file=sys.stderr)
     # Case-insensitive via the shared predicate. `schemas.py` hands the LLM an
     # upper-case vocabulary (`FALSE_POSITIVE`) while this comparison was lower case,
     # so a dismissed finding was being counted, correlated and exported as live.

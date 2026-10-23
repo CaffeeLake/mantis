@@ -691,6 +691,8 @@ class TestUntrustedContentFramingAndScrubbing(unittest.IsolatedAsyncioTestCase):
             "run_sandbox_with_evidence",
             "get_security_guidance",
             "query_lineage",
+            "record_regression_check",
+            "get_prior_poc",
         }
 
         classified = returns_untrusted | returns_harness
