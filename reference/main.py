@@ -3322,8 +3322,9 @@ async def pipeline(
 
     # The pool. One worker IS the sequential loop; N workers are N copies of
     # it draining the same queue. gather() rather than fire-and-forget so a
-    # worker's auth failure (return 1) surfaces exactly where the sequential
-    # loop's `return 1` always did -- before any post-loop reporting.
+    # worker's stop (an auth failure's EXIT_AUTH, an abort's 1) surfaces
+    # exactly where the sequential loop's return always did -- before any
+    # post-loop reporting.
     worker_count = max(1, int(parallel or 1))
     ramp = max(0.0, float(parallel_ramp_seconds or 0.0))
     if worker_count > 1:
@@ -3348,8 +3349,14 @@ async def pipeline(
         await runner.close()
         if _transcript_writer is not None:
             _transcript_writer.close()
-    if any(res == 1 for res in worker_results):
-        return 1
+    # A worker that stopped the run returns its exit code (EXIT_AUTH for a
+    # credential failure, 1 for the sequential loop's abort); the run
+    # returns the first one, before any post-loop reporting. Checking for 1
+    # alone let an authentication failure print its banner three times and
+    # then exit 0 behind a "completed" summary.
+    stopped = [res for res in worker_results if res not in (None, 0)]
+    if stopped:
+        return int(stopped[0])
 
     # File what this run actually examined, so the next one can tell "audited and clean"
     # apart from "never opened". Written after the loop rather than per-campaign: one

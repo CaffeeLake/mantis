@@ -359,5 +359,56 @@ class ParallelRampTest(unittest.TestCase):
         self.assertIn("_staggered_worker(i) for i in range(worker_count)", src)
 
 
+class AuthFailureStopsTheRunTest(unittest.TestCase):
+    """A credential failure in a parallel worker returns EXIT_AUTH, and the
+    run returns it -- before the post-loop summary. The pool used to check
+    for the sequential loop's `1` only, so three workers printed the
+    authentication banner and the process exited 0 behind a "completed"
+    summary (measured)."""
+
+    def test_the_run_exits_with_the_auth_code_not_zero(self):
+        import json
+        import subprocess
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = json.dumps({"error": {"message": "Incorrect API key provided", "type": "invalid_request_error",
+                                             "code": "invalid_api_key"}}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        tmp = tempfile.mkdtemp(prefix="mantis_auth_exit_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        for name in ("a", "b", "c"):
+            Path(repo, f"{name}.py").write_text(f"def {name}():\n    return 1\n")
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        env.update({"OPENAI_API_KEY": "dummy", "LLM_TIMEOUT": "10", "MANTIS_LLM_MAX_PATIENCE_SECONDS": "5"})
+        proc = subprocess.run(
+            [sys.executable, str(_REF_ROOT / "main.py"), repo, "--scan-mode", "file-by-file", "--yes",
+             "--parallel", "2", "--sandbox", "static-only", "--model", "openai/fake",
+             "--api-base", f"http://127.0.0.1:{httpd.server_address[1]}", "--db", os.path.join(tmp, "k.db")],
+            capture_output=True, text=True, timeout=300, env=env, cwd=str(_REF_ROOT))
+        out = proc.stdout + proc.stderr
+        from core.config import EXIT_AUTH
+        self.assertEqual(proc.returncode, EXIT_AUTH, out[-3000:])
+        self.assertIn("AUTHENTICATION ERROR", out)
+        self.assertNotIn("Pipeline Execution Completed", out, "no 'completed' summary after a credential failure")
+
+
 if __name__ == "__main__":
     unittest.main()
