@@ -1518,12 +1518,15 @@ def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: s
 def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> dict:
     """After a change-scoped campaign: one decision per prior finding, from
     the checks the stages recorded and from lineage, and the closures that
-    follow. Precedence: a PoC that reached its sink again, or a re-report
-    carrying the lineage, means still present whatever else was said; then
-    a fixed check (dynamic before static); then nothing, which is
-    unverified. A fixed finding is closed as mitigated -- the operator
-    chose this -- with the evidence kind on the record. Returns the summary
-    `{"still_present": [...], "fixed": [...], "unverified": [...]}` of ids.
+    follow. Precedence: any still_present check (a PoC that reached its
+    sink again, a re-report the tool verified under new_finding_id, or a
+    reading of the code), or a re-report carrying the lineage, means still
+    present whatever else was said -- closing is the one action that must
+    not happen on a disagreement; then a fixed check (dynamic before
+    static); then nothing, which is unverified. A fixed finding is closed
+    as mitigated -- the operator chose this -- with the evidence kind on
+    the record. Returns the summary `{"still_present": [...], "fixed":
+    [...], "unverified": [...]}` of ids.
     """
     from core.database import mitigate_finding, read_findings, read_regression_checks
     from core.database import record_regression_check as _record
@@ -1543,12 +1546,12 @@ def _settle_regression_checks(db_path: str, run_id: str, prior: list[dict]) -> d
         pid = int(p["id"])
         checks = read_regression_checks(db_path, run_id=run_id, prior_finding_id=pid)
         rereported = by_lineage.get(str(p.get("lineage_id") or ""), [])
-        dyn_present = any(c["outcome"] == "still_present" and c["evidence"] == "dynamic" for c in checks)
+        present = [c for c in checks if c["outcome"] == "still_present"]
         fixed = [c for c in checks if c["outcome"] == "fixed"]
         fixed.sort(key=lambda c: 0 if c["evidence"] == "dynamic" else 1)
-        if dyn_present or rereported:
+        if present or rereported:
             summary["still_present"].append(pid)
-            if not any(c["outcome"] == "still_present" for c in checks):
+            if not present:
                 _record(db_path, run_id, pid, "still_present",
                         reason="re-reported by this run under the same lineage", evidence="lineage",
                         node="harness", new_finding_id=rereported[0]["id"] if rereported else None)

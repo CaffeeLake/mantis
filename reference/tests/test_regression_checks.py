@@ -233,6 +233,59 @@ class SettlementTest(_Base):
         self.assertEqual(settled["still_present"], [b])
         self.assertEqual(settled["fixed"], [])
 
+    async def test_a_verified_re_report_settles_still_present(self):
+        """Measured live: the reviewer and the reproducer recorded
+        still_present with the new finding's id for five earlier findings
+        (lineage evidence, the tool had checked the new finding exists),
+        and the run ended "0 still present, 10 unverified" because
+        settlement counted dynamic evidence and the lineage join only.
+        Any still_present check counts; closing on a disagreement is the
+        one thing settlement must not do."""
+        import main
+
+        old = self.seed_old()
+        a, b = old["SQLi in a"]["id"], old["traversal in b"]["id"]
+        prior = prior_findings_touching(self.db, NEW, ["a.py", "b.py"], scope_path=self.target)
+        # b: re-reported under a lineage the model named in words, so the
+        # lineage join alone would miss it; the reviewer linked the new id.
+        write_findings(self.db, self.target, [{**_finding("b.py", "traversal in b, again"), "lineage_id": "prior-%d" % b}], run_id=NEW)
+        new_b = next(f["id"] for f in read_findings(self.db, run_id=NEW))
+        record_regression_check(self.db, NEW, b, "still_present", reason="same sink, same path",
+                                evidence="lineage", new_finding_id=new_b)
+        # a: a reading of the code says present, another says fixed.
+        record_regression_check(self.db, NEW, a, "fixed", reason="guard added", evidence="static")
+        record_regression_check(self.db, NEW, a, "still_present", reason="guard is bypassable", evidence="static")
+        settled = main._settle_regression_checks(self.db, NEW, prior)
+        self.assertIn(b, settled["still_present"])
+        self.assertIn(a, settled["still_present"], "a disagreement never closes a finding")
+        self.assertEqual(settled["fixed"], [])
+        st = {f["id"]: f["status"] for f in read_findings(self.db, run_id=OLD)}
+        self.assertEqual(st[a], "dynamic_confirmed")
+
+    async def test_a_lineage_named_in_words_resolves_to_the_priors_lineage(self):
+        """The researcher is told a re-report "carries the prior's lineage"
+        and writes lineage_id="prior-<id>"; that named the finding, not a
+        lineage, and the verbatim string broke the join. A prior named in
+        words now resolves to that prior's lineage; a reference to no
+        finding falls back to the anchors; an explicit id (a seed, an
+        import) is kept as before."""
+        old = self.seed_old()
+        b = old["traversal in b"]["id"]
+        lineage = old["traversal in b"]["lineage_id"]
+        for supplied in (f"prior-{b}", f"prior #{b}", f"finding {b}", str(b), lineage):
+            write_findings(self.db, self.target, [{**_finding("b.py", "traversal in b"), "lineage_id": supplied}],
+                           run_id=NEW)
+            row = read_findings(self.db, run_id=NEW)[-1]
+            self.assertEqual(row["lineage_id"], lineage, supplied)
+        write_findings(self.db, self.target, [{**_finding("pkg/c.py", "something new"), "lineage_id": "prior-424242"}],
+                       run_id=NEW)
+        row = read_findings(self.db, run_id=NEW)[-1]
+        self.assertNotIn("prior", str(row["lineage_id"]), "a reference to no finding mints a fresh lineage")
+        write_findings(self.db, self.target, [{**_finding("pkg/c.py", "seeded"), "lineage_id": "seed-lineage-1"}],
+                       run_id=NEW)
+        row = read_findings(self.db, run_id=NEW)[-1]
+        self.assertEqual(row["lineage_id"], "seed-lineage-1", "an explicit id is kept")
+
     async def test_dynamic_fixed_is_preferred_and_recorded_on_the_row(self):
         import main
 

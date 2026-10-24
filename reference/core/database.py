@@ -795,6 +795,34 @@ def resolve_ancestor_lineage(
     return str(uuid.uuid4())
 
 
+_PRIOR_REF = re.compile(r"^\s*(?:prior|finding|earlier|id)?[\s\-_#:]*#?(\d+)\s*$", re.IGNORECASE)
+
+
+def _supplied_lineage(cursor, raw: Any) -> str:
+    """The lineage a reported finding carries, or "" to resolve from the
+    anchors. A lineage the table already has is kept, as is an explicit id a
+    caller minted (an import, a seed). A model told that a re-report
+    "carries the prior's lineage" writes the prior in words ("prior-103",
+    "#103"); that names a finding, not a lineage, and the finding's lineage
+    is what it meant -- stored verbatim it broke the join regression
+    settlement makes. A reference to no finding resolves from the anchors."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        cursor.execute("SELECT 1 FROM findings WHERE lineage_id = ? LIMIT 1", (text,))
+        if cursor.fetchone():
+            return text
+        m = _PRIOR_REF.match(text)
+        if m:
+            cursor.execute("SELECT lineage_id FROM findings WHERE id = ?", (int(m.group(1)),))
+            row = cursor.fetchone()
+            return str(row[0]) if row and row[0] else ""
+    except Exception:
+        return text
+    return text
+
+
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
                    verified_evidence: Optional[bool] = None,
                    finding_evidence: Optional[Dict[str, dict]] = None):
@@ -905,7 +933,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                 })
 
             # Compute or inherit cross-pass lineage identifier via deterministic anchors
-            lineage_id = str(finding.get("lineage_id") or "").strip()
+            lineage_id = _supplied_lineage(cursor, finding.get("lineage_id"))
             if not lineage_id:
                 lineage_id = resolve_ancestor_lineage(
                     cursor=cursor,
