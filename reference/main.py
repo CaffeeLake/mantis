@@ -226,7 +226,9 @@ _CONTEXT_OVERFLOW_MARKERS = (
 def _is_context_overflow(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
     text = f"{name} {exc}".lower()
-    if "contextwindowexceeded" in name:
+    # Mantis's own pre-dispatch refusal (core.config.enforce_context_budget)
+    # and litellm's typed overflow: deterministic in the request, by class.
+    if "contextbudgetexceeded" in name or "contextwindowexceeded" in name:
         return True
     return "badrequest" in name and any(m in text for m in _CONTEXT_OVERFLOW_MARKERS)
 
