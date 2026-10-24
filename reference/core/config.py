@@ -1948,6 +1948,7 @@ class ResilientLiteLlm(LiteLlm):
                 findings = read_findings(
                     ctx.db_path, run_id=ctx.run_id,
                     scope_path=(getattr(ctx, "target_file", "") or None),
+                    campaign=(getattr(ctx, "target_file", "") or None),
                 )
             except Exception:
                 return

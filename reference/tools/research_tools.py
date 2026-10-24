@@ -767,7 +767,7 @@ def get_findings(filepath: str = "") -> str:
             # An explicit file: the full records for that file, as always.
             findings = read_findings(resolved_db, filepath=clean_fp, run_id=ctx.run_id)
         else:
-            own = read_findings(resolved_db, run_id=ctx.run_id, scope_path=own_scope)
+            own = read_findings(resolved_db, run_id=ctx.run_id, scope_path=own_scope, campaign=own_scope)
             others: list = []
             if run_wide and own_scope:
                 own_ids = {f.get("id") for f in own}

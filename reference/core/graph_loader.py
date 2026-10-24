@@ -247,7 +247,7 @@ def _persist_dismissal_verdict(node_id: str, route, verdict) -> None:
         if rc is None or not rc.db_path or not rc.run_id or not rc.target_file:
             return
         from core.database import update_status
-        update_status(rc.db_path, rc.target_file, rc.run_id, route)
+        update_status(rc.db_path, rc.target_file, rc.run_id, route, campaign=rc.target_file)
     except Exception as exc:
         print(f"[{node_id}] could not persist '{route}' verdict: {exc}", file=sys.stderr)
 
@@ -388,7 +388,7 @@ def _active_campaign_finding_ids(db_path: str, target_file: str, run_id: str) ->
 
     closed = {"false_positive", "duplicate_merged", "non_viable", "sample_or_test", "mitigated", "patch_verified"}
     try:
-        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
+        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None, campaign=target_file or None)
     except Exception:
         return []
     return [int(r["id"]) for r in rows
@@ -448,10 +448,11 @@ def apply_completion_stamp(rc, new_status: str, node_id: str = "") -> Optional[l
     ids = stamp_finding_ids(rc, status)
     try:
         if ids is None:
-            update_status(rc.db_path, rc.target_file, rc.run_id, status)
+            update_status(rc.db_path, rc.target_file, rc.run_id, status, campaign=rc.target_file)
         else:
             if ids:
-                update_status(rc.db_path, rc.target_file, rc.run_id, status, finding_ids=ids)
+                update_status(rc.db_path, rc.target_file, rc.run_id, status, finding_ids=ids,
+                              campaign=rc.target_file)
             if status in ("dynamic_confirmed", "patch_verified"):
                 left = [i for i in _active_campaign_finding_ids(rc.db_path, rc.target_file, rc.run_id)
                         if i not in set(ids)]
@@ -606,7 +607,7 @@ def campaign_has_findings_to_triage(db_path: str, run_id: str, target_file: str)
     if not db_path or not os.path.exists(db_path):
         return None
     try:
-        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
+        rows = read_findings(db_path, run_id=run_id, scope_path=target_file or None, campaign=target_file or None)
     except Exception:
         return None
     inactive = set(FALSE_POSITIVE_STATUSES) | {"duplicate_merged"}
@@ -2079,9 +2080,10 @@ def create_calibrator_node(
                 # Campaign scope, not run scope: multi-target runs share one
                 # run_id, and an unscoped read re-calibrated every earlier
                 # campaign's findings on each later campaign.
-                findings = read_findings(db_path, run_id=run_id, scope_path=target_file or None)
+                findings = read_findings(db_path, run_id=run_id, scope_path=target_file or None,
+                                         campaign=target_file or None)
                 if not findings and not run_id:
-                    findings = read_findings(db_path, scope_path=target_file or None)
+                    findings = read_findings(db_path, scope_path=target_file or None, campaign=target_file or None)
             except Exception:
                 findings = []
 

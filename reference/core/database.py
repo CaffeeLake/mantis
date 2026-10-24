@@ -335,6 +335,7 @@ def init_db(db_path: str):
                 rca_summary TEXT,
                 embedding BLOB,
                 code_paths TEXT NOT NULL DEFAULT '[]',
+                campaign TEXT,
                 UNIQUE(filepath, title, description, line_numbers, run_id)
             )
         """)
@@ -347,6 +348,8 @@ def init_db(db_path: str):
                 cursor.execute("ALTER TABLE findings ADD COLUMN embedding BLOB")
             if "code_paths" not in existing_cols:
                 cursor.execute("ALTER TABLE findings ADD COLUMN code_paths TEXT DEFAULT '[]'")
+            if "campaign" not in existing_cols:
+                cursor.execute("ALTER TABLE findings ADD COLUMN campaign TEXT")
 
         # Which model a run used. Every record the pipeline writes already
         # carries its run id, so provenance is a join away without touching
@@ -823,6 +826,58 @@ def _supplied_lineage(cursor, raw: Any) -> str:
     return text
 
 
+def campaign_key(target: Any) -> str:
+    """The identity a finding's reporting campaign is recorded under: the
+    campaign's target path in the same canonical, target-relative form as
+    every finding's `filepath` (canonical_filepath), so no host path lands
+    in the table or an export, and a later process of the same run derives
+    the same key from the same target. "" for no target and for the target
+    root, whose campaign reads the whole tree anyway."""
+    text = str(target or "").strip()
+    if not text:
+        return ""
+    try:
+        key = canonical_filepath(text, target_file=text)
+    except Exception:
+        return ""
+    return "" if key in (".", "/") else key
+
+
+def _ownership_clause(scope_path: Optional[str], campaign: Optional[str]) -> "tuple[str, List[str]]":
+    """SQL predicate for what a campaign may read and stamp: the findings it
+    reported (`campaign`) OR the findings in its path (`scope_path`, see
+    _campaign_scope_clause). Either alone when only one is given; ("", [])
+    for neither.
+
+    Ownership fixes what the path approximates in both directions. A
+    campaign told to follow a changed sink to its callers reports a bug
+    located in another package: under the path rule its own reviewer,
+    critic and reproducer never saw it and its stamps never reached it.
+    Location is kept alongside, not replaced: the campaign whose path a
+    finding sits in is usually the better owner of a bug two campaigns
+    both found (the package is in its context, its harness is there), and
+    rows written before the column existed have no owner recorded.
+    """
+    parts: list = []
+    params: list = []
+    if scope_path:
+        norm_scope = canonical_filepath(scope_path, target_file=scope_path)
+        if norm_scope and norm_scope not in (".", "/"):
+            clause, scope_params = _campaign_scope_clause(norm_scope)
+            parts.append(clause)
+            params.extend(scope_params)
+        elif campaign:
+            # A whole-tree scope reads everything; ownership adds nothing.
+            return "", []
+    key = campaign_key(campaign)
+    if key:
+        parts.append("campaign = ?")
+        params.append(key)
+    if not parts:
+        return "", []
+    return "(" + " OR ".join(parts) + ")", params
+
+
 def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
                    verified_evidence: Optional[bool] = None,
                    finding_evidence: Optional[Dict[str, dict]] = None):
@@ -843,6 +898,11 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
     """
     with _db(db_path) as conn:
         cursor = conn.cursor()
+        # Which campaign is reporting: `filepath` is the campaign's target
+        # (the tools pass RunContext.target_file). Recorded on every row the
+        # campaign writes and kept on a re-report by another campaign; see
+        # _ownership_clause for what it buys.
+        owner = campaign_key(filepath)
         for obj in findings:
             finding = obj.model_dump() if hasattr(obj, "model_dump") else (obj if isinstance(obj, dict) else dict(obj))
             code_paths = finding.get("code_paths") or []
@@ -1056,7 +1116,8 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         filepath = ?, title = ?, severity = ?, description = ?, line_numbers = ?,
                         remediation = ?, status = ?, mantis_risk_score = ?, impact_score = ?, likelihood_score = ?,
                         priority = ?, signature = ?, lineage_id = ?, cwe = ?, triage_reasoning = ?, patch_diff = ?,
-                        patch_status = ?, rca_summary = ?, code_paths = ?
+                        patch_status = ?, rca_summary = ?, code_paths = ?,
+                        campaign = COALESCE(NULLIF(campaign, ''), ?)
                     WHERE id = ?
                 """, (
                     finding_filepath,
@@ -1078,6 +1139,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     patch_status,
                     rca_summary,
                     code_paths_str,
+                    owner or None,
                     target_id,
                 ))
             else:
@@ -1086,9 +1148,9 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                         run_id, filepath, title, severity, description, line_numbers,
                         remediation, status, mantis_risk_score, impact_score, likelihood_score,
                         priority, signature, lineage_id, cwe, triage_reasoning, patch_diff, patch_status,
-                        rca_summary, embedding, code_paths
+                        rca_summary, embedding, code_paths, campaign
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     run_id,
                     finding_filepath,
@@ -1111,6 +1173,7 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     rca_summary,
                     None,
                     code_paths_str,
+                    owner or None,
                 ))
 
 def update_finding_calibration(
@@ -1214,12 +1277,16 @@ def archive_finding(db_path: str, lineage_id: str, note: str = "") -> int:
 
 
 def update_status(db_path: str, filepath: str, run_id: str, status: str,
-                  finding_ids: Optional[Sequence[int]] = None):
+                  finding_ids: Optional[Sequence[int]] = None,
+                  campaign: Optional[str] = None):
     """Update status for active candidate findings under `filepath` in a given run
     (preserving terminal/suppressed statuses and preventing downgrades).
 
     Scope is the CAMPAIGN, never the run: the exact file, plus the subtree when
-    the target is a directory. An earlier revision branched on os.path.isdir and
+    the target is a directory, plus -- with `campaign`, the campaign's target
+    -- the findings that campaign reported wherever they sit (ownership OR
+    location, see _ownership_clause). An earlier revision branched on
+    os.path.isdir and
     updated EVERY finding of the run for directory targets. In cross-functional
     mode the campaign target IS a directory slice, so one slice entering the
     reproducer stamped static_confirmed onto every other slice's findings --
@@ -1270,7 +1337,9 @@ def update_status(db_path: str, filepath: str, run_id: str, status: str,
             """, (status, run_id, *id_params))
             return
 
-        scope_clause, scope_params = _campaign_scope_clause(norm_fp)
+        scope_clause, scope_params = _ownership_clause(filepath, campaign)
+        if not scope_clause:
+            scope_clause, scope_params = _campaign_scope_clause(norm_fp)
         cursor.execute(f"""
             UPDATE findings
             SET status = ?
@@ -1498,13 +1567,16 @@ def read_findings(
     run_id: Optional[str] = None,
     status: Optional[str] = None,
     scope_path: Optional[str] = None,
+    campaign: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Read findings from the database, optionally filtered by filepath, run_id, or status.
 
     `scope_path` restricts results to a campaign's scope: the exact path plus
     its subtree, using the same rule as update_status. Unlike `filepath` (an
     exact match on one file), it works for directory slices and never touches
-    the filesystem, so it answers the same regardless of CWD.
+    the filesystem, so it answers the same regardless of CWD. `campaign`
+    (the campaign's target) adds the findings that campaign reported,
+    wherever they sit: ownership OR location (see _ownership_clause).
     """
     with _db(db_path) as conn:
         cursor = conn.cursor()
@@ -1514,16 +1586,16 @@ def read_findings(
             norm_fp = canonical_filepath(filepath, target_file=filepath)
             query += " AND filepath = ?"
             params.append(norm_fp)
-        if scope_path:
-            norm_scope = canonical_filepath(scope_path, target_file=scope_path)
-            if norm_scope and norm_scope not in (".", "/"):
-                # A cross-file finding can sit at a filepath outside the
-                # campaign scope while citing in-scope files in code_paths;
-                # the shared clause keeps those visible here and promotable
-                # by update_status.
-                scope_clause, scope_params = _campaign_scope_clause(norm_scope)
-                query += " AND " + scope_clause
-                params.extend(scope_params)
+        if scope_path or campaign:
+            # A cross-file finding can sit at a filepath outside the
+            # campaign scope while citing in-scope files in code_paths;
+            # the shared clause keeps those visible here and promotable
+            # by update_status. The campaign's own reports are visible
+            # wherever they sit.
+            clause, own_params = _ownership_clause(scope_path, campaign)
+            if clause:
+                query += " AND " + clause
+                params.extend(own_params)
         if run_id:
             query += " AND run_id = ?"
             params.append(run_id)

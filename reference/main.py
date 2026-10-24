@@ -361,7 +361,7 @@ async def _drive_campaign(
                         from core.graph_loader import apply_completion_stamp
                         apply_completion_stamp(ctx, new_status, node_name)
                     else:
-                        update_status(db_path, filepath, run_id, new_status)
+                        update_status(db_path, filepath, run_id, new_status, campaign=filepath)
 
             banner = (node_path, route)
             if (node_path or route) and banner != last_banner:
