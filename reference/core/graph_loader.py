@@ -161,6 +161,10 @@ class GlobalConfig(_Base):
     enable_compaction: bool = False
     compaction_token_threshold: int = Field(default=500000, gt=0)
     compaction_event_retention: int = Field(default=50, ge=0)
+    # How many fresh contexts a stage may continue into after filling the
+    # model's window (see MAX_NODE_CONTINUATIONS for the reasoning behind
+    # the default). 0 ends or fails the stage at its first ceiling.
+    max_node_continuations: int = Field(default=6, ge=0)
     enable_context_cache: bool = True
     budget: Optional[dict[str, Any]] = None
     # Paths under the target that are not scanned: patterns relative to the
@@ -1431,7 +1435,7 @@ async def _write_handoff(node_id: str, llm: Any, llm_request: Any) -> tuple[str,
 
 def _make_node_context_ceiling_before_model_callback(
     node_id: str, model: Any = None, has_schema: bool = False, keep_tool_results: Optional[int] = None,
-    llm_factory: Any = None,
+    llm_factory: Any = None, max_continuations: Optional[int] = None,
 ):
     """Keeps a stage's own context inside the model's window, append-only.
 
@@ -1473,6 +1477,10 @@ def _make_node_context_ceiling_before_model_callback(
                 limit_cache["limit"] = None
         return limit_cache["limit"]
 
+    def _cap() -> int:
+        # Read at call time so a test may patch the module default.
+        return int(MAX_NODE_CONTINUATIONS if max_continuations is None else max_continuations)
+
     def _llm() -> Any:
         if "llm" not in llm_cache:
             try:
@@ -1508,7 +1516,7 @@ def _make_node_context_ceiling_before_model_callback(
         ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
         if estimated < ceiling:
             return None
-        may_continue = slot is not None and continuations < MAX_NODE_CONTINUATIONS
+        may_continue = slot is not None and continuations < _cap()
         if may_continue:
             handoff, used = await _write_handoff(node_id, _llm(), llm_request)
             if used:
@@ -1527,7 +1535,7 @@ def _make_node_context_ceiling_before_model_callback(
             print(
                 f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
                 f"against a {limit:,}-token window (ceiling {ceiling:,}); continuing in a "
-                f"fresh context (continuation {number}/{MAX_NODE_CONTINUATIONS}, handoff "
+                f"fresh context (continuation {number}/{_cap()}, handoff "
                 f"{len(handoff):,} chars).",
                 file=sys.stderr,
             )
@@ -2599,6 +2607,7 @@ def load_workflow_from_json(
                     llm_factory=(
                         (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
                     ),
+                    max_continuations=spec.config.max_node_continuations,
                 ),
             ]
             if node_id == "reflector" or (
