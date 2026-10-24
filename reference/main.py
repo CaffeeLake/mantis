@@ -1163,6 +1163,10 @@ def resolve_scan_targets(
         )
         if scope_out is not None:
             scope_out["focus_files"] = list(focus)
+            # The subset whose content actually changed, apart from the
+            # never-covered: only a finding in one of these can be called
+            # fixed by its PoC's silence (see _rerun_prior_pocs).
+            scope_out["changed_files"] = [f for f in focus if f in set(edited.get("files") or [])]
             scope_out["nothing_changed"] = False
         return [str(target_path)], None, SCAN_MODE_CHANGED
 
@@ -1269,10 +1273,45 @@ _POC_SETUP_FAILURE_MARKERS = (
     "command not found",
     "SANDBOX-UNAVAILABLE",
     "SANDBOX-ERROR",
+    # A Go or shell PoC that never got as far as the target: the scaffold it
+    # was built with is not in this guest, or the toolchain is not.
+    "no Go files in",
+    "cannot find package",
+    "cannot find module",
+    "no required module provides package",
+    "directory not found",
+    "is not in std",
+    "go: cannot find main module",
+    "executable file not found",
+    "build failed",
+    "setup failed",
 )
 
 
-async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict]) -> str:
+def _finding_files(finding: dict) -> set:
+    """The target-relative files a finding sits in or cites."""
+    files = set()
+    fp = str(finding.get("filepath") or "").replace("\\", "/").lstrip("./")
+    if fp:
+        files.add(fp)
+    raw = finding.get("code_paths")
+    try:
+        paths = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except ValueError:
+        paths = []
+    for entry in paths if isinstance(paths, list) else []:
+        if isinstance(entry, str):
+            files.add(entry.split(":")[0].replace("\\", "/").lstrip("./"))
+        elif isinstance(entry, dict):
+            for key in ("file", "filepath", "path"):
+                v = entry.get(key)
+                if isinstance(v, str) and v:
+                    files.add(v.split(":")[0].replace("\\", "/").lstrip("./"))
+    return {f for f in files if f}
+
+
+async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
+                            changed_paths: Optional[set] = None) -> str:
     """Re-runs, unchanged, the PoC each prior finding's run left behind,
     against the code as it is now, and records what happened as a dynamic
     regression check. Returns a note for the campaign directive.
@@ -1284,8 +1323,18 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict]) -
     finding is dynamic_confirmed) for its silence to mean anything now:
     then reaching the sink is still_present, not reaching it when the PoC
     ran is fixed, and a PoC that did not run (traceback, missing module,
-    exit 127) is inconclusive and left to the stages. A static-only sandbox
-    re-runs nothing. Never raises.
+    exit 127, a build that found no scaffold) is inconclusive and left to
+    the stages. A static-only sandbox re-runs nothing. Never raises.
+
+    `changed_paths` are the target-relative files whose content differs
+    from what the ledger covered them as. A finding none of whose files
+    changed cannot have been fixed by the change: its PoC's silence is
+    environmental -- the scaffold it was built with is not in this guest,
+    a service it drove is not up -- and is recorded inconclusive, never
+    fixed. Without that rule a change-scoped run closed live findings in
+    untouched files (measured), which is the one thing a regression check
+    must not do. None (unknown) disables nothing: with no changed set every
+    silent PoC is inconclusive.
     """
     from core.database import read_artifact, record_regression_check
     from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence
@@ -1293,6 +1342,7 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict]) -
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None or type(sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
         return ""
+    changed = {str(p).replace("\\", "/").lstrip("./") for p in (changed_paths or set())}
     results: list[str] = []
     for p in prior:
         pid = int(p["id"])
@@ -1330,19 +1380,25 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict]) -
             present, reason = check_reached_sink_evidence(
                 output=output, exit_code=exit_code, sentinel_content=sentinel_content)
             # Did the PoC run at all? A missing module, a missing file, a
-            # shell that cannot find the interpreter, a syntax error: no.
-            # An AssertionError, a 500 from the app, a non-zero exit after
-            # the request went out: yes -- that is the exploit failing,
-            # which is what a fix looks like from the PoC's side.
+            # shell that cannot find the interpreter, a syntax error, a Go
+            # build with nothing to build: no. An AssertionError, a 500
+            # from the app, a non-zero exit after the request went out:
+            # yes -- that is the exploit failing, which is what a fix looks
+            # like from the PoC's side.
             ran = (
                 exit_code not in (126, 127)
                 and not bool(getattr(res, "timed_out", False))
                 and not any(m in output for m in _POC_SETUP_FAILURE_MARKERS)
             )
+            touched = bool(_finding_files(p) & changed)
             if present:
                 outcome, why = "still_present", f"prior PoC re-run reached the sink: {reason}"
-            elif ran:
+            elif ran and touched:
                 outcome, why = "fixed", f"prior PoC re-run no longer reaches the sink (exit {exit_code}): {reason}"
+            elif ran:
+                outcome, why = "inconclusive", (
+                    f"prior PoC re-run did not reach the sink (exit {exit_code}), but none of the "
+                    "finding's files changed since it was recorded; not evidence of a fix")
             else:
                 outcome, why = "inconclusive", f"prior PoC did not run (exit {exit_code})"
         except Exception as exc:
@@ -2061,6 +2117,15 @@ async def pipeline(
         return 0
     focus_files: list[str] = list(scan_scope.get("focus_files") or [])
     change_focus = _render_change_focus(focus_files, str(target_path)) if focus_files else ""
+    # The files whose content changed, target-relative: the only ones a
+    # prior finding can be called fixed in (see _rerun_prior_pocs).
+    changed_rel: set = set()
+    _rel_root = os.path.realpath(str(resolved_path_root or target_path))
+    for _f in scan_scope.get("changed_files") or []:
+        try:
+            changed_rel.add(os.path.relpath(os.path.realpath(str(_f)), _rel_root).replace(os.sep, "/"))
+        except ValueError:
+            continue
     # What earlier runs reported in those files, for this run to decide about.
     prior_in_scope: list[dict] = []
     if focus_files:
@@ -2817,7 +2882,8 @@ async def pipeline(
                 # boots must not outlive a cancellation here.
                 if scan_mode == SCAN_MODE_CHANGED and prior_in_scope:
                     try:
-                        rerun_note = await _rerun_prior_pocs(branch_ctx, db_path, run_id, prior_in_scope)
+                        rerun_note = await _rerun_prior_pocs(
+                            branch_ctx, db_path, run_id, prior_in_scope, changed_paths=changed_rel)
                         if rerun_note:
                             branch_ctx.campaign_directive = (branch_ctx.campaign_directive or "") + rerun_note
                             for line in rerun_note.strip().splitlines()[1:]:

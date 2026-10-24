@@ -288,6 +288,10 @@ class HarnessRerunTest(_Base):
                 # is what a fix looks like from the PoC's side.
                 return ExecutionResult(stdout="", stderr="Traceback (most recent call last):\nAssertionError\n",
                                        exit_code=1, timed_out=False)
+            if kind == "gobuild":
+                # A Go PoC whose scaffold is not in this guest: it never reached the target.
+                return ExecutionResult(stdout="", stderr="go: no Go files in /workspace/workspace/repro_x\nexit status 1\n",
+                                       exit_code=1, timed_out=False)
             return ExecutionResult(stdout="400 rejected\n", stderr="", exit_code=0, timed_out=False)
 
     async def test_rerun_records_dynamic_checks_and_settles(self):
@@ -300,7 +304,7 @@ class HarnessRerunTest(_Base):
         sb = self._SB({a: "assert", b: "present"})
         ctx = self.ctx("harness", sandbox=sb)
         prior = prior_findings_touching(self.db, NEW, ["a.py", "b.py", "pkg/c.py"], scope_path=self.target)
-        note = await main._rerun_prior_pocs(ctx, self.db, NEW, prior)
+        note = await main._rerun_prior_pocs(ctx, self.db, NEW, prior, changed_paths={"a.py", "b.py"})
         self.assertIn(f"#{a}: fixed", note)
         self.assertIn(f"#{b}: still_present", note)
         self.assertNotIn(f"#{c}", note, "a static_confirmed prior proved nothing before; its PoC's silence proves nothing now")
@@ -317,6 +321,42 @@ class HarnessRerunTest(_Base):
         self.assertEqual(settled["unverified"], sorted([c, old["route bug"]["id"]]),
                          "no PoC proved these before; nothing to re-run, nobody decided")
         self.assertEqual(next(f["status"] for f in read_findings(self.db, run_id=OLD) if f["id"] == a), "mitigated")
+
+    async def test_a_silent_poc_in_an_unchanged_file_is_never_a_fix(self):
+        """The one thing a regression check must not do is close a live
+        finding. A PoC that ran but reached no sink proves a fix only when
+        the finding's own code changed; otherwise its silence is
+        environmental (the scaffold it drove is not in this guest) and is
+        recorded inconclusive. Measured on a changed-mode run: four PoCs in
+        untouched files came back silent after `go run` found no scaffold.
+        A Go build that found nothing is not a run at all."""
+        import main
+
+        old = self.seed_old()
+        a, b = old["SQLi in a"]["id"], old["traversal in b"]["id"]
+        for pid in (a, b):
+            record_artifact(self.db, OLD, "workspace_file", f"workspace/repro_{pid}.py", f"# poc {pid}\n")
+        # a: ran, silent, but a.py did not change -> inconclusive, never fixed.
+        # b: the Go scaffold is missing -> did not run, whatever changed.
+        sb = self._SB({a: "assert", b: "gobuild"})
+        ctx = self.ctx("harness", sandbox=sb)
+        prior = prior_findings_touching(self.db, NEW, ["a.py", "b.py"], scope_path=self.target)
+        note = await main._rerun_prior_pocs(ctx, self.db, NEW, prior, changed_paths={"b.py", "other.py"})
+        self.assertIn(f"#{a}: inconclusive", note)
+        self.assertIn("none of the finding's files changed", note)
+        self.assertIn(f"#{b}: inconclusive", note)
+        self.assertIn("did not run", note)
+        settled = main._settle_regression_checks(self.db, NEW, prior)
+        self.assertEqual(settled["fixed"], [], "nothing is closed")
+        self.assertEqual(sorted(settled["unverified"])[:2], sorted([a, b]))
+        statuses = {f["id"]: f["status"] for f in read_findings(self.db, run_id=OLD)}
+        self.assertEqual(statuses[a], "dynamic_confirmed")
+        self.assertEqual(statuses[b], "dynamic_confirmed")
+        # No changed set at all: silence is inconclusive everywhere.
+        sb2 = self._SB({a: "assert"})
+        ctx2 = self.ctx("harness", sandbox=sb2)
+        note2 = await main._rerun_prior_pocs(ctx2, self.db, NEW, prior[:1])
+        self.assertIn(f"#{a}: inconclusive", note2)
 
     async def test_a_poc_that_crashes_is_inconclusive_and_a_stale_sentinel_is_cleared(self):
         import main
