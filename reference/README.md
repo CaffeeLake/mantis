@@ -281,6 +281,21 @@ automatically; a small tree is rescanned whole as before, with a note naming
 on the code as it was and says when that code has moved. Files covered before
 content was recorded count as covered until they are scanned once more.
 
+A ledger from before content was recorded cannot say what changed, so the first
+`changed` run over it scans the whole target once. To keep those earlier
+campaigns instead, fill the ledger in from git before that run:
+
+```bash
+# Record, for each completed campaign, the content its files had when it ran.
+python3 scripts/knowledge.py backfill-coverage --db knowledge.db --repo /path/to/repo
+```
+
+Runs that recorded their commit are filled in from it; for the rest, pass
+`--at <commit>` (the commit they scanned) or `--assume-unchanged` (nothing has
+been edited since). `--dry-run` reports without writing, and `--exclude` takes
+the patterns the scans were given. A file edited since the commit is reported as
+changed by the next `changed` run, as it should be.
+
 Running `file-by-file` first gives a later `cross-functional` pass real evidence
 to plan from, and `auto` encodes exactly that workflow, file by file: it sweeps
 whatever the spend ledger has never seen covered (a first scan sweeps

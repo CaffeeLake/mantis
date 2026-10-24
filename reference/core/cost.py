@@ -89,6 +89,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -1001,3 +1002,179 @@ def estimate_scan(
         observations=int(n_obs),
         oversized=oversized,
     )
+
+
+# --- Backfilling the content ledger ------------------------------------------------------
+#
+# Databases from before coverage_files existed hold completed campaigns with
+# no record of the content they examined, so a `changed` run cannot tell
+# what moved and scans the whole target once to find out. The operator who
+# paid for those campaigns should not pay again: the ledger can be filled
+# in after the fact, from what the files were when the campaign ran.
+#
+# What a file was then is known three ways, in order of trust: the commit
+# the run recorded (snapshot_id on its artifacts), a commit the operator
+# names (--at), or the working tree as it is now (--assume-unchanged: the
+# operator asserts nothing was edited since). A commit's content is hashed
+# from git, never from the tree, so an edit made since is seen as a change.
+
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+
+
+def run_snapshot_ids(db_path: str) -> dict:
+    """`{run_id: snapshot_id}` from the artifacts each run recorded, for runs
+    that recorded one. {} when the database has none or cannot be read."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    out: dict = {}
+    conn = None
+    try:
+        conn = _connect(db_path)
+        rows = conn.execute(
+            "SELECT run_id, metadata_json FROM campaign_artifacts WHERE metadata_json LIKE '%snapshot_id%'"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    for run_id, meta_json in rows:
+        if run_id in out:
+            continue
+        try:
+            meta = json.loads(meta_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        snap = str((meta or {}).get("snapshot_id") or "").strip()
+        if snap and _COMMIT_RE.match(snap):
+            out[str(run_id)] = snap
+    return out
+
+
+def git_blob_identities(repo_root: str, commit: str, rel_paths: Iterable[str]) -> dict:
+    """`{rel_path: (content_hash, size, None)}` for the files that exist at
+    `commit`, hashed the way file_identity hashes the working tree (the
+    content ledger's own rule), with no mtime: a later check hashes rather
+    than trusting a timestamp. Files absent at the commit are left out.
+    {} when git is unavailable or the commit unknown. Never raises."""
+    import subprocess
+
+    rels = [str(p).replace(os.sep, "/") for p in rel_paths if str(p).strip()]
+    if not rels:
+        return {}
+    try:
+        subprocess.run(["git", "-C", repo_root, "cat-file", "-e", f"{commit}^{{commit}}"],
+                       check=True, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: dict = {}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "cat-file", "--batch"],
+            input="".join(f"{commit}:{rel}\n" for rel in rels).encode("utf-8"),
+            capture_output=True, timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    data = proc.stdout
+    pos = 0
+    for rel in rels:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = data[pos:nl].decode("utf-8", errors="replace")
+        pos = nl + 1
+        fields = header.split()
+        if len(fields) == 3 and fields[1] == "blob":
+            size = int(fields[2])
+            blob = data[pos:pos + size]
+            pos += size + 1  # the trailing newline git adds after each object
+            out[rel] = (hashlib.sha256(blob).hexdigest()[:CONTENT_HASH_CHARS], size, None)
+        # "<spec> missing" (or a non-blob): absent at this commit; nothing to skip
+    return out
+
+
+def backfill_coverage(db_path: str, target_root: str, discovered_files: Iterable[str],
+                      at: Optional[str] = None, assume_unchanged: bool = False,
+                      dry_run: bool = False) -> dict:
+    """Writes coverage_files rows for every completed campaign under
+    `target_root` that has none, from the content its files had when it
+    ran. Returns a summary: {"backfilled": [(run_id, target, files, source)],
+    "skipped": [(run_id, target, reason)], "rows": n}. Never raises on a
+    campaign; a campaign whose content cannot be established is skipped
+    with the reason, so the operator can supply --at or decide the tree is
+    unchanged. Campaigns that already have content rows are left alone.
+
+    `discovered_files` is the target's source file list (main.discover_files
+    with the operator's excludes): a directory campaign covered what that
+    list holds under it, as the scan loop records.
+    """
+    summary: dict = {"backfilled": [], "skipped": [], "rows": 0}
+    if not db_path or not os.path.exists(db_path):
+        summary["skipped"].append(("", "", "no database"))
+        return summary
+    root = os.path.realpath(str(target_root))
+    files = [os.path.realpath(str(f)) for f in discovered_files or []]
+    under_root = [f for f in files if f == root or f.startswith(root + os.sep)]
+    snapshots = run_snapshot_ids(db_path)
+
+    conn = _connect(db_path)
+    try:
+        _ensure_table(conn)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(campaign_spend)").fetchall()}
+        if not cols:
+            return summary
+        rows = conn.execute("SELECT run_id, target, metadata_json FROM campaign_spend ORDER BY id").fetchall()
+        have_content = {(str(r[0]), str(r[1])) for r in conn.execute(
+            "SELECT DISTINCT run_id, campaign_target FROM coverage_files").fetchall()}
+    finally:
+        conn.close()
+
+    seen: set = set()
+    for run_id, target, meta in rows:
+        key = (str(run_id), str(target))
+        if key in seen:
+            continue
+        seen.add(key)
+        if _row_failed(meta):
+            continue
+        real_target = os.path.realpath(str(target))
+        if real_target != root and not real_target.startswith(root + os.sep):
+            continue
+        if key in have_content:
+            summary["skipped"].append((run_id, target, "already has content rows"))
+            continue
+        if os.path.isfile(real_target):
+            scope = [real_target]
+        else:
+            prefix = real_target.rstrip(os.sep) + os.sep
+            scope = [f for f in under_root if f.startswith(prefix)]
+        if not scope:
+            summary["skipped"].append((run_id, target, "no source files under the target now"))
+            continue
+        rels = [os.path.relpath(f, root) for f in scope]
+        commit = str(at or "").strip() or snapshots.get(str(run_id), "")
+        identities: list = []
+        if commit:
+            blobs = git_blob_identities(root, commit, rels)
+            if not blobs:
+                summary["skipped"].append((run_id, target, f"commit {commit[:12]} not readable from git here"))
+                continue
+            for f, rel in zip(scope, rels):
+                ident = blobs.get(rel.replace(os.sep, "/"))
+                if ident is not None:
+                    identities.append((f, *ident))
+            source = f"commit {commit[:12]}"
+        elif assume_unchanged:
+            identities = scope_identities(scope)
+            source = "working tree (asserted unchanged)"
+        else:
+            summary["skipped"].append((run_id, target, "no recorded commit; pass --at <commit> or --assume-unchanged"))
+            continue
+        if not identities:
+            summary["skipped"].append((run_id, target, f"none of its files exist at {source}"))
+            continue
+        if not dry_run:
+            summary["rows"] += record_coverage_files(db_path, run_id, target, identities)
+        summary["backfilled"].append((run_id, target, len(identities), source))
+    return summary

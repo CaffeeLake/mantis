@@ -1157,10 +1157,13 @@ def resolve_scan_targets(
             # Covered, but by campaigns that recorded no content (a ledger
             # from before this existed): which files changed cannot be
             # told. One whole scan records it; the next changed run knows.
+            # The operator can instead fill the ledger in from git.
             print(
                 f"Scan mode {SCAN_MODE_CHANGED}: the ledger covers this target but recorded no "
                 "file content (it predates content recording), so which files changed is "
-                "unknown; scanning the whole target once to record it.",
+                "unknown; scanning the whole target once to record it. To keep the earlier "
+                "scans instead, stop and run `scripts/knowledge.py backfill-coverage --db "
+                f"{db_path} --repo {target_path}` first.",
                 file=sys.stderr,
             )
             return whole

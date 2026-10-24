@@ -59,12 +59,51 @@ def main(argv=None) -> int:
     im.add_argument("--repo", required=True, help="repository root the paths are relative to")
     im.add_argument("--from", dest="src", default="", help=f"export directory (default: <repo>/{KNOWLEDGE_DIR})")
     im.add_argument("--run-id", default="imported", help="run id the threat model and architecture are recorded under")
+    bf = sub.add_parser(
+        "backfill-coverage",
+        help="record, for completed campaigns that predate the content ledger, the content "
+             "their files had, so --scan-mode changed can tell what moved without a fresh whole scan",
+    )
+    bf.add_argument("--db", default="knowledge.db")
+    bf.add_argument("--repo", required=True, help="repository root the campaigns scanned")
+    bf.add_argument("--at", default="", help="the git commit the campaigns scanned, when the run did not record one")
+    bf.add_argument("--assume-unchanged", action="store_true",
+                    help="no commit known: record the working tree as it is now, asserting nothing was edited since the scans")
+    bf.add_argument("--exclude", action="append", default=[], help="exclude pattern, as given to the scan (repeatable)")
+    bf.add_argument("--dry-run", action="store_true", help="say what would be recorded; write nothing")
     args = p.parse_args(argv)
 
     repo = os.path.realpath(args.repo)
     if not os.path.isdir(repo):
         print(f"error: --repo {args.repo} is not a directory", file=sys.stderr)
         return 2
+    if args.cmd == "backfill-coverage":
+        if not os.path.exists(args.db):
+            print(f"error: no database at {args.db}", file=sys.stderr)
+            return 2
+        from pathlib import Path
+
+        from core.cost import backfill_coverage
+        from core.exclusions import normalize_exclude_patterns
+        from main import discover_files
+
+        files = discover_files(Path(repo), args.db, exclude=normalize_exclude_patterns(args.exclude))
+        summary = backfill_coverage(args.db, repo, files, at=args.at or None,
+                                    assume_unchanged=args.assume_unchanged, dry_run=args.dry_run)
+        verb = "Would record" if args.dry_run else "Recorded"
+        for run_id, target, n, source in summary["backfilled"]:
+            print(f"{verb} {n} file(s) for {os.path.relpath(target, repo) or '.'} (run {str(run_id)[:8]}, from {source})")
+        reasons: dict = {}
+        for _run_id, _target, reason in summary["skipped"]:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"Skipped {count} campaign(s): {reason}")
+        print(f"{verb} content for {len(summary['backfilled'])} campaign(s), {summary['rows']} file row(s)."
+              + ("" if args.dry_run else " A --scan-mode changed run now examines only what differs from this."))
+        # Non-zero only when something was left undone that the operator can
+        # act on (a missing commit); campaigns already recorded are not that.
+        undone = [s for s in summary["skipped"] if s[2] != "already has content rows"]
+        return 1 if (undone and not summary["backfilled"]) else 0
     if args.cmd == "export":
         out = args.out or os.path.join(repo, KNOWLEDGE_DIR)
         if not os.path.exists(args.db):
