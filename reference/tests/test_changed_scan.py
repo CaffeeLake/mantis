@@ -243,12 +243,17 @@ class ResolveTest(_Repo):
 
     def test_a_first_run_in_changed_mode_scans_everything_as_new(self):
         targets, resolved, scope = self._resolve("changed")
-        # Three files in two directories: pkg/ has one changed file, fewer
-        # than the minimum, so it joins the root's campaign.
-        self.assertEqual(targets, [self.repo])
+        # Three files in two directories. pkg/ has one changed file: too
+        # small to stand alone by preference, but it cannot climb into the
+        # root (a root campaign would span every other), so it stays; the two
+        # root files are then one single-file campaign each.
+        self.assertEqual(targets, [self.files["a"], self.files["b"], os.path.join(self.repo, "pkg")])
         self.assertEqual(sorted(scope["focus_files"]), sorted(self.files.values()))
-        self.assertEqual([g["dir"] for g in scope["focus_groups"]], [self.repo])
-        self.assertEqual(sorted(scope["focus_groups"][0]["files"]), sorted(self.files.values()))
+        self.assertEqual([(g["dir"], g["files"]) for g in scope["focus_groups"]], [
+            (self.files["a"], [self.files["a"]]),
+            (self.files["b"], [self.files["b"]]),
+            (os.path.join(self.repo, "pkg"), [self.files["pkg/c"]]),
+        ])
 
     def test_changed_files_are_grouped_by_directory(self):
         import main
@@ -256,21 +261,30 @@ class ResolveTest(_Repo):
         root = self.repo
         def p(*parts):
             return os.path.join(root, *parts)
-        # cmd/api: 4 files (a campaign); cmd/api/internal: 1 file (merges
-        # up into cmd/api, 5 <= max); pkg/util: 3 files (its own campaign);
-        # lone file at the root; tools/x: 1 file (merges to tools, then the
-        # root: still small all the way up).
+        # cmd/api: 4 files (a campaign); cmd/api/internal: 1 file (merges up
+        # into cmd/api); pkg/util: 3 files (its own campaign); tools/x: 1
+        # file (climbs to tools, then stops short of the root); main.go at
+        # the root: its own single-file campaign, since others exist.
         files = [p("cmd", "api", f"{i}.go") for i in range(4)] + [p("cmd", "api", "internal", "z.go")] \
             + [p("pkg", "util", f"{i}.go") for i in range(3)] + [p("main.go"), p("tools", "x", "t.go")]
         groups = main.group_changed_files(files, root)
         by_dir = {g["dir"]: g["files"] for g in groups}
-        self.assertEqual(sorted(by_dir), sorted([root, p("cmd", "api"), p("pkg", "util")]))
+        self.assertEqual(sorted(by_dir), sorted([p("main.go"), p("cmd", "api"), p("pkg", "util"), p("tools")]))
         self.assertEqual(len(by_dir[p("cmd", "api")]), 5)
         self.assertEqual(len(by_dir[p("pkg", "util")]), 3)
-        self.assertEqual(sorted(by_dir[root]), sorted([p("main.go"), p("tools", "x", "t.go")]))
+        self.assertEqual(by_dir[p("tools")], [p("tools", "x", "t.go")])
+        self.assertEqual(by_dir[p("main.go")], [p("main.go")])
         self.assertEqual(sum(len(f) for f in by_dir.values()), len(files), "every file is in exactly one campaign")
+        self._assert_disjoint(by_dir)
 
-    def test_a_large_directory_is_one_campaign_and_nothing_nests_into_it(self):
+    def _assert_disjoint(self, by_dir: dict) -> None:
+        """No campaign's identity path contains another's: the path is the
+        scope of its stamps and of get_findings."""
+        for d in by_dir:
+            for e in by_dir:
+                self.assertFalse(d != e and e.startswith(d + os.sep), f"{e} is inside {d}")
+
+    def test_a_nested_directory_always_joins_its_ancestor(self):
         import main
 
         root = self.repo
@@ -278,11 +292,23 @@ class ResolveTest(_Repo):
         nested = [os.path.join(root, "big", "sub", "n.go")]
         groups = main.group_changed_files(big + nested, root)
         by_dir = {g["dir"]: g["files"] for g in groups}
-        self.assertEqual(len(by_dir[os.path.join(root, "big")]), main.CHANGED_CAMPAIGN_MAX_FILES)
-        self.assertEqual(by_dir[os.path.join(root, "big", "sub")], nested,
-                         "too big to merge into: the nested directory stays its own campaign")
+        self.assertEqual(sorted(by_dir), [os.path.join(root, "big")])
+        self.assertEqual(len(by_dir[os.path.join(root, "big")]), main.CHANGED_CAMPAIGN_MAX_FILES + 1,
+                         "the max is a preference; disjoint scopes are not")
+        self._assert_disjoint(by_dir)
         self.assertEqual(main.group_changed_files([], root), [])
         self.assertEqual(main.group_changed_files(["/elsewhere/x.go"], root), [], "outside the target: dropped")
+
+    def test_root_files_alone_are_the_one_root_campaign(self):
+        import main
+
+        root = self.repo
+        only_root = [os.path.join(root, "a.py"), os.path.join(root, "b.py")]
+        self.assertEqual(main.group_changed_files(only_root, root), [{"dir": root, "files": only_root}])
+        with_other = main.group_changed_files(only_root + [os.path.join(root, "pkg", "c.py")], root)
+        self.assertEqual([g["dir"] for g in with_other],
+                         [os.path.join(root, "a.py"), os.path.join(root, "b.py"), os.path.join(root, "pkg")])
+        self._assert_disjoint({g["dir"]: g["files"] for g in with_other})
 
     def test_an_old_ledger_without_content_is_scanned_whole_once(self):
         import contextlib
@@ -374,9 +400,11 @@ class EndToEndTest(_Repo):
         self.assertIn("4 of 5 source file(s) to examine (2 changed since last covered, 2 never covered)", out)
         self.assertIn("2 campaign(s) over the target", out)
         self.assertIn("Work plan — changed: 2 campaign(s)", out)
-        # The dummy endpoint pauses the run inside the first campaign (the
-        # root's, for b.py); the banner counts both.
-        self.assertIn("Triggered via: " + self.repo + "\n", out, "the root campaign, for b.py")
+        # b.py at the root is its own single-file campaign (a root campaign
+        # would span pkg's); it sorts first, and the dummy endpoint pauses
+        # the run inside it. The banner counts both.
+        self.assertIn("Triggered via: " + self.files["b"] + "\n", out, "the campaign for b.py alone")
+        self.assertNotIn("Triggered via: " + self.repo + "\n", out, "no root campaign beside another")
         self.assertIn("of 2 changed target(s)", out)
 
     def test_resume_notices_drift_and_points_at_changed(self):

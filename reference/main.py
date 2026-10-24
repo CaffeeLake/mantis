@@ -1177,8 +1177,8 @@ def resolve_scan_targets(
         print(
             f"Scan mode {SCAN_MODE_CHANGED}: {len(focus)} of {len(discovered_files)} source "
             f"file(s) to examine ({n_edited} changed since last covered, {n_new} never covered); "
-            f"{len(groups)} campaign(s) over the target, one per directory with changed files, "
-            "each scoped to its files.",
+            f"{len(groups)} campaign(s) over the target, one per directory with changed files "
+            "(a changed file at the root is its own), each scoped to its files.",
             file=sys.stderr,
         )
         if scope_out is not None:
@@ -1605,31 +1605,39 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     )
 
 
-#: A `changed` campaign is one directory's worth of changed files. Larger
-#: than this and a directory stays its own campaign anyway (nothing splits
-#: a package); smaller than CHANGED_CAMPAIGN_MIN_FILES and the directory's
-#: files join their parent's campaign, up to the max.
+#: A `changed` campaign is one directory's worth of changed files. A
+#: directory with fewer than CHANGED_CAMPAIGN_MIN_FILES changed files joins
+#: its parent's campaign while the merged campaign stays within
+#: CHANGED_CAMPAIGN_MAX_FILES; a directory under another campaign's
+#: directory joins it whatever the size, because scopes must not nest.
 CHANGED_CAMPAIGN_MAX_FILES = 24
 CHANGED_CAMPAIGN_MIN_FILES = 3
 
 
 def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
-    """The campaigns of a `changed` run: `[{"dir": <abs dir>, "files": [...]}]`,
-    one per directory holding changed files, sorted by directory.
+    """The campaigns of a `changed` run: `[{"dir": <abs path>, "files": [...]}]`,
+    sorted by path. `dir` is the campaign's identity: a directory holding
+    changed files, or -- for a file at the target root when there are other
+    campaigns -- the file itself.
 
     One campaign over everything made `--parallel` moot and put every changed
     file into the longest context the run has. A campaign per directory keeps
     a package's changes together (a Go package is its directory), gives each
     campaign a distinct identity for its session, artifacts and coverage
-    rows, and lets campaigns run side by side. One adjustment, toward fewer
-    tiny campaigns: a directory with fewer than CHANGED_CAMPAIGN_MIN_FILES
-    changed files merges into its parent's campaign when that stays within
-    CHANGED_CAMPAIGN_MAX_FILES, and climbs on while that holds. The target
-    root is a valid campaign directory, so a small change is the one root
-    campaign it was. Campaign scopes may nest (a root campaign spans the
-    tree): a stamp one campaign makes over a subtree is a status a nested
-    campaign's own stages set anyway, and dynamic statuses are written by
-    finding id. Never raises; an unresolvable file is dropped.
+    rows, and lets campaigns run side by side.
+
+    Scopes are disjoint by construction. A campaign's identity path is also
+    the scope of its stamps and of `get_findings`: a campaign whose path
+    contained another's would review, reproduce and stamp the other's
+    findings as its own, concurrently. So: a directory under another
+    campaign's directory always merges into that campaign, whatever the
+    size; a small directory (fewer than CHANGED_CAMPAIGN_MIN_FILES files)
+    climbs toward the root while the merged campaign stays within
+    CHANGED_CAMPAIGN_MAX_FILES, but never into the root itself; and files at
+    the root become the one root campaign only when nothing else changed --
+    otherwise each is its own single-file campaign, scoped to that file,
+    since a root campaign would span every other. Never raises; an
+    unresolvable file is dropped.
     """
     root = os.path.realpath(str(target_root))
     by_dir: dict[str, list[str]] = {}
@@ -1648,25 +1656,52 @@ def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
         p = os.path.dirname(d)
         return p if (p == root or p.startswith(root + os.sep)) else None
 
-    # Small directories climb toward the root while they stay small and the
-    # merged campaign stays within the max. Deepest first, so a directory's
-    # children have settled before it decides.
+    def _deepest_first(keys) -> list:
+        return sorted(keys, key=lambda x: (-x.count(os.sep), x))
+
+    # 1. Small directories climb toward (never into) the root while they
+    #    stay small and the merged campaign stays within the max. Deepest
+    #    first, so a directory's children have settled before it decides.
     changed = True
     while changed:
         changed = False
-        for d in sorted(by_dir, key=lambda x: (-x.count(os.sep), x)):
+        for d in _deepest_first(by_dir):
             files = by_dir.get(d)
             if not files or len(files) >= CHANGED_CAMPAIGN_MIN_FILES:
                 continue
             p = _parent(d)
-            if p is None:
+            if p is None or p == root:
                 continue
             if len(files) + len(by_dir.get(p, [])) > CHANGED_CAMPAIGN_MAX_FILES:
                 continue
             by_dir.setdefault(p, []).extend(by_dir.pop(d))
             changed = True
             break
-    return [{"dir": d, "files": sorted(by_dir[d])} for d in sorted(by_dir)]
+    # 2. No campaign under another's directory: the nested one joins the
+    #    ancestor, whatever the size. The root is handled below.
+    changed = True
+    while changed:
+        changed = False
+        for d in _deepest_first(by_dir):
+            anc = _parent(d)
+            while anc is not None and anc != root and anc not in by_dir:
+                anc = _parent(anc)
+            if anc is None or anc == root:
+                continue
+            by_dir[anc].extend(by_dir.pop(d))
+            changed = True
+            break
+    # 3. Files at the root: the one root campaign when nothing else changed;
+    #    otherwise one campaign per file, scoped to the file.
+    groups: list[dict] = []
+    root_files = sorted(by_dir.pop(root, []))
+    if root_files and not by_dir:
+        groups.append({"dir": root, "files": root_files})
+    else:
+        for f in root_files:
+            groups.append({"dir": os.path.realpath(f), "files": [f]})
+    groups.extend({"dir": d, "files": sorted(by_dir[d])} for d in by_dir)
+    return sorted(groups, key=lambda g: g["dir"])
 
 
 def _changed_files_hint(changed: int, total: int) -> str:
