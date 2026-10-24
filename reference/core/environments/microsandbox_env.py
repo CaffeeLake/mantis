@@ -121,6 +121,10 @@ class MicrosandboxEnvironment(BaseEnvironment):
             self._name = name
             self._sb = sb
             self.is_initialized = True
+            # Staging is done: anything newer than this was made by the
+            # campaign (see core.poc_scaffold).
+            from core.poc_scaffold import mark_staged
+            await mark_staged(self.write_file)
         return self._sb
 
     async def initialize(self) -> None:

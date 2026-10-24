@@ -474,6 +474,9 @@ async def run_sandbox_with_evidence(
     # recorded: an absent re-attack is what verifies a patch.
     _record_finding_evidence(current_run_context.get(), finding_id, evidence_present, reason,
                              sink_symbol=sink_symbol)
+    scaffold: List[str] = []
+    if evidence_present and finding_id is not None:
+        scaffold = await _keep_poc_scaffold(current_run_context.get(), int(finding_id))
 
     return {
         "raw": raw_res,
@@ -482,7 +485,50 @@ async def run_sandbox_with_evidence(
         "evidence_present": evidence_present,
         "evidence_reason": reason,
         "finding_id": finding_id,
+        "scaffold_files_kept": scaffold,
     }
+
+
+async def _keep_poc_scaffold(ctx, finding_id: int) -> List[str]:
+    """Stores, against the finding, the files its PoC left in the guest's
+    target tree (a harness built inside the module, a `_test.go` dropped
+    into the package): see core.poc_scaffold. Reproduction only -- in the
+    patcher evidence means the patch failed, and the tree holds the patch.
+    Returns the target-relative paths kept; never raises."""
+    import os
+    import sys
+
+    try:
+        if ctx is None or ctx.sandbox is None or not ctx.db_path:
+            return []
+        if type(ctx.sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
+            return []
+        if getattr(ctx, "active_node", "") == "patcher":
+            return []
+        from core.database import record_artifact
+        from core.poc_scaffold import capture_poc_scaffold
+
+        host_root = str(getattr(ctx.sandbox, "target_path", "") or "")
+        if host_root and os.path.isfile(host_root):
+            host_root = os.path.dirname(host_root)
+        meta_base = {
+            "resource": getattr(ctx, "target_file", ""),
+            "snapshot_id": getattr(ctx, "snapshot_id", ""),
+            "agent_authored": True,
+        }
+
+        def _persist(artifact_path: str, content: str, rel: str) -> None:
+            record_artifact(ctx.db_path, ctx.run_id, "workspace_file", artifact_path, content,
+                            metadata={**meta_base, "poc_scaffold": rel})
+
+        kept = await capture_poc_scaffold(ctx.sandbox, finding_id, _persist, host_root=host_root or None)
+        if kept:
+            print(f"[{getattr(ctx, 'active_node', '') or 'reproducer'}] kept {len(kept)} scaffold file(s) "
+                  f"for finding {finding_id}: {', '.join(kept[:5])}{'...' if len(kept) > 5 else ''}",
+                  file=sys.stderr)
+        return kept
+    except Exception:
+        return []
 
 
 async def apply_patch(diff_content: str) -> str:

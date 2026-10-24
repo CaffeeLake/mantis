@@ -102,6 +102,7 @@ class GvisorEnvironment(BaseEnvironment):
             return -1, f"SANDBOX-ERROR: {e}"
 
     async def _ensure(self) -> None:
+        fresh = False
         async with self._lock:
             if self._started:
                 return
@@ -149,6 +150,13 @@ class GvisorEnvironment(BaseEnvironment):
             await asyncio.to_thread(_init)
             self._started = True
             self.is_initialized = True
+            fresh = True
+        if fresh:
+            # Staging is done: anything newer than this was made by the
+            # campaign (see core.poc_scaffold). Outside the lock: write_file
+            # re-enters _ensure.
+            from core.poc_scaffold import mark_staged
+            await mark_staged(self.write_file)
 
     async def initialize(self) -> None:
         await self._ensure()

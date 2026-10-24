@@ -1326,6 +1326,11 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     exit 127, a build that found no scaffold) is inconclusive and left to
     the stages. A static-only sandbox re-runs nothing. Never raises.
 
+    The PoC is restored with its companions: the files its run kept under
+    `workspace/repro_<id>*` and the files it left in the target tree, which
+    the reproducer stored when the evidence landed (core.poc_scaffold).
+    Without them a wrapper around a Go harness has nothing to build.
+
     `changed_paths` are the target-relative files whose content differs
     from what the ledger covered them as. A finding none of whose files
     changed cannot have been fixed by the change: its PoC's silence is
@@ -1337,6 +1342,7 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     silent PoC is inconclusive.
     """
     from core.database import read_artifact, record_regression_check
+    from core.poc_scaffold import restore_poc_companions
     from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence
 
     sandbox = getattr(ctx, "sandbox", None)
@@ -1361,6 +1367,16 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
         sentinel = f"sentinel_{pid}"
         outcome, why = "inconclusive", "PoC did not run"
         try:
+            # The wrapper's companions first -- the harness under
+            # workspace/repro_<id>/, the _test.go its run left in the
+            # package -- so the wrapper re-runs with what it was built
+            # with, not against an empty scaffold (see core.poc_scaffold).
+            restored, skipped = await restore_poc_companions(
+                sandbox, db_path, str(p.get("run_id") or ""), pid)
+            if restored or skipped:
+                print(f"[REGRESSION] earlier PoC #{pid}: restored {len(restored)} companion file(s)"
+                      + (f", {len(skipped)} skipped (present in the current tree)" if skipped else ""),
+                      file=sys.stderr)
             await sandbox.write_file(Path(guest_path), content)
             try:
                 existing = await sandbox.read_file(Path(sentinel))

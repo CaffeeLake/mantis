@@ -2117,6 +2117,30 @@ def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = 
     return isinstance(meta, dict) and bool(meta.get("imported"))
 
 
+def read_artifacts_like(db_path: str, run_id: str, pattern: str, artifact_type: str = "") -> List[Dict[str, Any]]:
+    """Every artifact of `run_id` whose filepath matches the SQL LIKE
+    `pattern` (backslash escapes), newest row per filepath, as
+    `{filepath, content, metadata_json}` sorted by filepath. For gathering
+    a family of files (a PoC and its companions) rather than one."""
+    with _db(db_path) as conn:
+        cursor = conn.cursor()
+        query = ("SELECT id, filepath, content, metadata_json FROM campaign_artifacts "
+                 "WHERE run_id = ? AND filepath LIKE ? ESCAPE '\\'")
+        params: list = [run_id, pattern]
+        if artifact_type:
+            query += " AND artifact_type = ?"
+            params.append(artifact_type)
+        query += " ORDER BY id DESC"
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        fp = str(row["filepath"])
+        if fp not in latest:
+            latest[fp] = {"filepath": fp, "content": row["content"], "metadata_json": row["metadata_json"]}
+    return [latest[fp] for fp in sorted(latest)]
+
+
 def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None,
                          resource: Optional[str] = None) -> Optional[dict]:
     """The latest matching artifact row as {content, metadata_json}, or None.

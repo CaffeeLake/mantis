@@ -258,6 +258,7 @@ class GceEnvironment(BaseEnvironment):
 
     async def _ensure(self) -> None:
         """Creates the hardened ephemeral GCE VM instance and stages workspace files."""
+        fresh = False
         async with self._lock:
             if self._started:
                 return
@@ -408,6 +409,7 @@ class GceEnvironment(BaseEnvironment):
                 await asyncio.to_thread(_init)
                 self._started = True
                 self.is_initialized = True
+                fresh = True
             except Exception as e:
                 self._stage_error = e
                 try:
@@ -415,6 +417,12 @@ class GceEnvironment(BaseEnvironment):
                 except Exception:
                     pass
                 raise e
+        if fresh:
+            # Staging is done: anything newer than this was made by the
+            # campaign (see core.poc_scaffold). Outside the lock: write_file
+            # re-enters _ensure.
+            from core.poc_scaffold import mark_staged
+            await mark_staged(self.write_file)
 
     def _verify_guest_isolation(self) -> None:
         """Executes active in-guest probes to verify zero internet access, no IAM token leak, and no public DNS recursion."""

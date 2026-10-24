@@ -1447,8 +1447,9 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
 
 
 async def get_prior_poc(prior_finding_id: int) -> str:
-    """Fetches the proof-of-concept an EARLIER run wrote for one of its findings (workspace/repro_<id>.py) into this run's workspace as workspace/repro_prior_<id>.py, so it can be re-run UNCHANGED against the current code."""
+    """Fetches the proof-of-concept an EARLIER run wrote for one of its findings (workspace/repro_<id>.py) into this run's workspace as workspace/repro_prior_<id>.py, with the companion files it needs (its workspace/repro_<id>/ harness, the files it left in the target tree), so it can be re-run UNCHANGED against the current code."""
     from core.database import read_artifact, read_findings
+    from core.poc_scaffold import restore_poc_companions
 
     ctx = current_run_context.get()
     if ctx is None or not ctx.db_path:
@@ -1477,11 +1478,26 @@ async def get_prior_poc(prior_finding_id: int) -> str:
                 "Judge it from the code and the entry point instead, and record the check as 'static' reasoning.")
     ext = source.rsplit(".", 1)[-1]
     dest = f"workspace/repro_prior_{pid}.{ext}"
+    # Companions go straight into the guest at the paths the wrapper expects;
+    # the wrapper goes through write_file so this run keeps a record of what
+    # it re-ran.
+    restored: list = []
+    skipped: list = []
+    if ctx.sandbox is not None and type(ctx.sandbox).__name__ not in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
+        restored, skipped = await restore_poc_companions(ctx.sandbox, resolved_db, prior_run, pid)
     res = await write_file(dest, content)
     if not str(res).startswith("SUCCESS"):
         return f"Error: could not place the prior PoC in this workspace: {res}"
     head = "\n".join(str(content).splitlines()[:12])
-    return (f"SUCCESS: prior PoC for finding {pid} (from run {prior_run[:8]}, {len(content)} chars) placed at {dest}. "
+    companions = ""
+    if restored:
+        companions = (f" Restored {len(restored)} companion file(s) it needs: "
+                      + ", ".join(restored[:8]) + ("..." if len(restored) > 8 else "") + ".")
+    if skipped:
+        companions += (f" Not restored ({len(skipped)}, the current tree already has a file there): "
+                       + ", ".join(skipped[:4]) + ("..." if len(skipped) > 4 else "") + ".")
+    return (f"SUCCESS: prior PoC for finding {pid} (from run {prior_run[:8]}, {len(content)} chars) placed at {dest}."
+            f"{companions} "
             f"Run it UNCHANGED with run_sandbox_with_evidence(command=..., finding_id={pid}, "
             f"sentinel_path='sentinel_{pid}', sink_symbol=...). Its sentinel path was whatever it wrote before; "
             f"read {dest} if unsure.\n" + wrap_untrusted_content(head, filename=dest))
