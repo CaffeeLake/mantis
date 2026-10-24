@@ -909,7 +909,9 @@ def resolve_scan_targets(
     Both are optional: without them the function behaves exactly as it did before.
 
     `scope_out`, when given, receives what a mode decided beyond its targets:
-    `changed` writes `focus_files` (the files the one campaign is about) and
+    `changed` writes `focus_files` (every file the run is about),
+    `focus_groups` (the campaigns: `{"dir", "files"}` each, the targets
+    returned being their directories), `changed_files` and
     `nothing_changed` (True when there was nothing to scan, and `targets` is
     empty). The return shape is unchanged for every caller that does not ask.
 
@@ -1111,13 +1113,14 @@ def resolve_scan_targets(
     if mode == SCAN_MODE_CHANGED:
         # The files no completed campaign has covered in their present
         # content, for this model: never covered, or covered and edited
-        # since. One campaign over the whole target with these as its scope,
-        # so the agent can read the routes and callers around a changed file
-        # (a single-file campaign is jailed to the file's directory and
-        # cannot). A missing ledger makes every file new, which is the whole
-        # target by a longer route; an unreadable one is said and scanned
-        # whole, the safe direction. Nothing changed means nothing to scan,
-        # and the caller is told so through scope_out.
+        # since. A campaign per directory holding them (group_changed_files),
+        # each over the whole target with its files as its scope, so the
+        # agent can read the routes and callers around a changed file and
+        # campaigns can run side by side. A missing ledger makes every file
+        # new, which is the whole target by a longer route; an unreadable
+        # one is said and scanned whole, the safe direction. Nothing changed
+        # means nothing to scan, and the caller is told so through
+        # scope_out.
         if target_path.is_file():
             return whole
         focus: Optional[list] = None
@@ -1170,20 +1173,23 @@ def resolve_scan_targets(
             return [], None, SCAN_MODE_CHANGED
         n_edited = len(set(edited.get("files") or []) & set(focus))
         n_new = len(focus) - n_edited
+        groups = group_changed_files(list(focus), str(target_path)) or [{"dir": str(target_path), "files": list(focus)}]
         print(
             f"Scan mode {SCAN_MODE_CHANGED}: {len(focus)} of {len(discovered_files)} source "
             f"file(s) to examine ({n_edited} changed since last covered, {n_new} never covered); "
-            "one campaign over the target, scoped to them.",
+            f"{len(groups)} campaign(s) over the target, one per directory with changed files, "
+            "each scoped to its files.",
             file=sys.stderr,
         )
         if scope_out is not None:
             scope_out["focus_files"] = list(focus)
+            scope_out["focus_groups"] = groups
             # The subset whose content actually changed, apart from the
             # never-covered: only a finding in one of these can be called
             # fixed by its PoC's silence (see _rerun_prior_pocs).
             scope_out["changed_files"] = [f for f in focus if f in set(edited.get("files") or [])]
             scope_out["nothing_changed"] = False
-        return [str(target_path)], None, SCAN_MODE_CHANGED
+        return [g["dir"] for g in groups], None, SCAN_MODE_CHANGED
 
     if mode == SCAN_MODE_FILE_BY_FILE:
         # discover_files already produced this list and, until now, nothing consumed it:
@@ -1584,8 +1590,9 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
     more = f"\n... and {len(rels) - len(shown)} more" if len(rels) > len(shown) else ""
     listing = wrap_untrusted_content("\n".join(shown) + more, filename="changed_files")
     return (
-        "\n\nCHANGE-SCOPED RUN. This run examines only the files below: they are new, or "
-        "were edited since a completed scan last covered them. The rest of the target "
+        "\n\nCHANGE-SCOPED RUN. This campaign examines only the files below: they are new, or "
+        "were edited since a completed scan last covered them (other changed files belong to "
+        "other campaigns of this run). The rest of the target "
         "is unchanged since it was examined, stays readable and indexed, and is there "
         "for context: follow a changed function to its callers and the routes that "
         "reach it, and read whatever those paths need. Plan, research and report on "
@@ -1593,6 +1600,70 @@ def _render_change_focus(focus_files: list[str], target_root: str) -> str:
         "for their own sake. If an earlier run reported a finding in one of these files, "
         "say whether it is still present.\n" + listing
     )
+
+
+#: A `changed` campaign is one directory's worth of changed files. Larger
+#: than this and a directory stays its own campaign anyway (nothing splits
+#: a package); smaller than CHANGED_CAMPAIGN_MIN_FILES and the directory's
+#: files join their parent's campaign, up to the max.
+CHANGED_CAMPAIGN_MAX_FILES = 24
+CHANGED_CAMPAIGN_MIN_FILES = 3
+
+
+def group_changed_files(focus_files: list[str], target_root: str) -> list[dict]:
+    """The campaigns of a `changed` run: `[{"dir": <abs dir>, "files": [...]}]`,
+    one per directory holding changed files, sorted by directory.
+
+    One campaign over everything made `--parallel` moot and put every changed
+    file into the longest context the run has. A campaign per directory keeps
+    a package's changes together (a Go package is its directory), gives each
+    campaign a distinct identity for its session, artifacts and coverage
+    rows, and lets campaigns run side by side. One adjustment, toward fewer
+    tiny campaigns: a directory with fewer than CHANGED_CAMPAIGN_MIN_FILES
+    changed files merges into its parent's campaign when that stays within
+    CHANGED_CAMPAIGN_MAX_FILES, and climbs on while that holds. The target
+    root is a valid campaign directory, so a small change is the one root
+    campaign it was. Campaign scopes may nest (a root campaign spans the
+    tree): a stamp one campaign makes over a subtree is a status a nested
+    campaign's own stages set anyway, and dynamic statuses are written by
+    finding id. Never raises; an unresolvable file is dropped.
+    """
+    root = os.path.realpath(str(target_root))
+    by_dir: dict[str, list[str]] = {}
+    for f in focus_files or []:
+        try:
+            real = os.path.realpath(str(f))
+        except (OSError, ValueError):
+            continue
+        if real != root and not real.startswith(root + os.sep):
+            continue
+        by_dir.setdefault(os.path.dirname(real), []).append(str(f))
+
+    def _parent(d: str) -> Optional[str]:
+        if d == root:
+            return None
+        p = os.path.dirname(d)
+        return p if (p == root or p.startswith(root + os.sep)) else None
+
+    # Small directories climb toward the root while they stay small and the
+    # merged campaign stays within the max. Deepest first, so a directory's
+    # children have settled before it decides.
+    changed = True
+    while changed:
+        changed = False
+        for d in sorted(by_dir, key=lambda x: (-x.count(os.sep), x)):
+            files = by_dir.get(d)
+            if not files or len(files) >= CHANGED_CAMPAIGN_MIN_FILES:
+                continue
+            p = _parent(d)
+            if p is None:
+                continue
+            if len(files) + len(by_dir.get(p, [])) > CHANGED_CAMPAIGN_MAX_FILES:
+                continue
+            by_dir.setdefault(p, []).extend(by_dir.pop(d))
+            changed = True
+            break
+    return [{"dir": d, "files": sorted(by_dir[d])} for d in sorted(by_dir)]
 
 
 def _changed_files_hint(changed: int, total: int) -> str:
@@ -2147,7 +2218,9 @@ async def pipeline(
     if scan_mode == SCAN_MODE_CHANGED and not targets_to_scan:
         return 0
     focus_files: list[str] = list(scan_scope.get("focus_files") or [])
-    change_focus = _render_change_focus(focus_files, str(target_path)) if focus_files else ""
+    focus_groups: list[dict] = list(scan_scope.get("focus_groups") or [])
+    if focus_files and not focus_groups:
+        focus_groups = [{"dir": str(target_path), "files": list(focus_files)}]
     # The files whose content changed, target-relative: the only ones a
     # prior finding can be called fixed in (see _rerun_prior_pocs).
     changed_rel: set = set()
@@ -2157,15 +2230,32 @@ async def pipeline(
             changed_rel.add(os.path.relpath(os.path.realpath(str(_f)), _rel_root).replace(os.sep, "/"))
         except ValueError:
             continue
-    # What earlier runs reported in those files, for this run to decide about.
+    # What earlier runs reported in those files, for this run to decide
+    # about: the whole set here, for the count and the settlement at the
+    # end; each campaign is briefed on, and re-runs the PoCs of, the ones in
+    # its own files (_changed_campaign_brief).
     prior_in_scope: list[dict] = []
     if focus_files:
-        prior_in_scope, brief = _regression_brief(
+        prior_in_scope, _brief = _regression_brief(
             db_path, run_id, focus_files, str(resolved_path_root or target_path), str(target_path))
-        change_focus += brief
         if prior_in_scope:
             print(f"{len(prior_in_scope)} earlier finding(s) sit in the changed files; this run will say "
                   "whether each is still present.", file=sys.stderr)
+
+    def _changed_campaign_brief(group: dict) -> tuple[str, list[dict]]:
+        """(directive, prior findings) for one `changed` campaign: its files
+        and the earlier findings in them. ("", []) outside changed mode."""
+        files = list(group.get("focus") or [])
+        if not files:
+            return "", []
+        text = _render_change_focus(files, str(target_path))
+        try:
+            priors, brief = _regression_brief(
+                db_path, run_id, files, str(resolved_path_root or target_path), str(target_path))
+        except Exception as exc:
+            print(f"[REGRESSION BRIEF WARNING] {exc}", file=sys.stderr)
+            priors, brief = [], ""
+        return text + brief, priors
 
     # H-3: the LLM planning pass. When this run resolved to a cross-functional scan
     # and the knowledge base holds history -- coverage, spend, or prior findings --
@@ -2513,6 +2603,17 @@ async def pipeline(
             plan_groups,
             key=lambda g: _flat_rank.get(g["targets"][0], len(_flat_rank)),
         )
+    if not campaign_groups and scan_mode == SCAN_MODE_CHANGED and focus_groups:
+        # A `changed` run: one campaign per directory with changed files,
+        # over the directory (its identity, status scope and coverage row)
+        # with the changed files as its focus. The group keeps the files so
+        # the campaign's directive, PoC re-runs and content ledger are about
+        # exactly them, not every file under the directory.
+        _by_dir = {str(g.get("dir")): list(g.get("files") or []) for g in focus_groups}
+        campaign_groups = [
+            {"targets": [t], "focus": _by_dir.get(str(t), []), "hypothesis": None, "chain": None}
+            for t in targets_to_scan
+        ]
     if not campaign_groups:
         campaign_groups = [
             {"targets": [t], "hypothesis": None, "chain": None}
@@ -2784,6 +2885,9 @@ async def pipeline(
             # whose contract is to read nothing else.
             sandbox_root = str(target_path) if target_path.is_dir() else scan_item
             sandbox = build_sandbox(config.get("sandbox", {}), sandbox_root)
+            # A `changed` campaign's directive and the earlier findings it
+            # answers for: its own files' (empty in every other mode).
+            change_focus, campaign_priors = _changed_campaign_brief(group)
             branch_ctx = dataclasses.replace(
                 base_ctx,
                 target_file=scan_item,
@@ -2901,23 +3005,24 @@ async def pipeline(
             scope_content: list = []
             try:
                 from core.cost import scope_identities
-                # A change-scoped campaign examined the changed files; the
+                # A change-scoped campaign examined its changed files; the
                 # rest of the tree keeps the content it was covered as.
-                scope_files = focus_files if (scan_mode == SCAN_MODE_CHANGED and focus_files) \
-                    else _campaign_scope_files(group, scan_item, discovered_files)
+                scope_files = list(group.get("focus") or []) if scan_mode == SCAN_MODE_CHANGED else []
+                scope_files = scope_files or _campaign_scope_files(group, scan_item, discovered_files)
                 scope_content = scope_identities(scope_files)
             except Exception as exc:
                 print(f"[CONTENT LEDGER WARNING] {exc}", file=sys.stderr)
             try:
-                # A change-scoped run: the earlier PoCs are re-run by the
-                # harness now, against the operator's code as staged, and
-                # the outcome joins the directive every stage reads. Inside
-                # the try whose finally closes the sandbox: the guest this
-                # boots must not outlive a cancellation here.
-                if scan_mode == SCAN_MODE_CHANGED and prior_in_scope:
+                # A change-scoped run: the earlier PoCs in this campaign's
+                # files are re-run by the harness now, against the
+                # operator's code as staged, and the outcome joins the
+                # directive every stage reads. Inside the try whose finally
+                # closes the sandbox: the guest this boots must not outlive a
+                # cancellation here.
+                if scan_mode == SCAN_MODE_CHANGED and campaign_priors:
                     try:
                         rerun_note = await _rerun_prior_pocs(
-                            branch_ctx, db_path, run_id, prior_in_scope, changed_paths=changed_rel)
+                            branch_ctx, db_path, run_id, campaign_priors, changed_paths=changed_rel)
                         if rerun_note:
                             branch_ctx.campaign_directive = (branch_ctx.campaign_directive or "") + rerun_note
                             for line in rerun_note.strip().splitlines()[1:]:
