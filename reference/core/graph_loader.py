@@ -1448,6 +1448,125 @@ async def _write_handoff(node_id: str, llm: Any, llm_request: Any) -> tuple[str,
         return "", 0
 
 
+CLEARED_TOOL_RESULT_TEXT = "[cleared by context editing]"
+NODE_CONTEXT_CLEARED_KEY = "cleared_tool_results"
+
+
+def _function_response_parts(llm_request: Any) -> list:
+    """`[(content, part_index, chars)]` for every tool result in the request,
+    in order: the list client-side context editing clears from the front."""
+    out: list = []
+    for content in getattr(llm_request, "contents", None) or []:
+        parts = getattr(content, "parts", None) or []
+        for i, part in enumerate(parts):
+            response = getattr(part, "function_response", None)
+            if response is None:
+                continue
+            payload = getattr(response, "response", None) or {}
+            if isinstance(payload, dict) and payload.get("result") == CLEARED_TOOL_RESULT_TEXT and len(payload) == 1:
+                out.append((content, i, 0))
+            else:
+                out.append((content, i, len(json.dumps(payload, default=str))))
+    return out
+
+
+def _clear_function_response(content: Any, index: int) -> None:
+    """Replaces one tool result with the placeholder. ADK hands the request a
+    shallow copy of each Content and Part, so a new Part in the copied list
+    leaves the session's events untouched; the call id stays so the pairing
+    with its function call holds."""
+    part = content.parts[index]
+    response = part.function_response
+    content.parts[index] = types.Part(function_response=types.FunctionResponse(
+        name=getattr(response, "name", None),
+        id=getattr(response, "id", None),
+        response={"result": CLEARED_TOOL_RESULT_TEXT},
+    ))
+
+
+def _make_client_context_editing_before_model_callback(node_id: str, model: Any = None, config: Any = None):
+    """Clears a stage's older tool results before dispatch, for models that
+    do not bind their reasoning to the request prefix (Gemini, OpenAI):
+    the harness-side counterpart of Anthropic context editing, same trigger,
+    keep and clear-at-least (core.config.client_context_editing).
+
+    Deterministic and monotonic within a stage attempt: the campaign's
+    budget slot remembers how many of the oldest results are cleared, every
+    request clears exactly those (ADK rebuilds the request from the session
+    on each call, so the clearing is re-applied, never persisted), and the
+    count only grows -- at the trigger, by at least clear-at-least worth of
+    results, never into the newest `keep`. Between edits the request prefix
+    is therefore stable, which is what implicit prompt caching needs; each
+    edit costs one cache miss, as the provider's own edit does. Reset by a
+    continuation, whose attempt starts with no tool results of its own.
+
+    Runs before the ceiling callback, which then measures the request as
+    cleared. Claude models get None here: the provider edits for them.
+    """
+    editing_cache: dict[str, Any] = {}
+
+    def _editing() -> Optional[dict]:
+        if "editing" not in editing_cache:
+            try:
+                from core.config import client_context_editing
+                editing_cache["editing"] = client_context_editing(model, config=config) if model else None
+            except Exception:
+                editing_cache["editing"] = None
+        return editing_cache["editing"]
+
+    async def _before_model(callback_context: Any = None, llm_request: Any = None):
+        if llm_request is None:
+            return None
+        editing = _editing()
+        if not editing:
+            return None
+        slot = _node_context_slot(node_id)
+        if slot is None:
+            return None
+        keep = max(0, int(editing.get("keep") or 0))
+        responses = _function_response_parts(llm_request)
+        clearable = max(0, len(responses) - keep)
+        cleared = min(max(0, int(slot.get(NODE_CONTEXT_CLEARED_KEY) or 0)), clearable)
+        if hasattr(llm_request, "append_instructions"):
+            sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
+            if "[CONTEXT EDITING]" not in sys_inst:
+                llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
+        for content, index, _chars in responses[:cleared]:
+            _clear_function_response(content, index)
+        estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
+        trigger = int(editing.get("trigger_tokens") or 0)
+        if trigger and estimated >= trigger and cleared < clearable:
+            # At least clear-at-least worth, and enough to get back under
+            # the trigger, so one edit (one cache miss) buys a long stretch.
+            target = int(editing.get("clear_at_least_tokens") or 0) * NODE_CONTEXT_CHARS_PER_TOKEN
+            total_chars = estimated * NODE_CONTEXT_CHARS_PER_TOKEN
+            freed = 0
+            new_cleared = cleared
+            while new_cleared < clearable and (
+                new_cleared == cleared or freed < target
+                or (total_chars - freed) // NODE_CONTEXT_CHARS_PER_TOKEN >= trigger
+            ):
+                freed += responses[new_cleared][2]
+                new_cleared += 1
+            for content, index, _chars in responses[cleared:new_cleared]:
+                _clear_function_response(content, index)
+            slot[NODE_CONTEXT_CLEARED_KEY] = new_cleared
+            _observe("context_edits_applied")
+            _observe("context_edit_cleared_tokens", freed // NODE_CONTEXT_CHARS_PER_TOKEN)
+            print(
+                f"\n[CONTEXT EDITING] {node_id}: ~{estimated:,} tokens of working context at the "
+                f"{trigger:,}-token trigger; cleared {new_cleared - cleared} older tool result(s) "
+                f"(~{freed // NODE_CONTEXT_CHARS_PER_TOKEN:,} tokens), {new_cleared} of "
+                f"{len(responses)} now cleared, newest {keep} kept.",
+                file=sys.stderr,
+            )
+        elif slot.get(NODE_CONTEXT_CLEARED_KEY) != cleared:
+            slot[NODE_CONTEXT_CLEARED_KEY] = cleared
+        return None
+
+    return _before_model
+
+
 def _make_node_context_ceiling_before_model_callback(
     node_id: str, model: Any = None, has_schema: bool = False, keep_tool_results: Optional[int] = None,
     llm_factory: Any = None, max_continuations: Optional[int] = None,
@@ -1546,6 +1665,8 @@ def _make_node_context_ceiling_before_model_callback(
             slot["continuations"] = number
             slot["handoff"] = handoff
             slot["tokens"] = 0
+            # The continued attempt has no tool results of its own yet.
+            slot[NODE_CONTEXT_CLEARED_KEY] = 0
             _store_handoff(node_id, handoff, number)
             _observe("continuations")
             print(
@@ -2619,7 +2740,12 @@ def load_workflow_from_json(
             agent_kwargs["before_model_callback"] = [
                 _make_stage_experience_before_model_callback(node_id),
                 _make_campaign_directive_before_model_callback(node_id),
-                # Last: measures the request as the two above leave it.
+                # Models without prefix binding: the harness clears older
+                # tool results itself (None for Claude, whose provider does).
+                _make_client_context_editing_before_model_callback(
+                    node_id, model=node_model_id, config=spec.config.model_dump(),
+                ),
+                # Last: measures the request as the three above leave it.
                 _make_node_context_ceiling_before_model_callback(
                     node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema),
                     keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),

@@ -186,5 +186,161 @@ class EstimatesFollowTheProviderTest(unittest.TestCase):
         self.assertNotIn("[CONTEXT EDITING]", req2.config.system_instruction, "no editing, no notice")
 
 
+class ClientSideEditingTest(unittest.TestCase):
+    """Models without prefix binding get the same editing from the harness:
+    older tool results cleared before dispatch, deterministically, never
+    the newest `keep`, re-applied on every rebuilt request."""
+
+    def setUp(self):
+        self.env = patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ.pop(C._CONTEXT_EDITING_ENV, None)
+        os.environ.pop("MANTIS_MAX_INPUT_TOKENS", None)
+        from core.budget import BudgetConfig, BudgetController
+        from core.context import RunContext, current_run_context
+        self.ctrl = BudgetController(config=BudgetConfig(max_tokens=0, max_wall_clock_seconds=0), run_id="r")
+        token = current_run_context.set(RunContext(jail_dir="/tmp", db_path="", target_file="a.py", run_id="r",
+                                                   budget_controller=self.ctrl, node_context={}))
+        self.addCleanup(current_run_context.reset, token)
+        self.ctx = current_run_context.get()
+
+    def test_the_parameter_mirrors_the_providers_and_is_for_other_models_only(self):
+        with patch.object(C, "resolve_context_limit", return_value=1_000_000):
+            self.assertIsNone(C.client_context_editing(CLAUDE), "the provider edits for Claude")
+            for other in (GEMINI, "openai/gpt-5.3-codex", "gemini/gemini-3.6-flash"):
+                edit = C.client_context_editing(other)
+                self.assertEqual(edit, {"trigger_tokens": 500_000, "keep": C.CONTEXT_EDITING_KEEP_TOOL_USES,
+                                        "clear_at_least_tokens": 200_000}, other)
+            self.assertIsNone(C.client_context_editing(GEMINI, config={"context_editing": "off"}))
+            os.environ[C._CONTEXT_EDITING_ENV] = "off"
+            self.assertIsNone(C.client_context_editing(GEMINI))
+            os.environ.pop(C._CONTEXT_EDITING_ENV)
+        with patch.object(C, "resolve_context_limit", return_value=None):
+            self.assertIsNone(C.client_context_editing(GEMINI))
+        self.assertIsNone(C.client_context_editing(""))
+
+    @staticmethod
+    def _request(n: int, chars: int = 10_000):
+        from google.adk.models import LlmRequest
+        from google.genai import types
+
+        req = LlmRequest()
+        req.config.system_instruction = "be careful"
+        req.contents = [types.Content(role="user", parts=[types.Part.from_text(text="go")])]
+        for i in range(n):
+            req.contents.append(types.Content(role="model", parts=[
+                types.Part(function_call=types.FunctionCall(name="read_file", id=f"c{i}", args={"n": i}))]))
+            req.contents.append(types.Content(role="user", parts=[
+                types.Part(function_response=types.FunctionResponse(name="read_file", id=f"c{i}",
+                                                                    response={"result": f"{i}:" + "x" * chars}))]))
+        return req
+
+    @staticmethod
+    def _results(req):
+        import core.graph_loader as gl
+        return [c.parts[i].function_response for c, i, _ in gl._function_response_parts(req)]
+
+    def _callback(self, model=GEMINI, window=100_000):
+        import core.graph_loader as gl
+        patcher = patch.object(C, "resolve_context_limit", return_value=window)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return gl._make_client_context_editing_before_model_callback("researcher", model=model)
+
+    def test_at_the_trigger_the_oldest_results_are_cleared_and_stay_cleared(self):
+        import core.graph_loader as gl
+
+        # 100k-token window: trigger 50k tokens, clear at least 20k tokens
+        # (60k chars at 3 chars/token), keep 5. Twenty 10k-char results are
+        # ~67k tokens: over the trigger; six results clear 60k chars.
+        cb = self._callback()
+        req = self._request(20)
+        self.assertIsNone(asyncio.run(cb(callback_context=None, llm_request=req)))
+        results = self._results(req)
+        cleared = [r for r in results if r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT}]
+        self.assertEqual(len(cleared), 6)
+        self.assertEqual([r.id for r in cleared], [f"c{i}" for i in range(6)], "the oldest, in order; ids kept")
+        self.assertTrue(all(r.name == "read_file" for r in cleared))
+        self.assertTrue(results[6].response["result"].startswith("6:"), "the seventh is intact")
+        self.assertEqual(self.ctx.node_context["researcher"][gl.NODE_CONTEXT_CLEARED_KEY], 6)
+        self.assertIn("[CONTEXT EDITING]", req.config.system_instruction)
+        snap = self.ctrl.spend_snapshot()
+        self.assertEqual(snap["context"]["context_edits_applied"], 1)
+        self.assertGreaterEqual(snap["context"]["context_edit_cleared_tokens"], 20_000)
+
+        # ADK rebuilds the request from the session on the next call: the
+        # same six are cleared again, nothing more (now under the trigger),
+        # so the prefix the provider sees is the one it cached.
+        again = self._request(20)
+        asyncio.run(cb(callback_context=None, llm_request=again))
+        results = self._results(again)
+        self.assertEqual(sum(r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in results), 6)
+        self.assertEqual(self.ctrl.spend_snapshot()["context"]["context_edits_applied"], 1)
+        self.assertEqual(again.config.system_instruction.count("[CONTEXT EDITING]"), 1)
+
+    def test_under_the_trigger_nothing_is_cleared(self):
+        import core.graph_loader as gl
+        cb = self._callback()
+        req = self._request(4)
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        self.assertTrue(all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in self._results(req)))
+        self.assertEqual(self.ctx.node_context["researcher"].get(gl.NODE_CONTEXT_CLEARED_KEY, 0), 0)
+
+    def test_the_newest_keep_are_never_cleared(self):
+        import core.graph_loader as gl
+        cb = self._callback()
+        req = self._request(7, chars=100_000)  # far over the trigger; only two are clearable
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        results = self._results(req)
+        self.assertEqual([r.response == {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in results],
+                         [True, True, False, False, False, False, False])
+
+    def test_a_fresh_attempt_does_not_inherit_a_larger_count(self):
+        import core.graph_loader as gl
+        cb = self._callback()
+        slot = gl._node_context_slot("researcher")
+        slot[gl.NODE_CONTEXT_CLEARED_KEY] = 10
+        req = self._request(3)
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        self.assertTrue(all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in self._results(req)))
+        self.assertEqual(slot[gl.NODE_CONTEXT_CLEARED_KEY], 0)
+
+    def test_claude_is_left_to_its_provider(self):
+        import core.graph_loader as gl
+        cb = self._callback(model=CLAUDE)
+        req = self._request(20)
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        self.assertTrue(all(r.response != {"result": gl.CLEARED_TOOL_RESULT_TEXT} for r in self._results(req)))
+        self.assertNotIn("[CONTEXT EDITING]", req.config.system_instruction)
+
+    def test_the_ceiling_measures_the_request_as_cleared(self):
+        import core.graph_loader as gl
+        cb = self._callback()
+        req = self._request(20)
+        before = gl._request_chars(req)
+        asyncio.run(cb(callback_context=None, llm_request=req))
+        self.assertLess(gl._request_chars(req), before - 55_000)
+
+    def test_every_agent_node_carries_the_callback_ahead_of_the_ceiling(self):
+        from core.graph_loader import load_workflow_from_json
+
+        workflow, _cfg = load_workflow_from_json(str(_REF_ROOT / "workflow.json"), load_local=False)
+        seen = {}
+        for edge in workflow.edges:
+            for node in (getattr(edge, "from_node", None), getattr(edge, "to_node", None)):
+                agent = getattr(node, "agent", node)
+                if agent is not None and getattr(agent, "before_model_callback", None) and getattr(agent, "tools", None):
+                    seen[getattr(agent, "name", id(agent))] = agent
+        self.assertGreater(len(seen), 5)
+        for name, agent in seen.items():
+            names = [getattr(cb, "__qualname__", "") for cb in agent.before_model_callback]
+            editing = next((i for i, n in enumerate(names) if "client_context_editing" in n), None)
+            ceiling = next((i for i, n in enumerate(names) if "node_context_ceiling" in n), None)
+            self.assertIsNotNone(editing, f"{name}: no client-side context editing callback")
+            self.assertIsNotNone(ceiling, f"{name}: no ceiling callback")
+            self.assertLess(editing, ceiling, f"{name}: the ceiling must measure the request as cleared")
+
+
 if __name__ == "__main__":
     unittest.main()

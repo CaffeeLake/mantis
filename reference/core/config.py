@@ -809,15 +809,19 @@ def is_claude_model(model: Any) -> bool:
     return "claude" in str(model or "").lower()
 
 
+def _context_editing_off(config: Optional[dict]) -> bool:
+    if str(os.environ.get(_CONTEXT_EDITING_ENV, "") or "").strip().lower() in _OFF_WORDS:
+        return True
+    return isinstance(config, dict) and str(config.get("context_editing", "auto") or "").strip().lower() in _OFF_WORDS
+
+
 def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
     """The `context_management` parameter for `model`, or None when it must not
     be sent: not a Claude model, switched off (config `context_editing: off`
     or MANTIS_CONTEXT_EDITING=off), or a window we cannot size against."""
     if not is_claude_model(model):
         return None
-    if str(os.environ.get(_CONTEXT_EDITING_ENV, "") or "").strip().lower() in _OFF_WORDS:
-        return None
-    if isinstance(config, dict) and str(config.get("context_editing", "auto") or "").strip().lower() in _OFF_WORDS:
+    if _context_editing_off(config):
         return None
     limit = resolve_context_limit(model)
     if not limit:
@@ -828,6 +832,27 @@ def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Opti
         "keep": {"type": "tool_uses", "value": CONTEXT_EDITING_KEEP_TOOL_USES},
         "clear_at_least": {"type": "input_tokens", "value": int(limit * CONTEXT_EDITING_CLEAR_RATIO)},
     }]}
+
+
+def client_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
+    """The harness-side counterpart of `anthropic_context_editing` for models
+    that do not bind their reasoning to the request prefix (Gemini, OpenAI):
+    the same trigger, keep and clear-at-least, applied by the harness to the
+    request before dispatch (core.graph_loader). `{"trigger_tokens", "keep",
+    "clear_at_least_tokens"}`, or None for a Claude model (the provider does
+    it), when switched off, or a window we cannot size against."""
+    if is_claude_model(model):
+        return None
+    if _context_editing_off(config):
+        return None
+    limit = resolve_context_limit(model)
+    if not limit:
+        return None
+    return {
+        "trigger_tokens": int(limit * CONTEXT_EDITING_TRIGGER_RATIO),
+        "keep": CONTEXT_EDITING_KEEP_TOOL_USES,
+        "clear_at_least_tokens": int(limit * CONTEXT_EDITING_CLEAR_RATIO),
+    }
 
 
 def context_editing_keeps(context_management: Any) -> Optional[int]:
