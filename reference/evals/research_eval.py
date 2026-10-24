@@ -49,15 +49,24 @@ Usage:
     # Two arms at equal spend (recall@cap):
     python3 evals/research_eval.py --toolset baseline   --max-tokens 1500000 ...
     python3 evals/research_eval.py --toolset structural --max-tokens 1500000 ...
+
+    # The pipeline's file-by-file mode: one planner+researcher campaign per
+    # file, each reading only its file (the rest of the tree through the
+    # structural tools), all scored together. --files bounds the cost.
+    python3 evals/research_eval.py --predecessor planner --fork \\
+        --campaigns per-file --files gt+clean:7 --concurrency 4
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -74,6 +83,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_TARGET = Path(__file__).resolve().parent / "research_target"
 GROUND_TRUTH_BASENAME = "ground_truth.json"
 
+# How a cell campaigns over its target. "whole" is one campaign over the
+# tree, the pipeline's whole-target scan; "per-file" is one campaign per
+# source file, the pipeline's file-by-file scan, in which read_file opens
+# only the scanned file and the rest of the tree is reached through the
+# structural navigation tools. Both arms of a comparison run the same mode.
+CAMPAIGN_MODES = ("whole", "per-file")
+# Which files a per-file cell visits. A medium target has a couple of
+# hundred files; the answer key names a few dozen. "gt+clean:N" visits the
+# named files plus N the key does not name, chosen deterministically from
+# the key, so recall is measured as a full sweep would measure it while
+# precision is measured over a sample of clean files (and so reads high).
+DEFAULT_CAMPAIGN_FILES = "gt+clean:7"
+
 RESEARCH_PROMPT = (
     "You are the researcher stage of a security review. Audit the application "
     "source under the directory 'app/' for real, exploitable vulnerabilities.\n"
@@ -82,6 +104,34 @@ RESEARCH_PROMPT = (
     "parameters) to dangerous operations, including flows that cross file "
     "boundaries.\n"
     "3. Report every distinct vulnerability you confirm via report_findings, "
+    "with a precise title, the file where the flaw lives (filepath), affected "
+    "line numbers, and a description naming the mechanism end to end.\n"
+    "Report only real flaws; do not pad with style issues or hypotheticals."
+)
+
+# The per-file campaign's briefings. {filepath} is substituted literally
+# (never str.format: the path is repository-derived). The planner's replaces
+# its stage instruction, which otherwise tells it to list and read the
+# whole application; the researcher's plays the part of RESEARCH_PROMPT.
+PLANNER_PROMPT_FILE = (
+    "You are the Security Planner stage in the Mantis review pipeline. This "
+    "campaign scans one file of the application under the directory 'app/': "
+    "{filepath}. read_file opens only that file. Read it and record a focused, "
+    "prioritized research plan with record_plan: which functions in the file "
+    "to inspect, for which vulnerability classes, which callers and callees in "
+    "other files the researcher must confirm through the structural tools, "
+    "and why. Do not report findings yourself."
+)
+RESEARCH_PROMPT_FILE = (
+    "You are the researcher stage of a security review. This campaign scans "
+    "one file of the application under the directory 'app/': {filepath}. "
+    "read_file opens only that file; the rest of the tree is reachable "
+    "through find_symbol, find_callers, find_callees and get_function_boundary "
+    "when they are available.\n"
+    "1. Read the file and trace data flow from untrusted inputs (HTTP request "
+    "parameters) to dangerous operations, following each flow into the "
+    "callers and callees that live in other files.\n"
+    "2. Report every distinct vulnerability you confirm via report_findings, "
     "with a precise title, the file where the flaw lives (filepath), affected "
     "line numbers, and a description naming the mechanism end to end.\n"
     "Report only real flaws; do not pad with style issues or hypotheticals."
@@ -309,6 +359,46 @@ def parse_arm_spec(spec: str) -> "tuple[str, Optional[str], bool]":
     if flag not in ("", "fork"):
         raise ValueError(f"unknown arm shape '{shape}': expected 'solo', '<stage>' or '<stage>+fork'")
     return toolset, predecessor.strip() or None, flag == "fork"
+
+
+def campaign_shape(campaigns: str, files: str) -> str:
+    """The part of a run's shape that names how it campaigned: '' for the
+    whole-target mode every earlier result was measured in (so their
+    fingerprints stand), '/per-file:<files>' otherwise."""
+    mode = str(campaigns or "whole").strip()
+    if mode not in CAMPAIGN_MODES:
+        raise ValueError(f"unknown campaign mode '{mode}': expected one of {CAMPAIGN_MODES}")
+    if mode == "whole":
+        return ""
+    return f"/{mode}:{str(files or DEFAULT_CAMPAIGN_FILES).strip()}"
+
+
+def select_campaign_files(app_dir: Path, gt_entries: Sequence[Dict[str, Any]], selector: str) -> List[str]:
+    """The files a per-file cell campaigns over, relative to ``app_dir``,
+    sorted. ``all``: every source file. ``gt``: every file the answer key
+    names (seeded and decoy alike) that exists. ``gt+clean:N``: those plus N
+    files the key does not name, drawn by a generator seeded from the named
+    list, so every arm and every repeat of a target visits the same files.
+    """
+    app_dir = Path(app_dir)
+    all_files = sorted(
+        str(p.relative_to(app_dir)).replace(os.sep, "/")
+        for p in app_dir.rglob("*.py") if p.is_file()
+    )
+    sel = str(selector or DEFAULT_CAMPAIGN_FILES).strip().lower()
+    if sel == "all":
+        return all_files
+    named = {_norm_path(f) for gt in gt_entries for f in (gt.get("files") or []) if _norm_path(f)}
+    gt_files = [f for f in all_files if any(_file_matches(f, g) for g in named)]
+    if sel == "gt":
+        return gt_files
+    m = re.fullmatch(r"gt\+clean:(\d+)", sel)
+    if not m:
+        raise ValueError(f"unknown file selector '{selector}': expected 'all', 'gt' or 'gt+clean:N'")
+    clean = [f for f in all_files if f not in set(gt_files)]
+    rng = random.Random(hashlib.sha256("\n".join(gt_files).encode("utf-8")).hexdigest())
+    picked = rng.sample(clean, min(int(m.group(1)), len(clean)))
+    return sorted(gt_files + picked)
 
 
 def extract_event_billing(event: Any) -> "tuple[int, int]":
@@ -686,8 +776,11 @@ async def eval_researcher(
     arm_label: Optional[str] = None,
     predecessor: Optional[str] = None,
     fork: bool = False,
+    campaigns: str = "whole",
+    files: str = DEFAULT_CAMPAIGN_FILES,
+    concurrency: int = 4,
 ) -> Dict[str, Any]:
-    """Runs one researcher campaign over the seeded target and scores it.
+    """Runs the researcher over the seeded target and scores it.
 
     With ``predecessor`` (a stage name, e.g. "planner"), that stage runs
     first in the same session as a two-node graph, the way the pipeline
@@ -699,12 +792,20 @@ async def eval_researcher(
     nothing else, so a paired comparison isolates the fork; the
     predecessor's own tokens are reported apart (``tokens_by_stage``).
 
+    ``campaigns`` is how the target is covered: ``whole`` is one campaign
+    over the tree; ``per-file`` is one campaign per file in
+    ``select_campaign_files(files)``, each with the file as its target (so
+    read_file opens only that file, as in the pipeline's file-by-file
+    scan), up to ``concurrency`` at a time, all reporting into one database
+    that is scored once. Caps apply to the cell as a whole.
+
     Result validity, in the result's own words:
 
     * ``graded`` / ``status``: a run that crashed is ``ungraded`` -- its
       partial findings are still scored for the human reading the JSON, but
       an aggregator must leave it out of every mean and count it as a
-      failure. A run that completed and reported nothing is a real zero.
+      failure. A run that completed and reported nothing is a real zero. In
+      per-file mode one crashed campaign ungrades the cell.
     * ``cap_hit``: the run was stopped at ``max_tokens`` / ``max_tool_calls``
       and its score is recall@cap. Still graded.
     * ``config_fingerprint`` / ``ground_truth_version``: what was measured
@@ -715,11 +816,15 @@ async def eval_researcher(
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
 
+    from core.context import current_run_context
     from core.database import init_db, read_findings
     from evals.stage_agents import build_stage_agent, install_eval_run_context
 
     if fork and not predecessor:
         raise ValueError("fork needs a predecessor stage to fork from")
+    mode_suffix = campaign_shape(campaigns, files)
+    per_file = bool(mode_suffix)
+    concurrency = max(1, int(concurrency or 1))
     target_dir = Path(target_dir or DEFAULT_TARGET)
     gt_path = target_dir / GROUND_TRUTH_BASENAME
     gt_entries = load_research_ground_truth(gt_path)
@@ -727,8 +832,8 @@ async def eval_researcher(
     model_id = model_id or os.environ.get("EVAL_MODEL", "vertex_ai/gemini-3.8-flash")
     effort = effort or os.environ.get("EVAL_REASONING_EFFORT", "low")
     tool_names = resolve_toolset(toolset)
-    prompt_text = prompt_override or RESEARCH_PROMPT
-    shape = f"{predecessor or 'solo'}{'+fork' if fork else ''}"
+    prompt_text = prompt_override or (RESEARCH_PROMPT_FILE if per_file else RESEARCH_PROMPT)
+    shape = f"{predecessor or 'solo'}{'+fork' if fork else ''}{mode_suffix}"
     fingerprint = config_fingerprint(model_id, effort, tool_names, prompt_text + "\n" + shape, gt_version)
 
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_research_")
@@ -736,7 +841,13 @@ async def eval_researcher(
     tokens_by_stage: Dict[str, int] = {}
     billed_tokens = 0.0
     cached_tokens = 0
+    tool_calls = 0
+    rearms = 0
+    cap_hit = False
+    pseudo_calls = False
     run_errors: List[str] = []
+    campaign_stats: List[Dict[str, Any]] = []
+    campaign_files: List[str] = []
     try:
         # The jail root is a subdirectory so eval.db stays outside it: the
         # jailed read_file/list_files tools must not be able to reach the
@@ -746,7 +857,7 @@ async def eval_researcher(
         app_dir = _copy_target(target_dir, jail_root)
         db_path = os.path.join(temp_dir, "eval.db")
         init_db(db_path)
-        ctx, reset_token = install_eval_run_context(
+        base_ctx, reset_token = install_eval_run_context(
             str(jail_root), db_path, target_file=str(app_dir)
         )
         if any(t in tool_names for t in STRUCTURAL_NAV_TOOLS):
@@ -754,128 +865,189 @@ async def eval_researcher(
             # failed build just degrades the arm to baseline behavior.
             from core.structural_index import build_structural_index, state_dir_for_db
             build_structural_index(str(jail_root), state_dir_for_db(db_path))
-        try:
-            session_service = InMemorySessionService()
-            if predecessor:
-                from google.adk.apps.app import App
-                from google.adk.workflow import START, Edge, Workflow
+        if per_file:
+            campaign_files = select_campaign_files(app_dir, gt_entries, files)
+            if not campaign_files:
+                raise RuntimeError(f"file selector '{files}' chose no files under {app_dir}")
+        telemetry = ToolTelemetry()
+        transcript: List[Dict[str, Any]] = []
+        session_service = InMemorySessionService()
+        started = time.time()
 
-                from core.graph_loader import _make_fork_before_model_callback
-
-                first = build_stage_agent(
-                    predecessor, model_id=model_id, reasoning_effort=effort, include_contents="none",
-                )
-                agent = build_stage_agent(
-                    "researcher",
-                    model_id=model_id,
-                    reasoning_effort=effort,
-                    tools_override=tool_names,
-                    include_contents="none",
-                    before_model_callback=(
-                        [_make_fork_before_model_callback("researcher", predecessor)] if fork else None
-                    ),
-                    # Not the first node: it sees no seed message, so the
-                    # briefing it would have been seeded with rides in its
-                    # instruction -- in both planned arms alike.
-                    instruction_suffix=prompt_text,
-                )
-                workflow = Workflow(name="eval_graph", edges=[
-                    Edge(from_node=START, to_node=first), Edge(from_node=first, to_node=agent),
-                ])
-                runner = Runner(app=App(name="eval_app", root_agent=workflow), session_service=session_service)
-                seed_text = (
-                    f"Initial Task Input: Evaluate the application under 'app/'. You are the {predecessor} "
-                    "stage; do your stage's work and record it through your tools."
-                )
-            else:
-                agent = build_stage_agent(
-                    "researcher",
-                    model_id=model_id,
-                    reasoning_effort=effort,
-                    tools_override=tool_names,
-                )
-                runner = Runner(
-                    agent=agent, session_service=session_service, app_name="eval_app"
-                )
-                seed_text = prompt_text
-            session = await session_service.create_session(
-                app_name="eval_app", user_id="eval_user"
+        def _briefing(rel: str) -> "tuple[str, Optional[str], str]":
+            """(researcher briefing, planner instruction or None, seed subject)
+            for one campaign. Literal substitution: the path is repository
+            bytes and must never be on the template side of a format."""
+            if not rel:
+                return prompt_text, None, "the application under 'app/'"
+            shown = f"app/{rel}"
+            return (
+                prompt_text.replace("{filepath}", shown),
+                PLANNER_PROMPT_FILE.replace("{filepath}", shown),
+                shown,
             )
-            content = types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=seed_text)],
+
+        async def _campaign(rel: str) -> None:
+            """One campaign: its own RunContext (target_file), session and
+            agents; everything it spends lands in the cell's totals."""
+            nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens, rearms
+            target_file = str(app_dir / rel) if rel else str(app_dir)
+            # replace() copies field values; the per-campaign dicts must be
+            # this campaign's own, as main.py gives each campaign its own.
+            ctx = dataclasses.replace(
+                base_ctx, target_file=target_file, finding_evidence={}, node_context={}, read_file_counts={},
             )
-            started = time.time()
-            tool_calls = 0
-            rearms = 0
-            pseudo_calls = False
-            cap_hit = False
-            telemetry = ToolTelemetry()
-            transcript: List[Dict[str, Any]] = []
-
-            async def _drain(message: types.Content) -> None:
-                nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens
-                agen = runner.run_async(
-                    session_id=session.id, user_id="eval_user", new_message=message
-                )
-                try:
-                    async for event in agen:
-                        ev_tokens = extract_event_tokens(event)
-                        tokens += ev_tokens
-                        author = str(getattr(event, "author", "") or "")
-                        tokens_by_stage[author] = tokens_by_stage.get(author, 0) + ev_tokens
-                        fresh, cached = extract_event_billing(event)
-                        billed_tokens += fresh + 0.1 * cached
-                        cached_tokens += cached
-                        call_count = count_event_tool_calls(event)
-                        tool_calls += call_count
-                        pseudo_calls = pseudo_calls or event_has_pseudo_tool_call(event)
-                        telemetry.observe(event, tokens)
-                        if transcript_path is not None:
-                            transcript.extend(event_transcript_rows(event))
-                        # Let the Nth function_call event execute its tool before
-                        # breaking on its function_response (unless already past N
-                        # or over the token budget).
-                        effective_calls = tool_calls - call_count if call_count and tool_calls == max_tool_calls else tool_calls
-                        if cap_exceeded(tokens, effective_calls, max_tokens, max_tool_calls):
-                            cap_hit = True
-                            break
-                finally:
-                    await agen.aclose()
-
+            token = current_run_context.set(ctx)
+            briefing, planner_instruction, subject = _briefing(rel)
+            stat: Dict[str, Any] = {"file": rel or "", "tokens": 0, "tool_calls": 0, "status": "complete"}
+            c_started = time.time()
             try:
-                await _drain(content)
-                # The abort-guard re-arm re-sends the seed. In a planned arm
-                # that would run the whole graph -- the planner again, not
-                # just the researcher -- and charge the arm for it; a planned
-                # researcher that ended without a tool call is scored as it
-                # ended, as the pipeline's would be.
-                if not cap_hit and not predecessor and should_rearm_run(
-                    len(read_findings(db_path)), tool_calls, rearms, pseudo_calls
-                ):
-                    logger.warning(
-                        "Researcher run ended on a tool-less or text-written "
-                        "tool call reply; re-arming once."
-                    )
-                    rearms += 1
-                    await _drain(
-                        types.Content(
-                            role="user",
-                            parts=[types.Part.from_text(text=ABORT_GUARD_PROMPT)],
-                        )
-                    )
-            except Exception as exc:
-                from core.config import is_auth_error
+                if predecessor:
+                    from google.adk.apps.app import App
+                    from google.adk.workflow import START, Edge, Workflow
 
-                if is_auth_error(exc):
-                    # A credential problem is an operator error, not a score.
-                    raise
-                logger.warning("Researcher run aborted: %r", exc)
-                run_errors.append(repr(exc)[:200])
+                    from core.graph_loader import _make_fork_before_model_callback
+
+                    first = build_stage_agent(
+                        predecessor, model_id=model_id, reasoning_effort=effort, include_contents="none",
+                        instruction_override=planner_instruction,
+                    )
+                    agent = build_stage_agent(
+                        "researcher",
+                        model_id=model_id,
+                        reasoning_effort=effort,
+                        tools_override=tool_names,
+                        include_contents="none",
+                        before_model_callback=(
+                            [_make_fork_before_model_callback("researcher", predecessor)] if fork else None
+                        ),
+                        # Not the first node: it sees no seed message, so the
+                        # briefing it would have been seeded with rides in its
+                        # instruction -- in both planned arms alike.
+                        instruction_suffix=briefing,
+                    )
+                    workflow = Workflow(name="eval_graph", edges=[
+                        Edge(from_node=START, to_node=first), Edge(from_node=first, to_node=agent),
+                    ])
+                    runner = Runner(app=App(name="eval_app", root_agent=workflow), session_service=session_service)
+                    seed_text = (
+                        f"Initial Task Input: Evaluate {subject}. You are the {predecessor} "
+                        "stage; do your stage's work and record it through your tools."
+                    )
+                else:
+                    agent = build_stage_agent(
+                        "researcher",
+                        model_id=model_id,
+                        reasoning_effort=effort,
+                        tools_override=tool_names,
+                    )
+                    runner = Runner(
+                        agent=agent, session_service=session_service, app_name="eval_app"
+                    )
+                    seed_text = briefing
+                session = await session_service.create_session(
+                    app_name="eval_app", user_id="eval_user"
+                )
+                content = types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=seed_text)],
+                )
+
+                async def _drain(message: types.Content) -> None:
+                    nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens
+                    agen = runner.run_async(
+                        session_id=session.id, user_id="eval_user", new_message=message
+                    )
+                    try:
+                        async for event in agen:
+                            ev_tokens = extract_event_tokens(event)
+                            tokens += ev_tokens
+                            stat["tokens"] += ev_tokens
+                            author = str(getattr(event, "author", "") or "")
+                            tokens_by_stage[author] = tokens_by_stage.get(author, 0) + ev_tokens
+                            fresh, cached = extract_event_billing(event)
+                            billed_tokens += fresh + 0.1 * cached
+                            cached_tokens += cached
+                            call_count = count_event_tool_calls(event)
+                            tool_calls += call_count
+                            stat["tool_calls"] += call_count
+                            pseudo_calls = pseudo_calls or event_has_pseudo_tool_call(event)
+                            telemetry.observe(event, tokens)
+                            if transcript_path is not None:
+                                rows = event_transcript_rows(event)
+                                if rel:
+                                    for row in rows:
+                                        row["campaign"] = rel
+                                transcript.extend(rows)
+                            # Let the Nth function_call event execute its tool before
+                            # breaking on its function_response (unless already past N
+                            # or over the token budget).
+                            effective_calls = tool_calls - call_count if call_count and tool_calls == max_tool_calls else tool_calls
+                            if cap_exceeded(tokens, effective_calls, max_tokens, max_tool_calls):
+                                cap_hit = True
+                                break
+                            if cap_hit:
+                                # Another campaign hit the cell's cap.
+                                break
+                    finally:
+                        await agen.aclose()
+
+                try:
+                    await _drain(content)
+                    # The abort-guard re-arm re-sends the seed. In a planned arm
+                    # that would run the whole graph -- the planner again, not
+                    # just the researcher -- and charge the arm for it; a planned
+                    # researcher that ended without a tool call is scored as it
+                    # ended, as the pipeline's would be.
+                    if not cap_hit and not predecessor and not per_file and should_rearm_run(
+                        len(read_findings(db_path)), tool_calls, rearms, pseudo_calls
+                    ):
+                        logger.warning(
+                            "Researcher run ended on a tool-less or text-written "
+                            "tool call reply; re-arming once."
+                        )
+                        rearms += 1
+                        await _drain(
+                            types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=ABORT_GUARD_PROMPT)],
+                            )
+                        )
+                except Exception as exc:
+                    from core.config import is_auth_error
+
+                    if is_auth_error(exc):
+                        # A credential problem is an operator error, not a score.
+                        raise
+                    logger.warning("Researcher run aborted (%s): %r", rel or "whole", exc)
+                    run_errors.append((f"{rel}: " if rel else "") + repr(exc)[:200])
+                    stat["status"] = "error"
+                if cap_hit and stat["status"] == "complete":
+                    stat["status"] = "cap"
+            finally:
+                stat["wall_seconds"] = round(time.time() - c_started, 1)
+                campaign_stats.append(stat)
+                current_run_context.reset(token)
+
+        try:
+            if per_file:
+                sem = asyncio.Semaphore(concurrency)
+
+                async def _bounded(rel: str) -> None:
+                    async with sem:
+                        if cap_hit:
+                            campaign_stats.append({"file": rel, "tokens": 0, "tool_calls": 0,
+                                                   "status": "skipped_cap", "wall_seconds": 0.0})
+                            return
+                        await _campaign(rel)
+
+                # Each task carries its own copy of the context, so the
+                # RunContext one campaign sets is invisible to the others.
+                await asyncio.gather(*(asyncio.create_task(_bounded(rel)) for rel in campaign_files))
+            else:
+                await _campaign("")
             latency = time.time() - started
         finally:
-            from core.context import current_run_context
-
             current_run_context.reset(reset_token)
 
         findings = read_findings(db_path)
@@ -901,6 +1073,10 @@ async def eval_researcher(
                 "shape": shape,
                 "predecessor": predecessor or "",
                 "fork": bool(fork),
+                "campaigns": "per-file" if per_file else "whole",
+                "campaign_files": list(campaign_files),
+                "campaigns_run": sum(1 for s in campaign_stats if s["status"] != "skipped_cap"),
+                "campaign_stats": sorted(campaign_stats, key=lambda s: s["file"]),
                 "toolset": toolset,
                 "tools_resolved": tool_names,
                 "model": model_id,
@@ -974,6 +1150,20 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
         help="With --predecessor: the researcher's requests begin with the predecessor's transcript "
              "(fork_from) instead of a fresh context. The arm to compare against --predecessor alone.",
     )
+    parser.add_argument(
+        "--campaigns", default="whole", choices=list(CAMPAIGN_MODES),
+        help="'whole': one campaign over the target. 'per-file': one campaign per selected file, "
+             "each reading only its file, the pipeline's file-by-file scan; scored together.",
+    )
+    parser.add_argument(
+        "--files", default=DEFAULT_CAMPAIGN_FILES,
+        help="With --campaigns per-file: 'all', 'gt' (the files the answer key names) or "
+             "'gt+clean:N' (those plus N others, chosen deterministically per target).",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=4,
+        help="With --campaigns per-file: campaigns in flight at once.",
+    )
     args = parser.parse_args(argv)
 
     os.environ.setdefault("VERTEXAI_LOCATION", "global")
@@ -992,6 +1182,9 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
         arm_label=args.arm_label,
         predecessor=args.predecessor,
         fork=args.fork,
+        campaigns=args.campaigns,
+        files=args.files,
+        concurrency=args.concurrency,
     )
     print(json.dumps(result, indent=2))
     if args.json_out:

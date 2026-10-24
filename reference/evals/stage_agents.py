@@ -98,7 +98,8 @@ STAGE_CONFIGS = {
 }
 
 def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None, tools_override: list = None,
-                      include_contents: str = None, before_model_callback: list = None, instruction_suffix: str = None):
+                      include_contents: str = None, before_model_callback: list = None, instruction_suffix: str = None,
+                      instruction_override: str = None):
     """Builds one pipeline stage as a standalone ADK agent for benchmarking.
 
     ``tools_override`` replaces the stage's tool list for this build only
@@ -109,6 +110,9 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     planned arms): production nodes run with include_contents="none", a
     forked stage carries the fork callback, and a stage that is not first
     gets its briefing in its instruction since it sees no seed message.
+    ``instruction_override`` replaces the stage's own instruction (the skill
+    guidance still follows it): a per-file campaign's planner must not be
+    told to list and read the whole application.
     """
     model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
@@ -120,7 +124,7 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     skill_path = Path(__file__).resolve().parent.parent.parent / cfg['skill']
     tools_list = [TOOLS[t] for t in tool_names if t in TOOLS]
     
-    instruction = cfg['instruction']
+    instruction = instruction_override if instruction_override else cfg['instruction']
     if skill_path.is_dir() and (skill_path / 'SKILL.md').exists():
         skill_obj = load_skill_from_dir(str(skill_path))
         if hasattr(skill_obj, 'instructions') and skill_obj.instructions:

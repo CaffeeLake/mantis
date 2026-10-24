@@ -48,6 +48,12 @@ Usage::
     python3 evals/sweep.py --out runs/fork-1 \\
         --arms fresh=structural@planner,fork=structural@planner+fork ...
     python3 evals/compare.py runs/fork-1 --baseline fresh --candidate fork
+
+    # The same comparison in the pipeline's file-by-file mode: one campaign
+    # per file, each reading only its file. --files bounds the cost.
+    python3 evals/sweep.py --out runs/fork-per-file-1 --campaigns per-file \\
+        --files gt+clean:7 --concurrency 4 \\
+        --arms fresh=structural@planner,fork=structural@planner+fork ...
 """
 
 from __future__ import annotations
@@ -90,16 +96,27 @@ class SweepConfig:
     max_attempts: int = 2
     confirm_holdout: bool = False
     prompt_override: Optional[str] = None
+    # How every cell campaigns over its target (research_eval.CAMPAIGN_MODES):
+    # "whole", or "per-file" over the files `files` selects, `concurrency`
+    # at a time. Part of the identity: a per-file sweep measures a different
+    # thing from a whole-target one. Concurrency is not.
+    campaigns: str = "whole"
+    files: str = ""
+    concurrency: int = 4
 
     def __post_init__(self) -> None:
         if not self.model:
             self.model = os.environ.get("EVAL_MODEL", "vertex_ai/gemini-3.8-flash")
         if not self.effort:
             self.effort = os.environ.get("EVAL_REASONING_EFFORT", "low")
+        from evals.research_eval import DEFAULT_CAMPAIGN_FILES, campaign_shape
+        self.campaigns = str(self.campaigns or "whole")
+        self.files = str(self.files or DEFAULT_CAMPAIGN_FILES)
+        campaign_shape(self.campaigns, self.files)  # refuses an unknown mode early
 
     def identity(self) -> Dict[str, Any]:
         """The fields two sweeps must share to be the same measurement."""
-        return {
+        ident = {
             "arms": dict(sorted(self.arms.items())),
             "seeds": sorted(self.seeds),
             "repeats": self.repeats,
@@ -110,6 +127,12 @@ class SweepConfig:
             "max_tool_calls": self.max_tool_calls,
             "prompt_override": self.prompt_override or "",
         }
+        # Named only when set, so sweeps recorded before the mode existed
+        # keep resuming: whole-target is what they all measured.
+        if self.campaigns != "whole":
+            ident["campaigns"] = self.campaigns
+            ident["files"] = self.files
+        return ident
 
 
 def parse_seeds(spec: str) -> List[int]:
@@ -299,14 +322,18 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
         if targets.seed_split(s) != "holdout":
             targets.assert_not_holdout(s, "sweep")
 
-    from evals.research_eval import RESEARCH_PROMPT, config_fingerprint, parse_arm_spec, resolve_toolset
+    from evals.research_eval import (
+        RESEARCH_PROMPT, RESEARCH_PROMPT_FILE, campaign_shape, config_fingerprint, parse_arm_spec, resolve_toolset,
+    )
 
     # An arm is a toolset, optionally with a shape: 'structural@planner' runs
     # the planner first, 'structural@planner+fork' forks the researcher from
-    # it (research_eval.parse_arm_spec).
+    # it (research_eval.parse_arm_spec). The campaign mode is the sweep's,
+    # the same for every arm, and part of every arm's fingerprint.
     arm_shapes = {label: parse_arm_spec(spec) for label, spec in cfg.arms.items()}
     arm_tools = {label: resolve_toolset(shape[0]) for label, shape in arm_shapes.items()}
-    prompt_text = cfg.prompt_override or RESEARCH_PROMPT
+    mode_suffix = campaign_shape(cfg.campaigns, cfg.files)
+    prompt_text = cfg.prompt_override or (RESEARCH_PROMPT_FILE if mode_suffix else RESEARCH_PROMPT)
     gt_versions: Dict[str, str] = {}
     target_dirs: Dict[int, Path] = {}
     for seed in cfg.seeds:
@@ -314,7 +341,7 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
         target_dirs[seed] = tdir
         gt_versions[str(seed)] = gtv
     fingerprints = {
-        label: config_fingerprint(cfg.model, cfg.effort, tools, prompt_text + "\n" + cfg.arms[label], "")
+        label: config_fingerprint(cfg.model, cfg.effort, tools, prompt_text + "\n" + cfg.arms[label] + mode_suffix, "")
         for label, tools in arm_tools.items()
     }
     manifest = check_or_write_manifest(
@@ -329,7 +356,8 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
     cells = cell_order(list(cfg.arms), cfg.seeds, cfg.repeats)
     todo = [c for c in cells if not is_complete(out_dir, c)]
     log(f"sweep {out_dir}: {len(cells)} cells, {len(cells) - len(todo)} complete, {len(todo)} to run"
-        f"{' [HOLDOUT CONFIRMATION]' if holdout else ''}")
+        f"{' [HOLDOUT CONFIRMATION]' if holdout else ''}"
+        f"{f' [campaigns {cfg.campaigns} over {cfg.files}, {cfg.concurrency} at a time]' if mode_suffix else ''}")
     if dry_run:
         for c in todo:
             log(f"  would run {c.key}")
@@ -342,6 +370,9 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
             started = time.time()
             try:
                 toolset, predecessor, fork = arm_shapes[c.arm]
+                kwargs: Dict[str, Any] = {}
+                if mode_suffix:
+                    kwargs = {"campaigns": cfg.campaigns, "files": cfg.files, "concurrency": cfg.concurrency}
                 result = await eval_fn(
                     cfg.model, cfg.effort,
                     target_dir=target_dirs[c.seed],
@@ -352,6 +383,7 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
                     arm_label=c.arm,
                     predecessor=predecessor,
                     fork=fork,
+                    **kwargs,
                 )
             except Exception as exc:  # the eval swallows non-auth errors itself; this is a crash in the harness
                 from core.config import is_auth_error
@@ -388,6 +420,9 @@ def _build_config(args: argparse.Namespace) -> SweepConfig:
         max_attempts=args.max_attempts,
         confirm_holdout=args.confirm_holdout,
         prompt_override=prompt,
+        campaigns=args.campaigns,
+        files=args.files or "",
+        concurrency=args.concurrency,
     )
 
 
@@ -404,6 +439,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-tool-calls", type=int, default=None)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--prompt-file", type=Path, default=None)
+    parser.add_argument("--campaigns", default="whole", choices=["whole", "per-file"],
+                        help="How every cell covers its target: one campaign over the tree, or one per "
+                             "selected file reading only that file (the pipeline's file-by-file scan).")
+    parser.add_argument("--files", default=None,
+                        help="With --campaigns per-file: 'all', 'gt' or 'gt+clean:N' (default).")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="With --campaigns per-file: campaigns in flight at once within a cell.")
     parser.add_argument("--confirm-holdout", action="store_true",
                         help="Allow holdout seeds. One-shot confirmation only; never for tuning.")
     parser.add_argument("--dry-run", action="store_true")
