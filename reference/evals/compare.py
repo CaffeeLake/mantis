@@ -184,9 +184,20 @@ def cost_summary(cells: Iterable[Dict[str, Any]], arm: str) -> Dict[str, Any]:
     decoy_hits = [int(c.get("decoys_hit") or 0) for c in g]
     tok_per_tp = [t / n for t, n in zip(tokens, tps) if n > 0]
     penalised = [t / (n - d) for t, n, d in zip(tokens, tps, decoy_hits) if n - d > 0]
+    # What a fork changes most: the same transcript is re-sent from cache
+    # (cheap to bill, free of re-reading), so the billed figure, the tool
+    # calls and the wall time are reported beside the raw token count.
+    billed = [float(c["billed_tokens"]) for c in g if c.get("billed_tokens") is not None]
+    calls = [float(c.get("tool_calls") or 0) for c in g]
+    wall = [float(c.get("latency") or 0) for c in g if c.get("latency")]
+    researcher = [float(c["researcher_tokens"]) for c in g if c.get("researcher_tokens") is not None]
     return {
         "n": len(g),
         "mean_tokens": _mean(tokens),
+        "mean_billed_tokens": _mean(billed) if billed else None,
+        "mean_researcher_tokens": _mean(researcher) if researcher else None,
+        "mean_tool_calls": _mean(calls) if calls else None,
+        "mean_latency_seconds": _mean(wall) if wall else None,
         "mean_tokens_per_tp": _mean(tok_per_tp) if tok_per_tp else None,
         "mean_tokens_per_tp_penalised": _mean(penalised) if penalised else None,
         "per_target_tokens_per_tp": {

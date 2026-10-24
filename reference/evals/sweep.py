@@ -43,6 +43,11 @@ Usage::
         --seeds 1000-1009 --repeats 3 --size medium --max-tokens 1500000 \\
         --model vertex_ai/gemini-3.8-flash --effort low
     python3 evals/compare.py runs/sweep-1 --baseline baseline --candidate structural
+
+    # Fresh vs forked researcher after a planner (an arm is toolset@shape):
+    python3 evals/sweep.py --out runs/fork-1 \\
+        --arms fresh=structural@planner,fork=structural@planner+fork ...
+    python3 evals/compare.py runs/fork-1 --baseline fresh --candidate fork
 """
 
 from __future__ import annotations
@@ -294,9 +299,13 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
         if targets.seed_split(s) != "holdout":
             targets.assert_not_holdout(s, "sweep")
 
-    from evals.research_eval import RESEARCH_PROMPT, config_fingerprint, resolve_toolset
+    from evals.research_eval import RESEARCH_PROMPT, config_fingerprint, parse_arm_spec, resolve_toolset
 
-    arm_tools = {label: resolve_toolset(toolset) for label, toolset in cfg.arms.items()}
+    # An arm is a toolset, optionally with a shape: 'structural@planner' runs
+    # the planner first, 'structural@planner+fork' forks the researcher from
+    # it (research_eval.parse_arm_spec).
+    arm_shapes = {label: parse_arm_spec(spec) for label, spec in cfg.arms.items()}
+    arm_tools = {label: resolve_toolset(shape[0]) for label, shape in arm_shapes.items()}
     prompt_text = cfg.prompt_override or RESEARCH_PROMPT
     gt_versions: Dict[str, str] = {}
     target_dirs: Dict[int, Path] = {}
@@ -305,7 +314,7 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
         target_dirs[seed] = tdir
         gt_versions[str(seed)] = gtv
     fingerprints = {
-        label: config_fingerprint(cfg.model, cfg.effort, tools, prompt_text, "")
+        label: config_fingerprint(cfg.model, cfg.effort, tools, prompt_text + "\n" + cfg.arms[label], "")
         for label, tools in arm_tools.items()
     }
     manifest = check_or_write_manifest(
@@ -332,14 +341,17 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
         for attempt in range(cfg.max_attempts):
             started = time.time()
             try:
+                toolset, predecessor, fork = arm_shapes[c.arm]
                 result = await eval_fn(
                     cfg.model, cfg.effort,
                     target_dir=target_dirs[c.seed],
-                    toolset=cfg.arms[c.arm],
+                    toolset=toolset,
                     prompt_override=cfg.prompt_override,
                     max_tokens=cfg.max_tokens,
                     max_tool_calls=cfg.max_tool_calls,
                     arm_label=c.arm,
+                    predecessor=predecessor,
+                    fork=fork,
                 )
             except Exception as exc:  # the eval swallows non-auth errors itself; this is a crash in the harness
                 from core.config import is_auth_error

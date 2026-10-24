@@ -105,6 +105,10 @@ class AgentNode(_Base):
     output_schema: Optional[str] = None   # class name in core.schemas
     output_key: Optional[str] = None      # session-state key to write it to
     include_contents: Optional[Literal["default", "none"]] = None
+    # The agent node whose transcript this node's requests begin with: a
+    # fork of that stage's conversation instead of a fresh context. See
+    # _make_fork_before_model_callback for what is inherited and why.
+    fork_from: Optional[str] = None
 
 
 class ClassifierNode(_Base):
@@ -748,12 +752,18 @@ def compute_harness_fingerprint(
     for raw in nodes or []:
         if not isinstance(raw, dict) or not raw.get("id"):
             continue
-        normalized.append({
+        entry = {
             "id": str(raw["id"]),
             "instruction": _instruction_digest(raw.get("instruction") or ""),
             "model": str(raw.get("model") or ""),
             "tools": sorted(str(t) for t in (raw.get("tools") or [])),
-        })
+        }
+        # A fork changes what the stage sees, so it is part of what the
+        # harness can find; only present when set, so graphs without one
+        # keep the fingerprint they had.
+        if raw.get("fork_from"):
+            entry["fork_from"] = str(raw["fork_from"])
+        normalized.append(entry)
     normalized.sort(key=lambda n: n["id"])
     payload = json.dumps(
         {
@@ -1483,6 +1493,111 @@ def _clear_function_response(content: Any, index: int) -> None:
         id=getattr(response, "id", None),
         response={"result": CLEARED_TOOL_RESULT_TEXT},
     ))
+
+
+FORK_NOTICE_MARKER = "[FORKED CONTEXT]"
+
+
+def forked_contents(events: Any, parent_id: str) -> list:
+    """The parent stage's transcript as request contents: every event the
+    stage authored in this campaign's session -- its text, tool calls and
+    tool results, in order -- with thinking parts and signatures left out.
+
+    Thinking is dropped because it was produced under the parent's
+    instruction and tools; a model that binds reasoning to its prefix
+    would reject it under the child's, and providers allow omitting
+    thinking from earlier turns. Tool calls keep their ids so each pairs
+    with its result. The user seed and other stages' events are not the
+    parent's and are not inherited.
+    """
+    out: list = []
+    for ev in events or []:
+        if str(getattr(ev, "author", "") or "") != str(parent_id):
+            continue
+        if getattr(ev, "partial", False) or getattr(ev, "error_code", None):
+            continue
+        content = getattr(ev, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        if not parts:
+            continue
+        kept = []
+        for part in parts:
+            if getattr(part, "thought", False):
+                continue
+            if getattr(part, "thought_signature", None):
+                part = part.model_copy(update={"thought_signature": None})
+            kept.append(part)
+        if kept:
+            out.append(types.Content(role=getattr(content, "role", None) or "model", parts=kept))
+    return out
+
+
+def _make_fork_before_model_callback(node_id: str, parent_id: str):
+    """Starts this node's requests with `parent_id`'s transcript from the
+    same campaign: a fork of that stage's conversation instead of a fresh
+    context.
+
+    What it is for: a stage that would otherwise re-derive its
+    predecessor's reading of the code -- the researcher re-opening what
+    the planner just read, the reproducer re-walking the path to the sink
+    -- continues from it instead. Not for the stages whose value is
+    independence (reviewer, critic, calibrator, the patcher's re-attack):
+    a judge forked from the stage it judges inherits that stage's
+    confidence. Whether a fork helps or harms is a measurement, per edge
+    and per model, which is why it is a node knob (`fork_from`) and not a
+    default.
+
+    Mechanics: on every model call the parent's events are read from the
+    session (ADK rebuilds a request from the session each call, so this is
+    re-applied, never persisted) and prepended to the request's contents;
+    the node's own events follow. The same parent events on every call
+    keep the prefix stable for prompt caching. A one-line notice is
+    appended to the instruction once. Runs first among the before-model
+    callbacks, so the ceiling measures and context editing trims the
+    inherited transcript like the node's own.
+    """
+    async def _before_model(callback_context: Any = None, llm_request: Any = None):
+        if llm_request is None or callback_context is None:
+            return None
+        try:
+            session = getattr(callback_context, "session", None)
+            events = getattr(session, "events", None) if session is not None else None
+            inherited = forked_contents(events, parent_id)
+        except Exception:
+            return None
+        if not inherited:
+            return None
+        own = list(getattr(llm_request, "contents", None) or [])
+        # ADK opens a node's turn with its predecessor's final reply as a
+        # user message. When that predecessor is the parent, the inherited
+        # transcript already ends with the same text: keep ADK's copy, drop
+        # the duplicate.
+        if own and inherited:
+            last, first = inherited[-1], own[0]
+            last_parts = getattr(last, "parts", None) or []
+            first_parts = getattr(first, "parts", None) or []
+            if (
+                getattr(last, "role", "") == "model" and getattr(first, "role", "") == "user"
+                and len(last_parts) == 1 and len(first_parts) == 1
+                and getattr(last_parts[0], "text", None)
+                and last_parts[0].text == getattr(first_parts[0], "text", None)
+            ):
+                inherited = inherited[:-1]
+        llm_request.contents = inherited + own
+        if hasattr(llm_request, "append_instructions"):
+            sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
+            if FORK_NOTICE_MARKER not in sys_inst:
+                llm_request.append_instructions([
+                    f"\n\n{FORK_NOTICE_MARKER} The conversation before your own turns is the '{parent_id}' "
+                    "stage's work in this campaign: its reading of the code, its tool results and its "
+                    "conclusions. Build on it. Do not repeat reads it already made unless you need a "
+                    "different range; verify what matters for your own task rather than restating its "
+                    "claims."
+                ])
+        _observe("forked_requests")
+        return None
+
+    return _before_model
 
 
 def _make_client_context_editing_before_model_callback(node_id: str, model: Any = None, config: Any = None):
@@ -2460,6 +2575,9 @@ def load_workflow_from_json(
     nodes = {}
     node_specs = {}
     declared_node_ids = set()
+    # Agent nodes by id, for `fork_from`: a fork names a stage whose
+    # transcript exists, i.e. another agent node of this graph.
+    agent_node_ids = {n.id for n in spec.nodes if isinstance(n, AgentNode)}
     # Material for the harness fingerprint (compute_harness_fingerprint):
     # every node by id, and for agent nodes the resolved tools, model and
     # final instruction. Gathered here because this loop is the only place
@@ -2576,6 +2694,13 @@ def load_workflow_from_json(
                 if schema_cls is None:
                     errors.append(f"Node {node_id}: unknown output_schema '{node_cfg.output_schema}'")
                     node_has_error = True
+            if node_cfg.fork_from is not None:
+                if node_cfg.fork_from == node_id:
+                    errors.append(f"Node {node_id}: fork_from names itself.")
+                    node_has_error = True
+                elif node_cfg.fork_from not in agent_node_ids:
+                    errors.append(f"Node {node_id}: fork_from '{node_cfg.fork_from}' is not an agent node of this graph.")
+                    node_has_error = True
                 elif node_cfg.output_schema == "ReviewVerdict" and ExtendedReviewVerdict is not None:
                     # P6: bind the extended schema so the reviewer CAN return
                     # per-finding verdicts. This must happen at bind time, not
@@ -2668,6 +2793,7 @@ def load_workflow_from_json(
                 "tools": list(node_cfg.tools),
                 "model": node_model_id,
                 "instruction": instruction,
+                "fork_from": node_cfg.fork_from or "",
             })
 
             agent_kwargs: dict[str, Any] = {
@@ -2759,6 +2885,11 @@ def load_workflow_from_json(
                     max_continuations=spec.config.max_node_continuations,
                 ),
             ]
+            if node_cfg.fork_from:
+                # First: the inherited transcript is part of the request the
+                # callbacks below measure and trim.
+                agent_kwargs["before_model_callback"].insert(
+                    0, _make_fork_before_model_callback(node_id, node_cfg.fork_from))
             if node_id == "reflector" or (
                 node_cfg.skill and "mantis-reflect" in node_cfg.skill
             ):

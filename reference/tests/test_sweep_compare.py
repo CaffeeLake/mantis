@@ -55,6 +55,14 @@ def _cell(arm, seed, repeat, recall, detected=(), total_ids=("a", "b", "c", "d")
 
 class ParsingTest(unittest.TestCase):
     def test_seed_and_arm_specs(self):
+        from evals.research_eval import parse_arm_spec
+
+        self.assertEqual(parse_arm_spec("structural"), ("structural", None, False))
+        self.assertEqual(parse_arm_spec("structural@solo"), ("structural", None, False))
+        self.assertEqual(parse_arm_spec("structural@planner"), ("structural", "planner", False))
+        self.assertEqual(parse_arm_spec("baseline@planner+fork"), ("baseline", "planner", True))
+        with self.assertRaises(ValueError):
+            parse_arm_spec("baseline@planner+merge")
         self.assertEqual(sweep.parse_seeds("1000-1002"), [1000, 1001, 1002])
         self.assertEqual(sweep.parse_seeds("1000, 1005"), [1000, 1005])
         self.assertEqual(sweep.parse_seeds("dev:3"), list(gen.DEV_SEEDS)[:3])
@@ -81,7 +89,8 @@ class SchedulerTest(unittest.TestCase):
     def test_runs_every_cell_once_skips_complete_on_resume_and_locks_identity(self):
         calls = []
 
-        async def fake_eval(model, effort, *, target_dir, toolset, prompt_override, max_tokens, max_tool_calls, arm_label):
+        async def fake_eval(model, effort, *, target_dir, toolset, prompt_override, max_tokens, max_tool_calls, arm_label,
+                            predecessor=None, fork=False):
             calls.append((arm_label, Path(target_dir).name))
             self.assertTrue((Path(target_dir) / "ground_truth.json").exists())
             return _cell(arm_label, 0, 0, 0.5, detected=("a", "b"))
@@ -109,6 +118,24 @@ class SchedulerTest(unittest.TestCase):
             # A different identity may not reuse the directory.
             with self.assertRaises(RuntimeError):
                 asyncio.run(sweep.run_sweep(self._cfg(out, effort="high"), eval_fn=fake_eval, log=lambda s: None))
+
+    def test_shaped_arms_reach_the_eval_as_predecessor_and_fork(self):
+        """'toolset@planner' and 'toolset@planner+fork' are two arms of one
+        sweep: same toolset, planner first in both, the researcher forked
+        in one. The pair is what isolates the fork."""
+        seen = []
+
+        async def fake_eval(model, effort, *, target_dir, toolset, prompt_override, max_tokens, max_tool_calls, arm_label,
+                            predecessor=None, fork=False):
+            seen.append((arm_label, toolset, predecessor, fork))
+            return _cell(arm_label, 0, 0, 0.5, detected=("a", "b"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "sw"
+            cfg = self._cfg(out, arms={"fresh": "structural@planner", "fork": "structural@planner+fork"},
+                            seeds=[1000], repeats=1)
+            asyncio.run(sweep.run_sweep(cfg, eval_fn=fake_eval, log=lambda s: None))
+        self.assertEqual(sorted(seen), [("fork", "structural", "planner", True), ("fresh", "structural", "planner", False)])
 
     def test_ungraded_cells_are_retried_then_exhausted(self):
         attempts = {}

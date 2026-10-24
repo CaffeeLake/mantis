@@ -215,6 +215,9 @@ CONTEXT_OBSERVATIONS = (
     "context_edit_requests",
     "context_edits_applied",
     "context_edit_cleared_tokens",
+    # Requests a forked stage sent with its parent's transcript in front
+    # (core.graph_loader fork_from).
+    "forked_requests",
 )
 
 #: Request-level events: how often a call had to be retried, and why, and
@@ -268,6 +271,7 @@ def render_spend_summary(snapshot: Dict[str, Any]) -> list:
             "overflow_restarts": "resumed campaign(s) started over",
             "context_edit_requests": "request(s) with context editing",
             "context_edits_applied": "context edit(s) applied",
+            "forked_requests": "request(s) on a forked transcript",
             "retries": "retried request(s)",
             "rate_limit_retries": "rate-limit retry(ies)",
             "auth_refreshes": "credential refresh(es)",

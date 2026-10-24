@@ -34,6 +34,19 @@ STAGE_OUTPUT_SCHEMAS = {
 }
 
 STAGE_CONFIGS = {
+    'planner': {
+        'skill': 'mantis-plan',
+        # The planner node's tools in workflow.json. Used as the predecessor
+        # in research_eval.py's planned arms (fresh vs forked researcher).
+        'tools': ['read_file', 'write_file', 'list_files', 'get_summary', 'get_threat_model', 'record_plan', 'get_plan'],
+        'instruction': (
+            'You are the Security Planner stage in the Mantis review pipeline. Produce a focused, '
+            'prioritized vulnerability research plan for the application under the directory '
+            "'app/': call list_files('app'), read the entry points and the modules they reach, and "
+            'record the plan with record_plan: which files and functions to inspect, for which '
+            'vulnerability classes, and why. Do not report findings yourself.'
+        ),
+    },
     'researcher': {
         'skill': 'mantis-researcher',
         # Same tool list as the researcher node in workflow.json, so the eval
@@ -84,12 +97,18 @@ STAGE_CONFIGS = {
     },
 }
 
-def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None, tools_override: list = None):
+def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: str = None, tools_override: list = None,
+                      include_contents: str = None, before_model_callback: list = None, instruction_suffix: str = None):
     """Builds one pipeline stage as a standalone ADK agent for benchmarking.
 
     ``tools_override`` replaces the stage's tool list for this build only
     (used by research_eval.py for toolset A/B runs). Names still resolve
     through tools.TOOLS, so an override cannot inject an unregistered tool.
+    ``include_contents`` / ``before_model_callback`` / ``instruction_suffix``
+    shape a stage that runs after another in one graph (research_eval.py's
+    planned arms): production nodes run with include_contents="none", a
+    forked stage carries the fork callback, and a stage that is not first
+    gets its briefing in its instruction since it sees no seed message.
     """
     model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
@@ -106,12 +125,19 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
         skill_obj = load_skill_from_dir(str(skill_path))
         if hasattr(skill_obj, 'instructions') and skill_obj.instructions:
             instruction = f"{instruction}\n\n[SKILL GUIDANCE]\n{skill_obj.instructions[:1000]}"
+    if instruction_suffix:
+        instruction = f"{instruction}\n\n{instruction_suffix}"
 
     output_schema = STAGE_OUTPUT_SCHEMAS.get(stage_name)
     from core.graph_loader import LiteralInstruction, _make_after_tool_guard_callback
 
     after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names, model=model_id)
 
+    extra = {}
+    if include_contents is not None:
+        extra['include_contents'] = include_contents
+    if before_model_callback:
+        extra['before_model_callback'] = list(before_model_callback)
     return Agent(
         name=stage_name,
         model=LiteLlm(**llm_kwargs),
@@ -119,6 +145,7 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
         tools=tools_list,
         output_schema=output_schema,
         after_tool_callback=after_tool_cb,
+        **extra,
     )
 
 

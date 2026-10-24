@@ -296,6 +296,38 @@ def extract_event_tokens(event: Any) -> int:
         return 0
 
 
+def parse_arm_spec(spec: str) -> "tuple[str, Optional[str], bool]":
+    """'structural' -> ('structural', None, False); 'structural@planner' ->
+    planned, fresh; 'structural@planner+fork' -> planned, forked. The shape
+    after '@' is what sweep.py's arms carry beyond a toolset."""
+    toolset, _, shape = str(spec or "").partition("@")
+    toolset = toolset.strip() or "baseline"
+    shape = shape.strip()
+    if not shape or shape == "solo":
+        return toolset, None, False
+    predecessor, _, flag = shape.partition("+")
+    if flag not in ("", "fork"):
+        raise ValueError(f"unknown arm shape '{shape}': expected 'solo', '<stage>' or '<stage>+fork'")
+    return toolset, predecessor.strip() or None, flag == "fork"
+
+
+def extract_event_billing(event: Any) -> "tuple[int, int]":
+    """(uncached tokens, cached input tokens) for one event, from its usage
+    metadata; (0, 0) when there is none. Never raises."""
+    try:
+        usage = getattr(event, "usage_metadata", None)
+        if usage is None:
+            return 0, 0
+        total = int(getattr(usage, "total_token_count", None) or 0)
+        if total <= 0:
+            total = int(getattr(usage, "prompt_token_count", None) or 0) + int(
+                getattr(usage, "candidates_token_count", None) or 0)
+        cached = int(getattr(usage, "cached_content_token_count", None) or 0)
+        return max(0, total - cached), cached
+    except Exception:
+        return 0, 0
+
+
 # --- Abort guard ----------------------------------------------------------------------
 
 # Shared with production execution (core.graph_loader / main.py) so both
@@ -652,8 +684,20 @@ async def eval_researcher(
     max_tokens: Optional[int] = None,
     max_tool_calls: Optional[int] = None,
     arm_label: Optional[str] = None,
+    predecessor: Optional[str] = None,
+    fork: bool = False,
 ) -> Dict[str, Any]:
     """Runs one researcher campaign over the seeded target and scores it.
+
+    With ``predecessor`` (a stage name, e.g. "planner"), that stage runs
+    first in the same session as a two-node graph, the way the pipeline
+    runs them: each node with include_contents="none", the seed reaching
+    the first only, the researcher getting its briefing in its instruction
+    and the plan through get_plan. With ``fork`` as well, the researcher's
+    requests begin with the predecessor's transcript (core.graph_loader
+    fork_from) instead of a fresh context. The two planned arms differ in
+    nothing else, so a paired comparison isolates the fork; the
+    predecessor's own tokens are reported apart (``tokens_by_stage``).
 
     Result validity, in the result's own words:
 
@@ -674,6 +718,8 @@ async def eval_researcher(
     from core.database import init_db, read_findings
     from evals.stage_agents import build_stage_agent, install_eval_run_context
 
+    if fork and not predecessor:
+        raise ValueError("fork needs a predecessor stage to fork from")
     target_dir = Path(target_dir or DEFAULT_TARGET)
     gt_path = target_dir / GROUND_TRUTH_BASENAME
     gt_entries = load_research_ground_truth(gt_path)
@@ -682,10 +728,14 @@ async def eval_researcher(
     effort = effort or os.environ.get("EVAL_REASONING_EFFORT", "low")
     tool_names = resolve_toolset(toolset)
     prompt_text = prompt_override or RESEARCH_PROMPT
-    fingerprint = config_fingerprint(model_id, effort, tool_names, prompt_text, gt_version)
+    shape = f"{predecessor or 'solo'}{'+fork' if fork else ''}"
+    fingerprint = config_fingerprint(model_id, effort, tool_names, prompt_text + "\n" + shape, gt_version)
 
     temp_dir = tempfile.mkdtemp(prefix="mantis_eval_research_")
     tokens = 0
+    tokens_by_stage: Dict[str, int] = {}
+    billed_tokens = 0.0
+    cached_tokens = 0
     run_errors: List[str] = []
     try:
         # The jail root is a subdirectory so eval.db stays outside it: the
@@ -705,22 +755,55 @@ async def eval_researcher(
             from core.structural_index import build_structural_index, state_dir_for_db
             build_structural_index(str(jail_root), state_dir_for_db(db_path))
         try:
-            agent = build_stage_agent(
-                "researcher",
-                model_id=model_id,
-                reasoning_effort=effort,
-                tools_override=tool_names,
-            )
             session_service = InMemorySessionService()
-            runner = Runner(
-                agent=agent, session_service=session_service, app_name="eval_app"
-            )
+            if predecessor:
+                from google.adk.apps.app import App
+                from google.adk.workflow import START, Edge, Workflow
+
+                from core.graph_loader import _make_fork_before_model_callback
+
+                first = build_stage_agent(
+                    predecessor, model_id=model_id, reasoning_effort=effort, include_contents="none",
+                )
+                agent = build_stage_agent(
+                    "researcher",
+                    model_id=model_id,
+                    reasoning_effort=effort,
+                    tools_override=tool_names,
+                    include_contents="none",
+                    before_model_callback=(
+                        [_make_fork_before_model_callback("researcher", predecessor)] if fork else None
+                    ),
+                    # Not the first node: it sees no seed message, so the
+                    # briefing it would have been seeded with rides in its
+                    # instruction -- in both planned arms alike.
+                    instruction_suffix=prompt_text,
+                )
+                workflow = Workflow(name="eval_graph", edges=[
+                    Edge(from_node=START, to_node=first), Edge(from_node=first, to_node=agent),
+                ])
+                runner = Runner(app=App(name="eval_app", root_agent=workflow), session_service=session_service)
+                seed_text = (
+                    f"Initial Task Input: Evaluate the application under 'app/'. You are the {predecessor} "
+                    "stage; do your stage's work and record it through your tools."
+                )
+            else:
+                agent = build_stage_agent(
+                    "researcher",
+                    model_id=model_id,
+                    reasoning_effort=effort,
+                    tools_override=tool_names,
+                )
+                runner = Runner(
+                    agent=agent, session_service=session_service, app_name="eval_app"
+                )
+                seed_text = prompt_text
             session = await session_service.create_session(
                 app_name="eval_app", user_id="eval_user"
             )
             content = types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=prompt_text)],
+                parts=[types.Part.from_text(text=seed_text)],
             )
             started = time.time()
             tool_calls = 0
@@ -731,13 +814,19 @@ async def eval_researcher(
             transcript: List[Dict[str, Any]] = []
 
             async def _drain(message: types.Content) -> None:
-                nonlocal tokens, tool_calls, pseudo_calls, cap_hit
+                nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens
                 agen = runner.run_async(
                     session_id=session.id, user_id="eval_user", new_message=message
                 )
                 try:
                     async for event in agen:
-                        tokens += extract_event_tokens(event)
+                        ev_tokens = extract_event_tokens(event)
+                        tokens += ev_tokens
+                        author = str(getattr(event, "author", "") or "")
+                        tokens_by_stage[author] = tokens_by_stage.get(author, 0) + ev_tokens
+                        fresh, cached = extract_event_billing(event)
+                        billed_tokens += fresh + 0.1 * cached
+                        cached_tokens += cached
                         call_count = count_event_tool_calls(event)
                         tool_calls += call_count
                         pseudo_calls = pseudo_calls or event_has_pseudo_tool_call(event)
@@ -756,7 +845,12 @@ async def eval_researcher(
 
             try:
                 await _drain(content)
-                if not cap_hit and should_rearm_run(
+                # The abort-guard re-arm re-sends the seed. In a planned arm
+                # that would run the whole graph -- the planner again, not
+                # just the researcher -- and charge the arm for it; a planned
+                # researcher that ended without a tool call is scored as it
+                # ended, as the pipeline's would be.
+                if not cap_hit and not predecessor and should_rearm_run(
                     len(read_findings(db_path)), tool_calls, rearms, pseudo_calls
                 ):
                     logger.warning(
@@ -803,7 +897,10 @@ async def eval_researcher(
         result["findings_full"] = findings
         result.update(
             {
-                "arm": arm_label or toolset,
+                "arm": arm_label or (f"{toolset}:{shape}" if predecessor else toolset),
+                "shape": shape,
+                "predecessor": predecessor or "",
+                "fork": bool(fork),
                 "toolset": toolset,
                 "tools_resolved": tool_names,
                 "model": model_id,
@@ -818,6 +915,13 @@ async def eval_researcher(
                 "latency": latency,
                 "run_errors": run_errors,
                 "total_tokens": tokens,
+                "tokens_by_stage": tokens_by_stage,
+                "researcher_tokens": tokens_by_stage.get("researcher", tokens if not predecessor else 0),
+                # What a provider bills: uncached input and output at full
+                # price, cached input at a tenth. A fork re-sends the parent's
+                # transcript on every call, nearly all of it from cache.
+                "billed_tokens": round(billed_tokens),
+                "cached_tokens": cached_tokens,
                 "tool_calls": tool_calls,
                 "abort_guard_rearms": rearms,
                 "tokens_per_detected": (
@@ -860,6 +964,16 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
         "--arm-label", default=None,
         help="Label this configuration carries in results (default: the toolset name).",
     )
+    parser.add_argument(
+        "--predecessor", default=None, choices=["planner"],
+        help="Run this stage first in the same session, as a two-node graph; the researcher "
+             "follows it the way the pipeline's does (include_contents=none, plan via get_plan).",
+    )
+    parser.add_argument(
+        "--fork", action="store_true",
+        help="With --predecessor: the researcher's requests begin with the predecessor's transcript "
+             "(fork_from) instead of a fresh context. The arm to compare against --predecessor alone.",
+    )
     args = parser.parse_args(argv)
 
     os.environ.setdefault("VERTEXAI_LOCATION", "global")
@@ -876,6 +990,8 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
         max_tokens=args.max_tokens,
         max_tool_calls=args.max_tool_calls,
         arm_label=args.arm_label,
+        predecessor=args.predecessor,
+        fork=args.fork,
     )
     print(json.dumps(result, indent=2))
     if args.json_out:
