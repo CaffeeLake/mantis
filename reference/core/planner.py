@@ -1557,7 +1557,10 @@ async def propose_campaigns(
             try:
                 total_t = int(getattr(usage_meta, "total_token_count", 0) or 0)
                 cached_t = int(getattr(usage_meta, "cached_content_token_count", 0) or 0)
-                budget_controller.record_tokens(total_t, cached_t)
+                budget_controller.record_tokens(
+                    total_t, cached_t,
+                    prompt_count=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+                    output_count=int(getattr(usage_meta, "candidates_token_count", 0) or 0))
             except Exception:
                 pass
 
@@ -1808,7 +1811,10 @@ async def replan_campaigns(
             try:
                 total_t = int(getattr(usage_meta, "total_token_count", 0) or 0)
                 cached_t = int(getattr(usage_meta, "cached_content_token_count", 0) or 0)
-                budget_controller.record_tokens(total_t, cached_t)
+                budget_controller.record_tokens(
+                    total_t, cached_t,
+                    prompt_count=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+                    output_count=int(getattr(usage_meta, "candidates_token_count", 0) or 0))
             except Exception:
                 pass
 

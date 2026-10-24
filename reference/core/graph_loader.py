@@ -872,6 +872,8 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
         what = f"{tool_name} output" if tool_name else "tool output"
         if isinstance(tool_response, str):
             cut = len(tool_response) > cap
+            if cut:
+                _observe("tool_result_cuts")
             text = bound_fenced_text(tool_response, cap, what) if cut else tool_response
             return (text + notice, True) if (cut or notice) else (tool_response, False)
         if isinstance(tool_response, dict):
@@ -879,6 +881,8 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
                 cut = len(tool_response["result"]) > cap
                 if not cut and not notice:
                     return tool_response, False
+                if cut:
+                    _observe("tool_result_cuts")
                 updated = dict(tool_response)
                 text = bound_fenced_text(tool_response["result"], cap, what) if cut else tool_response["result"]
                 updated["result"] = text + notice
@@ -891,6 +895,8 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
                     if isinstance(val, str) and len(val) > cap:
                         updated[key] = bound_fenced_text(val, cap, what)
                         cut = True
+                if cut:
+                    _observe("tool_result_cuts")
                 if notice:
                     updated["context_notice"] = notice.strip()
                 return (updated, True) if (cut or notice) else (tool_response, False)
@@ -1321,6 +1327,15 @@ def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) ->
     return total
 
 
+def _observe(name: str, n: int = 1) -> None:
+    """Counts a context-management event on the run's spend report."""
+    try:
+        from core.budget import observe
+        observe(name, n)
+    except Exception:
+        pass
+
+
 def _node_context_slot(node_id: str) -> Optional[dict]:
     """This campaign's budget record for `node_id`, created on first use;
     None outside a campaign. {"tokens": last estimated request size,
@@ -1532,6 +1547,7 @@ def _make_node_context_ceiling_before_model_callback(
             slot["handoff"] = handoff
             slot["tokens"] = 0
             _store_handoff(node_id, handoff, number)
+            _observe("continuations")
             print(
                 f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
                 f"against a {limit:,}-token window (ceiling {ceiling:,}); continuing in a "
@@ -1551,6 +1567,7 @@ def _make_node_context_ceiling_before_model_callback(
                 "the stage cannot be ended with a synthetic answer (output schema); failing it.",
                 file=sys.stderr,
             )
+            _observe("ceiling_failures")
             raise NodeContextExhausted(
                 f"{node_id}: context exhausted after {continuations} continuation(s).",
                 retryable=False,
@@ -1561,6 +1578,7 @@ def _make_node_context_ceiling_before_model_callback(
             "continuation(s); ending the stage with its recorded work in place.",
             file=sys.stderr,
         )
+        _observe("ceiling_ends")
         from google.adk.models import LlmResponse
         return LlmResponse(
             content=types.Content(role="model", parts=[types.Part.from_text(text=NODE_CONTEXT_CEILING_TEXT)])
@@ -2062,7 +2080,10 @@ def create_calibrator_node(
             if run_ctx and getattr(run_ctx, "budget_controller", None) and usage_meta:
                 total_t = int(getattr(usage_meta, "total_token_count", 0) or 0)
                 cached_t = int(getattr(usage_meta, "cached_content_token_count", 0) or 0)
-                run_ctx.budget_controller.record_tokens(total_t, cached_t)
+                run_ctx.budget_controller.record_tokens(
+                    total_t, cached_t,
+                    prompt_count=int(getattr(usage_meta, "prompt_token_count", 0) or 0),
+                    output_count=int(getattr(usage_meta, "candidates_token_count", 0) or 0))
 
             calib = None
             if structured_data:

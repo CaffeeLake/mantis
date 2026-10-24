@@ -528,7 +528,54 @@ def meter_response_usage(response: Any) -> None:
     cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
     # The weight of a cached token is the run budget's to decide (a CI run
     # counts every token at full price); this layer only reports the counts.
-    controller.record_tokens(total, cached_count=cached)
+    controller.record_tokens(
+        total, cached_count=cached,
+        prompt_count=int(getattr(usage, "prompt_token_count", 0) or 0),
+        output_count=int(getattr(usage, "candidates_token_count", 0) or 0))
+
+
+def _observe(name: str, n: int = 1) -> None:
+    """Counts a request-level event on the run's spend report (core.budget)."""
+    try:
+        from core.budget import observe
+        observe(name, n)
+    except Exception:
+        pass
+
+
+def context_edits_applied(response: Any) -> tuple[int, int]:
+    """(edits applied, input tokens cleared) that an Anthropic response
+    reports under `context_management.applied_edits`, which LiteLLM keeps in
+    the message's provider_specific_fields. (0, 0) when the response says
+    nothing: no editing was requested, the trigger was not reached, or the
+    provider does not report it."""
+    edits = 0
+    cleared = 0
+    try:
+        choices = getattr(response, "choices", None) or []
+        message = getattr(choices[0], "message", None) if choices else None
+        fields = getattr(message, "provider_specific_fields", None) or {}
+        if not isinstance(fields, Mapping) or not fields:
+            hidden = getattr(response, "_hidden_params", None) or {}
+            fields = hidden.get("provider_specific_fields") or {} if isinstance(hidden, Mapping) else {}
+        cm = fields.get("context_management") if isinstance(fields, Mapping) else None
+        applied = cm.get("applied_edits") if isinstance(cm, Mapping) else None
+        for edit in applied or []:
+            if not isinstance(edit, Mapping):
+                continue
+            edits += 1
+            cleared += int(edit.get("cleared_input_tokens") or 0)
+    except Exception:
+        return 0, 0
+    return edits, cleared
+
+
+def _observe_context_edits(response: Any) -> None:
+    edits, cleared = context_edits_applied(response)
+    if edits:
+        _observe("context_edits_applied", edits)
+    if cleared:
+        _observe("context_edit_cleared_tokens", cleared)
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -1269,6 +1316,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
         enforce_context_budget(model, messages, tools, context_management=kwargs.get("context_management"))
+        if kwargs.get("context_management"):
+            _observe("context_edit_requests")
 
         if stream:
             # Returned, not awaited into a response: callers receive the async
@@ -1288,16 +1337,19 @@ class ResilientLiteLLMClient(LiteLLMClient):
         auth_refreshed = False
         while True:
             try:
-                return await litellm.acompletion(
+                response = await litellm.acompletion(
                     model=model,
                     messages=messages,
                     tools=tools,
                     **kwargs,
                 )
+                _observe_context_edits(response)
+                return response
             except Exception as e:
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
                         auth_refreshed = True
+                        _observe("auth_refreshes")
                         print(f"\n[AUTH REFRESH] Token refreshed for '{model}'; retrying request...", file=sys.stderr, flush=True)
                         continue
                     raise MantisAuthError(
@@ -1323,7 +1375,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
                 attempt += 1
                 model_name = str(model)
+                _observe("retries")
                 if is_rate_limit_error(e):
+                    _observe("rate_limit_retries")
                     err_detail = extract_rate_limit_detail(e)
                     prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
                 else:
@@ -1384,6 +1438,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
                         auth_refreshed = True
+                        _observe("auth_refreshes")
                         print(f"\n[AUTH REFRESH] Token refreshed for '{model}'; retrying stream request...", file=sys.stderr, flush=True)
                         continue
                     raise MantisAuthError(
@@ -1409,7 +1464,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
                 attempt += 1
                 model_name = str(model)
+                _observe("retries")
                 if is_rate_limit_error(e):
+                    _observe("rate_limit_retries")
                     err_detail = extract_rate_limit_detail(e)
                     prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
                 else:
@@ -1510,7 +1567,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
                 attempt += 1
                 model_name = str(model)
+                _observe("retries")
                 if is_rate_limit_error(e):
+                    _observe("rate_limit_retries")
                     err_detail = extract_rate_limit_detail(e)
                     prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
                 else:
@@ -1561,6 +1620,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
                         auth_refreshed = True
+                        _observe("auth_refreshes")
                         print(f"\n[AUTH REFRESH] Token refreshed for '{model}'; retrying stream request...", file=sys.stderr, flush=True)
                         continue
                     raise MantisAuthError(
@@ -1586,7 +1646,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
                 attempt += 1
                 model_name = str(model)
+                _observe("retries")
                 if is_rate_limit_error(e):
+                    _observe("rate_limit_retries")
                     err_detail = extract_rate_limit_detail(e)
                     prefix = f"[RATE LIMIT] 429 Quota Exceeded on '{model_name}'"
                 else:

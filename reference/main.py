@@ -193,6 +193,8 @@ async def execute_sub_task(
             f"the model window ({type(exc).__name__}); starting the campaign over.",
             file=sys.stderr,
         )
+        if budget_controller is not None:
+            budget_controller.observe("overflow_restarts")
         await session_service.delete_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
         await session_service.create_session(
             app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
@@ -397,7 +399,12 @@ async def _drive_campaign(
                 if budget_controller and usage and getattr(usage, "total_token_count", None):
                     total_tokens = int(usage.total_token_count)
                     cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
-                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens)
+                    budget_controller.record_tokens(
+                        total_tokens, cached_count=cached_tokens,
+                        prompt_count=int(getattr(usage, "prompt_token_count", 0) or 0),
+                        output_count=int(getattr(usage, "candidates_token_count", 0) or 0))
+                if budget_controller and getattr(getattr(event, "actions", None), "compaction", None):
+                    budget_controller.observe("compactions")
 
                 if hasattr(event, 'content') and event.content:
                     is_partial = getattr(event, "partial", False)
@@ -3257,6 +3264,15 @@ async def pipeline(
     from core.database import is_suppressed
 
     active_findings = [f for f in findings if not is_suppressed(f.get("status"))]
+    # What the run spent and how it kept within the model window, from the
+    # same snapshot --spend-report writes. Counts only.
+    try:
+        from core.budget import render_spend_summary
+        run_controller = _SPEND_REPORT.get("controller") or budget_ctrl
+        for i, line in enumerate(render_spend_summary(run_controller.spend_snapshot())):
+            print(("\n🧮 Spend: " if i == 0 else "   ") + line)
+    except Exception as exc:
+        print(f"[SPEND SUMMARY WARNING] {exc}", file=sys.stderr)
     print(f"\n📊 Summary: {len(active_findings)} active / {len(findings)} total vulnerability finding(s) recorded.")
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""

@@ -191,6 +191,98 @@ def clamp_cache_discount(val: Any) -> float:
     return f
 
 
+#: How the run kept within the model window, counted where it happened.
+#: Every key appears in the spend report's "context" block, zero or not.
+CONTEXT_OBSERVATIONS = (
+    # A stage reached its context ceiling and went on in a fresh context from
+    # a model-written handoff (core.graph_loader).
+    "continuations",
+    # A stage reached the ceiling with no continuation left and was ended
+    # with its recorded work in place / failed because its output schema
+    # could not be satisfied synthetically.
+    "ceiling_ends",
+    "ceiling_failures",
+    # A tool result was cut to the stage's remaining headroom before it was
+    # appended.
+    "tool_result_cuts",
+    # ADK compaction events seen (off by default; nonzero means it ran).
+    "compactions",
+    # A resumed campaign whose history no longer fit was started over.
+    "overflow_restarts",
+    # Requests sent with the provider's context editing (Anthropic
+    # clear_tool_uses); edits the provider reports applying; the input
+    # tokens those edits cleared.
+    "context_edit_requests",
+    "context_edits_applied",
+    "context_edit_cleared_tokens",
+)
+
+#: Request-level events: how often a call had to be retried, and why.
+REQUEST_OBSERVATIONS = (
+    "retries",
+    "rate_limit_retries",
+    "auth_refreshes",
+)
+
+
+def observe(name: str, n: int = 1) -> None:
+    """Counts an event on the current run's controller, from anywhere in the
+    process. No controller (a test, a tool run outside a campaign): nothing.
+    Never raises."""
+    try:
+        from core.context import current_run_context
+
+        ctx = current_run_context.get()
+        controller = getattr(ctx, "budget_controller", None) if ctx is not None else None
+        if controller is not None and hasattr(controller, "observe"):
+            controller.observe(name, n)
+    except Exception:
+        pass
+
+
+def render_spend_summary(snapshot: Dict[str, Any]) -> list:
+    """The spend report as lines for the end-of-run console: tokens with the
+    cache share, calls, and whichever context/request counters are nonzero.
+    Counts only, no repository bytes."""
+    lines: list = []
+    try:
+        prompt = int(snapshot.get("prompt_tokens") or 0)
+        output = int(snapshot.get("output_tokens") or 0)
+        cached = int(snapshot.get("cached_tokens") or 0)
+        calls = int(snapshot.get("llm_calls") or 0)
+        ratio = snapshot.get("cache_hit_ratio")
+        if prompt > 0:
+            share = f" ({ratio * 100:.0f}% read from the prompt cache)" if ratio is not None else ""
+            lines.append(f"{prompt:,} input tokens{share}, {output:,} output tokens, {calls:,} LLM call(s)")
+        else:
+            total = int(snapshot.get("fresh_tokens") or 0) + cached
+            lines.append(f"{total:,} tokens ({cached:,} cached), {calls:,} LLM call(s)")
+        labels = {
+            "continuations": "stage continuation(s)",
+            "ceiling_ends": "stage(s) ended at the context ceiling",
+            "ceiling_failures": "stage(s) failed at the context ceiling",
+            "tool_result_cuts": "tool result(s) cut to fit",
+            "compactions": "compaction(s)",
+            "overflow_restarts": "resumed campaign(s) started over",
+            "context_edit_requests": "request(s) with context editing",
+            "context_edits_applied": "context edit(s) applied",
+            "retries": "retried request(s)",
+            "rate_limit_retries": "rate-limit retry(ies)",
+            "auth_refreshes": "credential refresh(es)",
+        }
+        counters = dict(snapshot.get("context") or {})
+        counters.update(snapshot.get("requests") or {})
+        parts = [f"{int(v):,} {labels[k]}" for k, v in counters.items() if k in labels and int(v or 0) > 0]
+        cleared = int(counters.get("context_edit_cleared_tokens") or 0)
+        if cleared > 0:
+            parts.append(f"{cleared:,} input tokens cleared by context editing")
+        if parts:
+            lines.append("Context: " + "; ".join(parts) + ".")
+    except Exception:
+        return lines
+    return lines
+
+
 class BudgetExceededError(Exception):
     """Raised when an execution exceeds its allocated wall-clock time, token, or step budget."""
 
@@ -247,6 +339,19 @@ class BudgetController:
         # deltas are: every consumer snapshots its own before-value at a
         # campaign boundary.
         self.audit_code_reads = 0
+        # Input and output split of the usage-bearing responses, so the spend
+        # report can say what share of the input came from the provider's
+        # prompt cache (cached_tokens / prompt_tokens). `fresh_tokens` cannot:
+        # it holds the output too.
+        self.prompt_tokens = 0
+        self.output_tokens = 0
+        # Context-management and request events, counted where they happen
+        # (continuations, ceiling stops, tool-result cuts, compactions, context
+        # edits, retries): the run's own account of how it kept within the
+        # model window, readable from the spend report instead of the
+        # sessions database. Keys are OBSERVATION_KEYS; unknown keys are kept
+        # too, under "other".
+        self.observations: Dict[str, int] = {}
         self.start_time = start_time or time.time()
         # ---- Per-CAMPAIGN runaway-loop guards ------------------------------
         # These counters answer "is THIS campaign stuck in a loop?", not "how
@@ -280,12 +385,19 @@ class BudgetController:
         by cache_discount); `fresh_tokens + cached_tokens` is the raw count a
         provider bills before any discount. A caller that must bound the bill
         wants the raw sum, or runs with cache_discount=1.0 so the two agree.
+        `cache_hit_ratio` is cached_tokens / prompt_tokens (None before any
+        input was metered); `context` and `requests` are the observation
+        counters, every key present so a reader can rely on the shape.
         """
         return {
             "run_id": self.run_id,
             "tokens": int(self.accumulated_tokens),
             "fresh_tokens": int(self.fresh_tokens),
             "cached_tokens": int(self.cached_tokens),
+            "prompt_tokens": int(self.prompt_tokens),
+            "output_tokens": int(self.output_tokens),
+            "cache_hit_ratio": (round(self.cached_tokens / self.prompt_tokens, 4)
+                                if self.prompt_tokens > 0 else None),
             "cache_discount": float(self.config.cache_discount),
             "llm_calls": int(self.llm_calls),
             "graph_steps": int(self.graph_steps),
@@ -293,7 +405,22 @@ class BudgetController:
             "max_tokens": int(self.config.max_tokens),
             "max_llm_calls": int(self.config.max_llm_calls),
             "pause_trigger": self.pause_trigger,
+            "context": {k: int(self.observations.get(k, 0)) for k in CONTEXT_OBSERVATIONS},
+            "requests": {k: int(self.observations.get(k, 0)) for k in REQUEST_OBSERVATIONS},
+            "other": {k: int(v) for k, v in sorted(self.observations.items())
+                      if k not in CONTEXT_OBSERVATIONS and k not in REQUEST_OBSERVATIONS},
         }
+
+    def observe(self, name: str, n: int = 1) -> None:
+        """Counts one kind of event `n` more times. Never raises, never
+        enforces: these are the run's notes to its operator."""
+        try:
+            key = str(name or "").strip()
+            if not key:
+                return
+            self.observations[key] = int(self.observations.get(key, 0)) + int(n)
+        except (TypeError, ValueError):
+            pass
 
     def begin_campaign(self) -> None:
         """Resets the per-campaign runaway-loop counters at a campaign boundary.
@@ -332,10 +459,13 @@ class BudgetController:
         return f"{minutes}m {secs:02d}s"
 
     def record_tokens(self, count: int, cached_count: int = 0,
-                      cache_discount: Optional[float] = None) -> None:
+                      cache_discount: Optional[float] = None,
+                      prompt_count: int = 0, output_count: int = 0) -> None:
         """Records token consumption from an LLM call or stage. Cached input
         tokens are weighted by `cache_discount` (the config's when omitted:
-        0.1 by default, a 90% discount, matching a provider's cache-hit price)."""
+        0.1 by default, a 90% discount, matching a provider's cache-hit price).
+        `prompt_count` / `output_count` split the same call's usage for the
+        spend report; they do not change what the budget is charged."""
         self.llm_calls += 1
         # Per-campaign twin of the observer above, reset by begin_campaign().
         # Enforcement of max_llm_calls stays with the ADK RunConfig, which is
@@ -343,6 +473,8 @@ class BudgetController:
         # already per-campaign scoped; this counter exists so the controller
         # can report how deep into ITS campaign allowance a campaign got.
         self.campaign_llm_calls += 1
+        self.prompt_tokens += max(0, int(prompt_count or 0))
+        self.output_tokens += max(0, int(output_count or 0))
         if count <= 0:
             return
         if cache_discount is None:
@@ -603,7 +735,8 @@ class CampaignBudgetScope(BudgetController):
         self._parent = parent
 
     def record_tokens(self, count: int, cached_count: int = 0,
-                      cache_discount: Optional[float] = None) -> None:
+                      cache_discount: Optional[float] = None,
+                      prompt_count: int = 0, output_count: int = 0) -> None:
         """Records tokens against this campaign AND the shared run ledger.
 
         Deliberately does not call parent.record_tokens(): that would also
@@ -614,6 +747,12 @@ class CampaignBudgetScope(BudgetController):
         self.llm_calls += 1
         self.campaign_llm_calls += 1
         self._parent.llm_calls += 1
+        prompt_count = max(0, int(prompt_count or 0))
+        output_count = max(0, int(output_count or 0))
+        self.prompt_tokens += prompt_count
+        self.output_tokens += output_count
+        self._parent.prompt_tokens += prompt_count
+        self._parent.output_tokens += output_count
         if cache_discount is None:
             cache_discount = self.config.cache_discount
         if count > 0:
@@ -637,6 +776,11 @@ class CampaignBudgetScope(BudgetController):
         """Counts the step in the run's cumulative ledger, then in this campaign."""
         self._parent.graph_steps += 1
         super().record_step(node_name)
+
+    def observe(self, name: str, n: int = 1) -> None:
+        """An observation is the run's: mirrored to the parent like the totals."""
+        super().observe(name, n)
+        self._parent.observe(name, n)
 
     def check_budget(self) -> None:
         """Run-level ceilings against the SHARED totals, campaign guards against OWN.
