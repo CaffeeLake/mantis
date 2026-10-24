@@ -227,10 +227,10 @@ SCENARIOS = {
     ],
     "scale_revert_presend_context_guard": [
         ("core/config.py",
-         "        # Before the retry loop, not inside it: an oversized request is deterministic, so\n        # every pass through the loop would upload the same doomed payload again.\n        enforce_context_budget(model, messages, tools)",
+         "        # Before the retry loop, not inside it: an oversized request is deterministic, so\n        # every pass through the loop would upload the same doomed payload again.\n        enforce_context_budget(model, messages, tools, context_management=kwargs.get(\"context_management\"))",
          "        pass  # NEUTERED: no pre-dispatch context check"),
         ("core/config.py",
-         "        # Both dispatch paths are guarded: a control that only covers the async path is a\n        # control that a single synchronous caller silently disables.\n        enforce_context_budget(model, messages, tools)",
+         "        # Both dispatch paths are guarded: a control that only covers the async path is a\n        # control that a single synchronous caller silently disables.\n        enforce_context_budget(model, messages, tools, context_management=kwargs.get(\"context_management\"))",
          "        pass  # NEUTERED: no pre-dispatch context check"),
     ],
     "scale_revert_overflow_nonretryable": [

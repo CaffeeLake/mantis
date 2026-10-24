@@ -731,6 +731,94 @@ def resolve_tool_response_char_cap(model: Any) -> Optional[int]:
     return max(tokens * _CHARS_PER_TOKEN, MIN_TOOL_RESPONSE_CHARS)
 
 
+# --- Anthropic context editing -----------------------------------------------
+#
+# Server-side clearing of a conversation's older tool results (Anthropic's
+# `context_management`, edit `clear_tool_uses`). The provider applies it before
+# the model reads the request, so a long stage stays inside the window while
+# the request we send remains append-only -- the one form of history
+# management that models binding their reasoning to its prefix accept. The
+# cleared results are replaced by a placeholder the model can see, and the
+# edit is reported back in the response. Measured on Vertex AI: a
+# 210,105-token request was served at 529 tokens with the two tool results
+# reported cleared. Claude models only: the parameter is Anthropic's, on any
+# route (vertex_ai/, anthropic/, bedrock/).
+#
+# The trigger sits below the node context ceiling (0.8) so the provider acts
+# first and the ceiling is the backstop; `clear_at_least` is sized so one edit
+# buys a long stretch of further work (each edit invalidates the prompt cache
+# from the edit point); `keep` leaves the newest results verbatim.
+CONTEXT_EDITING_TRIGGER_RATIO = 0.5
+CONTEXT_EDITING_KEEP_TOOL_USES = 5
+CONTEXT_EDITING_CLEAR_RATIO = 0.2
+CONTEXT_EDITING_EDIT_TYPE = "clear_tool_uses_20250919"
+_CONTEXT_EDITING_ENV = "MANTIS_CONTEXT_EDITING"
+_OFF_WORDS = frozenset({"off", "false", "0", "no", "disabled"})
+
+
+def is_claude_model(model: Any) -> bool:
+    """A Claude model on any provider route."""
+    return "claude" in str(model or "").lower()
+
+
+def anthropic_context_editing(model: Any, config: Optional[dict] = None) -> Optional[dict]:
+    """The `context_management` parameter for `model`, or None when it must not
+    be sent: not a Claude model, switched off (config `context_editing: off`
+    or MANTIS_CONTEXT_EDITING=off), or a window we cannot size against."""
+    if not is_claude_model(model):
+        return None
+    if str(os.environ.get(_CONTEXT_EDITING_ENV, "") or "").strip().lower() in _OFF_WORDS:
+        return None
+    if isinstance(config, dict) and str(config.get("context_editing", "auto") or "").strip().lower() in _OFF_WORDS:
+        return None
+    limit = resolve_context_limit(model)
+    if not limit:
+        return None
+    return {"edits": [{
+        "type": CONTEXT_EDITING_EDIT_TYPE,
+        "trigger": {"type": "input_tokens", "value": int(limit * CONTEXT_EDITING_TRIGGER_RATIO)},
+        "keep": {"type": "tool_uses", "value": CONTEXT_EDITING_KEEP_TOOL_USES},
+        "clear_at_least": {"type": "input_tokens", "value": int(limit * CONTEXT_EDITING_CLEAR_RATIO)},
+    }]}
+
+
+def context_editing_keeps(context_management: Any) -> Optional[int]:
+    """How many newest tool results a `clear_tool_uses` edit keeps verbatim, or
+    None when the parameter carries no such edit. What the client-side
+    estimates (request guard, node context ceiling) treat as still present."""
+    if not isinstance(context_management, Mapping):
+        return None
+    for edit in context_management.get("edits") or []:
+        if isinstance(edit, Mapping) and str(edit.get("type", "")).startswith("clear_tool_uses"):
+            keep = edit.get("keep") or {}
+            if isinstance(keep, Mapping) and keep.get("type") == "tool_uses":
+                try:
+                    return max(0, int(keep.get("value", 0)))
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+    return None
+
+
+_CLEARED_TOOL_RESULT = "[cleared by context editing]"
+
+
+def _messages_as_the_provider_sees_them(messages: Any, keep: int) -> Any:
+    """The chat messages with every tool result but the newest `keep` replaced
+    by the provider's placeholder -- the shape the model reads once a
+    clear_tool_uses edit has fired. Tool calls themselves are untouched."""
+    if not isinstance(messages, (list, tuple)):
+        return messages
+    tool_indexes = [i for i, m in enumerate(messages) if isinstance(m, Mapping) and m.get("role") == "tool"]
+    cleared = set(tool_indexes[:-keep] if keep else tool_indexes)
+    if not cleared:
+        return messages
+    return [
+        ({**m, "content": _CLEARED_TOOL_RESULT} if i in cleared else m)
+        for i, m in enumerate(messages)
+    ]
+
+
 def resolve_input_token_cap() -> Optional[int]:
     """An absolute per-request input ceiling from MANTIS_MAX_INPUT_TOKENS, or None.
 
@@ -751,14 +839,23 @@ def resolve_input_token_cap() -> Optional[int]:
     return value if value > 0 else None
 
 
-def enforce_context_budget(model: Any, messages: Any, tools: Any = None) -> None:
+def enforce_context_budget(model: Any, messages: Any, tools: Any = None,
+                           context_management: Any = None) -> None:
     """Refuses a request that cannot fit the model's context window, or that exceeds the
-    operator's per-request input cap, before dispatching it."""
+    operator's per-request input cap, before dispatching it.
+
+    `context_management` is the request's Anthropic context-editing parameter, when
+    any: the provider clears older tool results before the model reads the request,
+    so the estimate counts those as cleared too -- otherwise this would refuse a
+    request the provider was about to make fit."""
     limit = resolve_context_limit(model)
     cap = resolve_input_token_cap()
     if not limit and not cap:
         return
 
+    keep = context_editing_keeps(context_management)
+    if keep is not None:
+        messages = _messages_as_the_provider_sees_them(messages, keep)
     estimated = estimate_prompt_tokens(messages, tools)
     window_budget = int(limit * _CONTEXT_BUDGET_RATIO) if limit else None
     budget = min(b for b in (window_budget, cap) if b is not None)
@@ -1162,7 +1259,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
-        enforce_context_budget(model, messages, tools)
+        enforce_context_budget(model, messages, tools, context_management=kwargs.get("context_management"))
 
         if stream:
             # Returned, not awaited into a response: callers receive the async
@@ -1350,7 +1447,7 @@ class ResilientLiteLLMClient(LiteLLMClient):
 
         # Both dispatch paths are guarded: a control that only covers the async path is a
         # control that a single synchronous caller silently disables.
-        enforce_context_budget(model, messages, tools)
+        enforce_context_budget(model, messages, tools, context_management=kwargs.get("context_management"))
 
         if stream:
             # Same boundary as the async path, for the same reason the context
@@ -2267,6 +2364,13 @@ def get_llm_kwargs(
                 litellm.vertex_ai_safety_settings = safety_settings
             except Exception:
                 pass
+
+    # Anthropic context editing, Claude models only (see
+    # anthropic_context_editing): the provider clears older tool results
+    # before the model reads a request that has grown past the trigger.
+    editing = anthropic_context_editing(resolved_model, config=config)
+    if editing:
+        llm_kwargs["context_management"] = editing
 
     return resolved_model, llm_kwargs
 

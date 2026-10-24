@@ -33,6 +33,7 @@ from core.prompts import get_stage_prompt, STAGE_PROMPTS
 
 
 from core.config import get_llm_kwargs, resolve_model_id, DEFAULT_MODEL, ResilientLiteLlm, DeferredEnvLiteLlm, ExtendedReviewVerdict
+from core.config import context_editing_keeps as _context_editing_keeps
 
 LiteLlm = ResilientLiteLlm
 from core.environments import ENVIRONMENTS, get_shared_proxy_environment
@@ -1221,6 +1222,15 @@ NODE_CONTEXT_RESTART_NOTICE = (
 )
 
 
+NODE_CONTEXT_EDITING_NOTICE = (
+    "\n\n[CONTEXT EDITING] When this stage's context grows large, the provider "
+    "clears your older tool results and leaves a placeholder in their place; "
+    "the newest ones stay. Record what you rely on through tools as you go "
+    "(findings in the store, notes under workspace/) rather than counting on "
+    "re-reading an earlier tool result."
+)
+
+
 class NodeContextExhausted(RuntimeError):
     """A stage's own working context reached the model's window.
 
@@ -1230,13 +1240,18 @@ class NodeContextExhausted(RuntimeError):
     """
 
 
-def _request_chars(llm_request: Any) -> int:
+def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) -> int:
     """Characters in a request: instruction, every content part, tool schemas.
     Counts the request as built -- what the model would be sent -- so it is
-    the same number whatever the session looks like."""
+    the same number whatever the session looks like.
+
+    With `keep_tool_results`, the request is counted as the provider reads it
+    under context editing: every tool result but the newest that many as the
+    provider's placeholder (core.config.anthropic_context_editing)."""
     total = 0
     config = getattr(llm_request, "config", None)
     total += len(str(getattr(config, "system_instruction", "") or ""))
+    responses: list[int] = []
     for content in getattr(llm_request, "contents", None) or []:
         for part in getattr(content, "parts", None) or []:
             text = getattr(part, "text", None)
@@ -1247,7 +1262,12 @@ def _request_chars(llm_request: Any) -> int:
                 total += len(json.dumps(getattr(call, "args", None) or {}, default=str))
             response = getattr(part, "function_response", None)
             if response is not None:
-                total += len(json.dumps(getattr(response, "response", None) or {}, default=str))
+                responses.append(len(json.dumps(getattr(response, "response", None) or {}, default=str)))
+    if keep_tool_results is None:
+        total += sum(responses)
+    else:
+        kept = responses[-keep_tool_results:] if keep_tool_results else []
+        total += sum(kept) + 32 * (len(responses) - len(kept))
     tools = getattr(llm_request, "tools_dict", None) or {}
     total += 2000 * len(tools)
     return total
@@ -1278,7 +1298,9 @@ def node_context_headroom(node_id: str) -> Optional[tuple[int, int]]:
     return max(0, ceiling - int(slot.get("tokens") or 0)), int(limit * NODE_CONTEXT_RESERVE_RATIO)
 
 
-def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = None, has_schema: bool = False):
+def _make_node_context_ceiling_before_model_callback(
+    node_id: str, model: Any = None, has_schema: bool = False, keep_tool_results: Optional[int] = None,
+):
     """Keeps a stage's own context inside the model's window, append-only.
 
     Models that bind reasoning to its prefix (preserved thinking) reject a
@@ -1299,7 +1321,10 @@ def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = 
       synthetic text would fail its schema and the node with it.
 
     Runs last among the before-model callbacks so the instruction it
-    measures is the one sent.
+    measures is the one sent. With `keep_tool_results` (the model's requests
+    carry Anthropic context editing), the request is measured as the provider
+    reads it -- older tool results as placeholders -- and the stage is told
+    so once, in the same words on every call.
     """
     limit_cache: dict[str, Optional[int]] = {}
 
@@ -1322,11 +1347,13 @@ def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = 
             return None
         slot = _node_context_slot(node_id)
         restarts = int(slot.get("restarts") or 0) if slot else 0
-        if restarts and hasattr(llm_request, "append_instructions"):
+        if hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
-            if "[STAGE RESTARTED]" not in sys_inst:
+            if keep_tool_results is not None and "[CONTEXT EDITING]" not in sys_inst:
+                llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
+            if restarts and "[STAGE RESTARTED]" not in sys_inst:
                 llm_request.append_instructions([NODE_CONTEXT_RESTART_NOTICE])
-        estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
+        estimated = _request_chars(llm_request, keep_tool_results) // NODE_CONTEXT_CHARS_PER_TOKEN
         if slot is not None:
             slot["tokens"] = estimated
             slot["limit"] = limit
@@ -2391,7 +2418,8 @@ def load_workflow_from_json(
                 _make_campaign_directive_before_model_callback(node_id),
                 # Last: measures the request as the two above leave it.
                 _make_node_context_ceiling_before_model_callback(
-                    node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema)
+                    node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema),
+                    keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
                 ),
             ]
             if node_id == "reflector" or (
