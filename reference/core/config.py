@@ -1220,6 +1220,14 @@ try:
         if is_auth_error(exception) or isinstance(exception, MantisAuthError):
             return False
         exc_cls_name = getattr(getattr(exception, "__class__", None), "__name__", "")
+        # A stage continuing in a fresh context (core.graph_loader
+        # .NodeContextExhausted): retried for as long as the stage's own
+        # continuation budget says so, whatever the node's attempt count --
+        # the continuation IS the recovery, not a retry of a failure. The
+        # exception carries the verdict so this module need not import the
+        # graph loader.
+        if exc_cls_name == "NodeContextExhausted":
+            return retry_config is not None and bool(getattr(exception, "retryable", False))
         if exc_cls_name in _NON_RETRYABLE_EXC_NAMES:
             return False
         cause = getattr(exception, "__cause__", None) or getattr(exception, "__context__", None)

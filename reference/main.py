@@ -2866,6 +2866,17 @@ async def pipeline(
                     # Bookkeeping must never cost a scan that is finding real bugs.
                     print(f"[SPEND LEDGER WARNING] {exc}", file=sys.stderr)
 
+                # Stages that continued in a fresh context (core.graph_loader
+                # node context ceiling), by stage -- what the window cost this
+                # campaign. Silent for the common case of none.
+                continued = {
+                    node: int(slot.get("continuations") or 0)
+                    for node, slot in (getattr(branch_ctx, "node_context", None) or {}).items()
+                    if int(slot.get("continuations") or 0)
+                }
+                if continued:
+                    print(f"[CONTEXT CEILING] {scan_item}: stage continuations {continued}", file=sys.stderr)
+
                 if task_failed:
                     failures += 1
                 else:

@@ -1198,14 +1198,20 @@ NODE_CONTEXT_RESERVE_RATIO = 0.08
 # generous one lets it reach the refusal.
 NODE_CONTEXT_CHARS_PER_TOKEN = 3
 
-# How often a stage is restarted with a fresh context before it is ended.
-# A restart is ADK's own node retry: the retried attempt gets a new anchor
-# and the previous attempt's events leave the prompt -- append-only by
-# construction, which models that bind reasoning to its prefix require.
-# Stages with an output schema cannot be ended with a synthetic text (the
-# schema check would fail the node), so they keep restarting until ADK's
-# retry budget is spent.
-MAX_NODE_CONTEXT_RESTARTS = 1
+# How many times a stage may continue in a fresh context before it is ended.
+# A continuation is ADK's own node retry, admitted for NodeContextExhausted
+# alone (core.config's retry predicate) and counted here rather than by
+# RetryConfig: the retried attempt gets a new anchor and the previous
+# attempt's events leave the prompt -- append-only by construction, which
+# models that bind reasoning to its prefix require -- and it starts from the
+# handoff the previous attempt wrote. Stages with an output schema cannot be
+# ended with a synthetic text (the schema check would fail the node), so at
+# the cap they raise once more, non-retryably, and the campaign is recorded
+# failed; a schema-less stage ends with its recorded work in place.
+MAX_NODE_CONTINUATIONS = 6
+
+# Characters of a handoff carried into the next attempt's instruction.
+MAX_HANDOFF_CHARS = 12000
 
 NODE_CONTEXT_CEILING_TEXT = (
     "[CONTEXT CEILING] This stage's working context has reached the model's "
@@ -1213,14 +1219,25 @@ NODE_CONTEXT_CEILING_TEXT = (
     "and the next stage reads it from the store."
 )
 
-NODE_CONTEXT_RESTART_NOTICE = (
-    "\n\n[STAGE RESTARTED] The previous attempt of this stage used its whole "
-    "context window and was restarted with a fresh one. Everything it recorded "
-    "through tools is intact: findings in the store, notes under workspace/. "
-    "Read your workspace notes first, do not re-read what you already recorded, "
-    "and finish within this window -- record results as you go."
+# What the stage is asked for when its context is full: the note its next
+# attempt starts from. Written by the model that did the work, with the
+# whole context in front of it, as the last call of the attempt.
+NODE_CONTEXT_HANDOFF_PROMPT = (
+    "CONTEXT HANDOFF. Your working context has reached its limit. This stage "
+    "continues in a fresh context that will contain only your instructions, "
+    "your tools and the handoff you write now. Write it for yourself:\n"
+    "1. The stage objective and the target.\n"
+    "2. What you have established, each item with where it is recorded "
+    "(finding ids, workspace files, file paths and line ranges, symbols).\n"
+    "3. What you ruled out, and the evidence.\n"
+    "4. Open hypotheses and the exact next steps, in priority order.\n"
+    "5. Anything in progress (a sandbox command, a patch, a PoC) and its last "
+    "result.\n"
+    "Be specific and compact: paths, identifiers, numbers. Plain text. Do not "
+    "call tools."
 )
 
+NODE_CONTEXT_CONTINUATION_MARKER = "[CONTINUATION"
 
 NODE_CONTEXT_EDITING_NOTICE = (
     "\n\n[CONTEXT EDITING] When this stage's context grows large, the provider "
@@ -1230,14 +1247,41 @@ NODE_CONTEXT_EDITING_NOTICE = (
     "re-reading an earlier tool result."
 )
 
+HANDOFF_ARTIFACT_PREFIX = "workspace/.handoff/"
+
 
 class NodeContextExhausted(RuntimeError):
     """A stage's own working context reached the model's window.
 
-    Raised from the before-model callback so ADK's node retry restarts the
-    stage with a fresh context (see MAX_NODE_CONTEXT_RESTARTS). Retryable
-    on purpose: the retried attempt is the recovery.
+    Raised from the before-model callback. While `retryable`, ADK's node
+    retry runs the stage again with a fresh context (a continuation, see
+    MAX_NODE_CONTINUATIONS); the handoff the attempt wrote travels through
+    the campaign's budget slot and the artifact store into the next
+    attempt's instruction. Non-retryable once the continuations are spent.
     """
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _continuation_block(handoff: str, number: int) -> str:
+    """The instruction block a continued attempt carries: the same bytes on
+    every call of the attempt. The handoff is model-written text about the
+    target, so it is fenced like every other model-to-model channel."""
+    from core.llm_gateway import wrap_untrusted_content
+
+    text = (handoff or "").strip() or "(no handoff was written; read your workspace notes first)"
+    if len(text) > MAX_HANDOFF_CHARS:
+        text = text[:MAX_HANDOFF_CHARS] + "\n[handoff truncated]"
+    return (
+        f"\n\n{NODE_CONTEXT_CONTINUATION_MARKER} {number}] This is a fresh context: the "
+        f"previous attempt{'s' if number > 1 else ''} of this stage used the window. "
+        "Everything recorded through tools is intact -- findings in the store, "
+        "notes under workspace/. Start from the handoff below, do not redo what it "
+        "records as done, and record results as you go.\n"
+        + wrap_untrusted_content(text, filename="stage_handoff")
+    )
 
 
 def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) -> int:
@@ -1275,7 +1319,9 @@ def _request_chars(llm_request: Any, keep_tool_results: Optional[int] = None) ->
 
 def _node_context_slot(node_id: str) -> Optional[dict]:
     """This campaign's budget record for `node_id`, created on first use;
-    None outside a campaign."""
+    None outside a campaign. {"tokens": last estimated request size,
+    "limit": the window, "continuations": how many fresh contexts this stage
+    has had, "handoff": the note the latest continuation started from}."""
     try:
         from core.context import current_run_context
         ctx = current_run_context.get()
@@ -1283,7 +1329,9 @@ def _node_context_slot(node_id: str) -> Optional[dict]:
         return None
     if ctx is None or not hasattr(ctx, "node_context"):
         return None
-    return ctx.node_context.setdefault(node_id, {"tokens": 0, "limit": 0, "restarts": 0})
+    return ctx.node_context.setdefault(
+        node_id, {"tokens": 0, "limit": 0, "continuations": 0, "handoff": ""}
+    )
 
 
 def node_context_headroom(node_id: str) -> Optional[tuple[int, int]]:
@@ -1298,35 +1346,121 @@ def node_context_headroom(node_id: str) -> Optional[tuple[int, int]]:
     return max(0, ceiling - int(slot.get("tokens") or 0)), int(limit * NODE_CONTEXT_RESERVE_RATIO)
 
 
+def _handoff_artifact_path(node_id: str) -> str:
+    return f"{HANDOFF_ARTIFACT_PREFIX}{node_id}.md"
+
+
+def _store_handoff(node_id: str, handoff: str, number: int) -> None:
+    """Persists the handoff with this campaign's artifacts, so a --resume in a
+    new process continues from it too. Never raises: a handoff that cannot be
+    stored still travels in the campaign's slot."""
+    try:
+        from core.context import current_run_context
+        from core.database import record_artifact
+        ctx = current_run_context.get()
+        if ctx is None or not ctx.db_path or not ctx.run_id:
+            return
+        record_artifact(
+            ctx.db_path, ctx.run_id, "handoff", _handoff_artifact_path(node_id), handoff,
+            metadata={"resource": getattr(ctx, "target_file", "") or "", "continuation": number, "node": node_id},
+        )
+    except Exception as exc:
+        print(f"[CONTEXT CEILING] {node_id}: handoff not stored ({exc}).", file=sys.stderr)
+
+
+def _stored_handoff(node_id: str) -> tuple[str, int]:
+    """(handoff, continuation number) recorded for this campaign's stage by an
+    earlier process, or ("", 0)."""
+    try:
+        from core.context import current_run_context
+        from core.database import read_artifact_record
+        ctx = current_run_context.get()
+        if ctx is None or not ctx.db_path or not ctx.run_id:
+            return "", 0
+        rec = read_artifact_record(
+            ctx.db_path, _handoff_artifact_path(node_id), run_id=ctx.run_id,
+            resource=getattr(ctx, "target_file", "") or "",
+        )
+        if not rec:
+            return "", 0
+        try:
+            meta = json.loads(rec.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        number = int(meta.get("continuation") or 0) if isinstance(meta, dict) else 0
+        return str(rec.get("content") or ""), number
+    except Exception:
+        return "", 0
+
+
+async def _write_handoff(node_id: str, llm: Any, llm_request: Any) -> tuple[str, int]:
+    """Asks the stage's model for the handoff: one more request on the same
+    prefix -- instruction, tools and history exactly as sent -- plus the
+    handoff prompt as a new user turn, tools switched off for the answer.
+    Returns (handoff text, tokens used); ("", 0) when no model is available
+    or the call fails, which must never block the continuation."""
+    if llm is None:
+        return "", 0
+    try:
+        request = llm_request.model_copy(deep=True)
+        request.contents = list(request.contents or []) + [
+            types.Content(role="user", parts=[types.Part.from_text(text=NODE_CONTEXT_HANDOFF_PROMPT)])
+        ]
+        try:
+            request.config.tool_config = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="NONE")
+            )
+        except Exception:
+            pass
+        text_parts: list[str] = []
+        tokens = 0
+        async for response in llm.generate_content_async(request, stream=False):
+            content = getattr(response, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                if getattr(part, "text", None) and not getattr(part, "thought", False):
+                    text_parts.append(part.text)
+            usage = getattr(response, "usage_metadata", None)
+            if usage and getattr(usage, "total_token_count", None):
+                tokens = int(usage.total_token_count)
+        return "".join(text_parts).strip(), tokens
+    except Exception as exc:
+        print(f"[CONTEXT CEILING] {node_id}: handoff call failed ({type(exc).__name__}: {str(exc)[:160]}).",
+              file=sys.stderr)
+        return "", 0
+
+
 def _make_node_context_ceiling_before_model_callback(
     node_id: str, model: Any = None, has_schema: bool = False, keep_tool_results: Optional[int] = None,
+    llm_factory: Any = None,
 ):
     """Keeps a stage's own context inside the model's window, append-only.
 
     Models that bind reasoning to its prefix (preserved thinking) reject a
     request whose earlier messages, instruction or tools changed under a
     retained thinking block, so this never edits a request: no trimming of
-    old tool responses, no summarisation in place. Three things instead:
+    old tool responses, no summarisation in place. Instead:
 
     * every call, it records the request's estimated size in the campaign's
       budget slot, which the after-tool guard reads to size NEW tool results
       to the headroom left and to warn the model when the reserve is reached;
-    * at the ceiling, it raises NodeContextExhausted so ADK's node retry
-      restarts the stage with a fresh context (a new anchor; the old events
-      leave the prompt), up to MAX_NODE_CONTEXT_RESTARTS; the retried attempt
-      sees NODE_CONTEXT_RESTART_NOTICE on every one of its calls, so its
-      instruction is the same byte string throughout the attempt;
-    * past the restarts, a schema-less stage ends with a final response (no
-      model call); a stage with an output schema raises again, since a
-      synthetic text would fail its schema and the node with it.
+    * at the ceiling it asks the model for a handoff (one more request on the
+      unchanged prefix), stores it, and raises NodeContextExhausted so ADK's
+      node retry runs the stage again in a fresh context -- a continuation.
+      The continued attempt carries the handoff in its instruction, the same
+      bytes on every one of its calls, so its prefix is stable too;
+    * after MAX_NODE_CONTINUATIONS, a schema-less stage ends with a final
+      response (no model call); a stage with an output schema raises once
+      more, non-retryably, since a synthetic text would fail its schema.
 
-    Runs last among the before-model callbacks so the instruction it
-    measures is the one sent. With `keep_tool_results` (the model's requests
-    carry Anthropic context editing), the request is measured as the provider
-    reads it -- older tool results as placeholders -- and the stage is told
-    so once, in the same words on every call.
+    `llm_factory` returns the model client used for the handoff call; None
+    means no handoff is written (the continuation still happens, from the
+    workspace notes). With `keep_tool_results` (the model's requests carry
+    Anthropic context editing), the request is measured as the provider
+    reads it. Runs last among the before-model callbacks so the instruction
+    it measures is the one sent.
     """
     limit_cache: dict[str, Optional[int]] = {}
+    llm_cache: dict[str, Any] = {}
 
     def _limit() -> Optional[int]:
         if "limit" not in limit_cache:
@@ -1339,20 +1473,34 @@ def _make_node_context_ceiling_before_model_callback(
                 limit_cache["limit"] = None
         return limit_cache["limit"]
 
-    def _before_model(callback_context: Any = None, llm_request: Any = None):
+    def _llm() -> Any:
+        if "llm" not in llm_cache:
+            try:
+                llm_cache["llm"] = llm_factory() if llm_factory else None
+            except Exception:
+                llm_cache["llm"] = None
+        return llm_cache["llm"]
+
+    async def _before_model(callback_context: Any = None, llm_request: Any = None):
         if llm_request is None:
             return None
         limit = _limit()
         if not limit:
             return None
         slot = _node_context_slot(node_id)
-        restarts = int(slot.get("restarts") or 0) if slot else 0
+        if slot is not None and not slot.get("continuations") and not slot.get("handoff"):
+            # A new process picking up this campaign: continue from the
+            # handoff an earlier process stored, if any.
+            stored, number = _stored_handoff(node_id)
+            if stored:
+                slot["handoff"], slot["continuations"] = stored, max(1, number)
+        continuations = int(slot.get("continuations") or 0) if slot else 0
         if hasattr(llm_request, "append_instructions"):
             sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
             if keep_tool_results is not None and "[CONTEXT EDITING]" not in sys_inst:
                 llm_request.append_instructions([NODE_CONTEXT_EDITING_NOTICE])
-            if restarts and "[STAGE RESTARTED]" not in sys_inst:
-                llm_request.append_instructions([NODE_CONTEXT_RESTART_NOTICE])
+            if continuations and NODE_CONTEXT_CONTINUATION_MARKER not in sys_inst:
+                llm_request.append_instructions([_continuation_block(slot.get("handoff", ""), continuations)])
         estimated = _request_chars(llm_request, keep_tool_results) // NODE_CONTEXT_CHARS_PER_TOKEN
         if slot is not None:
             slot["tokens"] = estimated
@@ -1360,23 +1508,49 @@ def _make_node_context_ceiling_before_model_callback(
         ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
         if estimated < ceiling:
             return None
-        if slot is not None and (restarts < MAX_NODE_CONTEXT_RESTARTS or has_schema):
-            slot["restarts"] = restarts + 1
+        may_continue = slot is not None and continuations < MAX_NODE_CONTINUATIONS
+        if may_continue:
+            handoff, used = await _write_handoff(node_id, _llm(), llm_request)
+            if used:
+                try:
+                    from core.context import current_run_context
+                    bc = getattr(current_run_context.get(), "budget_controller", None)
+                    if bc is not None:
+                        bc.record_tokens(used)
+                except Exception:
+                    pass
+            number = continuations + 1
+            slot["continuations"] = number
+            slot["handoff"] = handoff
             slot["tokens"] = 0
+            _store_handoff(node_id, handoff, number)
             print(
                 f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
-                f"against a {limit:,}-token window (ceiling {ceiling:,}); restarting the "
-                f"stage with a fresh context (restart {restarts + 1}).",
+                f"against a {limit:,}-token window (ceiling {ceiling:,}); continuing in a "
+                f"fresh context (continuation {number}/{MAX_NODE_CONTINUATIONS}, handoff "
+                f"{len(handoff):,} chars).",
                 file=sys.stderr,
             )
             raise NodeContextExhausted(
                 f"{node_id}: ~{estimated:,} tokens of working context against a "
-                f"{limit:,}-token window; the stage restarts with a fresh context."
+                f"{limit:,}-token window; the stage continues in a fresh context.",
+                retryable=True,
+            )
+        if has_schema or slot is None:
+            print(
+                f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
+                f"against a {limit:,}-token window after {continuations} continuation(s); "
+                "the stage cannot be ended with a synthetic answer (output schema); failing it.",
+                file=sys.stderr,
+            )
+            raise NodeContextExhausted(
+                f"{node_id}: context exhausted after {continuations} continuation(s).",
+                retryable=False,
             )
         print(
             f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
-            f"against a {limit:,}-token window (ceiling {ceiling:,}) after {restarts} "
-            "restart(s); ending the stage with its recorded work in place.",
+            f"against a {limit:,}-token window (ceiling {ceiling:,}) after {continuations} "
+            "continuation(s); ending the stage with its recorded work in place.",
             file=sys.stderr,
         )
         from google.adk.models import LlmResponse
@@ -2420,6 +2594,11 @@ def load_workflow_from_json(
                 _make_node_context_ceiling_before_model_callback(
                     node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema),
                     keep_tool_results=_context_editing_keeps(llm_kwargs.get("context_management")),
+                    # The handoff is written by the stage's own model, built
+                    # from the same kwargs; None under the hermetic path.
+                    llm_factory=(
+                        (lambda kw=dict(llm_kwargs): ResilientLiteLlm(**kw)) if llm_kwargs else None
+                    ),
                 ),
             ]
             if node_id == "reflector" or (

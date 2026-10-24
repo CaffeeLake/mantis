@@ -21,6 +21,7 @@ it, so neither refuses or ends a stage the provider was about to serve."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import unittest
@@ -171,17 +172,17 @@ class EstimatesFollowTheProviderTest(unittest.TestCase):
         cb = gl._make_node_context_ceiling_before_model_callback("researcher", model="m", keep_tool_results=5)
         with patch("core.config.resolve_context_limit", return_value=1_000_000), \
              patch("core.config.resolve_input_token_cap", return_value=None):
-            self.assertIsNone(cb(callback_context=None, llm_request=req))
+            self.assertIsNone(asyncio.run(cb(callback_context=None, llm_request=req)))
             first = req.config.system_instruction
             self.assertIn("[CONTEXT EDITING]", first)
-            self.assertIsNone(cb(callback_context=None, llm_request=req))
+            self.assertIsNone(asyncio.run(cb(callback_context=None, llm_request=req)))
             self.assertEqual(req.config.system_instruction, first)
         plain = gl._make_node_context_ceiling_before_model_callback("researcher", model="m")
         req2 = LlmRequest()
         req2.config.system_instruction = "be careful"
         with patch("core.config.resolve_context_limit", return_value=1_000_000), \
              patch("core.config.resolve_input_token_cap", return_value=None):
-            plain(callback_context=None, llm_request=req2)
+            asyncio.run(plain(callback_context=None, llm_request=req2))
         self.assertNotIn("[CONTEXT EDITING]", req2.config.system_instruction, "no editing, no notice")
 
 
