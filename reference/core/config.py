@@ -453,10 +453,18 @@ class MantisEmptyResponseError(RuntimeError):
     back through the same backoff loop as a 429. The difference from a 429
     is that each attempt was a billed prompt, so the response's usage is
     metered against the run budget before this is raised: the token ceiling
-    bounds the worst case, as it bounds everything else. Past the patience
-    window -- or past ``MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS`` empty turns on
-    the one request, whichever comes first -- the empty response is passed
-    on unchanged, and the pipeline sees exactly what it saw before.
+    bounds the worst case, as it bounds everything else. From the second
+    empty turn the request carries a nudge (EMPTY_TURN_NUDGE) instead of
+    being re-sent byte for byte. Past the patience window -- or past
+    ``MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS`` empty turns on the one request,
+    whichever comes first -- the stage ends: a verdict stage with its
+    fail-closed verdict (see _sanitize_structured_response), any other with
+    EMPTY_TURN_FINAL_TEXT as its final answer. Not an error event: the
+    model's work up to that turn (findings saved, notes written) stands,
+    the campaign completes, and --resume does not re-run it to draw the
+    same silence again. Measured: a model that ended its turn silently
+    after report_findings had its campaign marked failed and re-run on
+    every resume, with the review packet already written.
     """
 
     def __init__(self, message: str, response: Any = None):
@@ -471,6 +479,57 @@ class MantisEmptyResponseError(RuntimeError):
 # findings and an hour of patience each would otherwise stall a run for a
 # day on a prompt the model will never fill.
 DEFAULT_EMPTY_TURN_MAX_ATTEMPTS = 6
+
+#: Appended to the request (a new user message; the prefix is untouched)
+#: from the second empty turn on: a model that has finished and omitted the
+#: closing text answers this; one that is stuck does not, and the cap ends
+#: the stage.
+EMPTY_TURN_NUDGE = (
+    "Your previous turn was empty. If this stage's work is complete, say so in one "
+    "sentence (or give your verdict in the required form); otherwise continue with the "
+    "next tool call."
+)
+
+#: The final answer of a schema-less stage whose model kept answering with
+#: nothing: harness-authored, says what happened, claims nothing else.
+EMPTY_TURN_FINAL_TEXT = (
+    "The model ended this turn without content after repeated attempts; the stage ends "
+    "here with its recorded work in place."
+)
+
+
+def empty_turn_final_response() -> Any:
+    """The response a schema-less stage ends on at the empty-turn cap. Zero
+    usage, not none: no model billed this text, and the event loop's
+    estimate is for responses that carry no usage at all."""
+    from google.adk.models import LlmResponse
+    from google.genai import types
+
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part.from_text(text=EMPTY_TURN_FINAL_TEXT)]),
+        finish_reason=types.FinishReason.STOP,
+        usage_metadata=types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=0, candidates_token_count=0, total_token_count=0),
+    )
+
+
+def append_empty_turn_nudge(llm_request: Any) -> bool:
+    """Adds EMPTY_TURN_NUDGE to the request as a new user message, once.
+    Append-only, so a prefix-bound model accepts it. False if it could not."""
+    try:
+        from google.genai import types
+
+        contents = getattr(llm_request, "contents", None)
+        if contents is None:
+            return False
+        for content in contents:
+            for part in getattr(content, "parts", None) or []:
+                if getattr(part, "text", None) == EMPTY_TURN_NUDGE:
+                    return False
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=EMPTY_TURN_NUDGE)]))
+        return True
+    except Exception:
+        return False
 
 
 def structured_llm_request(prompt: str, system_instruction: str, schema_cls: Any) -> Any:
@@ -2174,23 +2233,32 @@ class ResilientLiteLlm(LiteLlm):
                 if isinstance(e, MantisEmptyResponseError):
                     empty_turns += 1
                 if isinstance(e, MantisEmptyResponseError) and (elapsed >= max_patience or empty_turns >= max_empty_turns):
-                    # Out of patience, or out of empty turns: hand the empty
-                    # turn on as it was, so ADK reports
-                    # MODEL_RETURNED_NO_CONTENT and the campaign fails the
-                    # way it did before this retry existed. --resume picks
-                    # that up; an exception here would turn one known failure
-                    # mode into another.
+                    # Out of patience, or out of empty turns: the stage ends
+                    # here. A verdict stage gets its fail-closed verdict from
+                    # the sanitizer, as before; any other gets a final answer
+                    # that says what happened, so ADK sees a completed turn
+                    # and not MODEL_RETURNED_NO_CONTENT -- the work the stage
+                    # recorded stands, the campaign completes, and --resume
+                    # has nothing to re-run (see MantisEmptyResponseError).
                     model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
                     reason = (f"{empty_turns} empty turn(s) in a row on this request (cap {max_empty_turns})"
                               if empty_turns >= max_empty_turns else f"{elapsed:.0f}s of retries")
                     print(
                         f"\n[LLM RETRY] '{model_name}' still returned no content after "
-                        f"{reason}; passing the empty turn on.",
+                        f"{reason}; ending the stage's turn with its recorded work in place.",
                         file=sys.stderr,
                         flush=True,
                     )
-                    yield self._sanitize_structured_response(e.response, schema_cls)
+                    _observe("empty_turn_ends")
+                    if schema_cls is not None:
+                        yield self._sanitize_structured_response(e.response, schema_cls)
+                    else:
+                        yield empty_turn_final_response()
                     return
+                if isinstance(e, MantisEmptyResponseError) and empty_turns >= 2:
+                    # The same bytes drew nothing twice; ask, once, whether
+                    # the stage is done. Appended, never edited.
+                    append_empty_turn_nudge(llm_request)
                 if not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
 

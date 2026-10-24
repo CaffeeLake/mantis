@@ -46,6 +46,7 @@ from google.adk.models.llm_response import LlmResponse  # noqa: E402
 from google.genai import types  # noqa: E402
 
 from core.budget import BudgetConfig, BudgetController, BudgetExceededError  # noqa: E402
+from core import config as C  # noqa: E402
 from core.config import (  # noqa: E402
     MantisEmptyResponseError,
     ResilientLiteLlm,
@@ -153,30 +154,53 @@ class EmptyTurnRetryTest(unittest.TestCase):
         self.assertEqual(controller.llm_calls, 2)
         self.assertEqual(err.count("[LLM RETRY]"), 2)
         self.assertIn("returned no content", err)
-        self.assertNotIn("passing the empty turn on", err)
+        self.assertNotIn("ending the stage's turn", err)
+        # The first retry re-sends the request as it was; from the second
+        # empty turn it carries the nudge, appended, once.
+        nudges = [p.text for c in self.request.contents for p in (c.parts or []) if p.text == C.EMPTY_TURN_NUDGE]
+        self.assertEqual(len(nudges), 1)
+        self.assertEqual(self.request.contents[0].parts[0].text, "look at this", "the prefix is untouched")
 
-    def test_out_of_patience_passes_the_empty_turn_on(self):
+    def test_out_of_patience_ends_the_stage_with_a_note(self):
+        """Measured: a model that ended its turn silently after saving its
+        findings had its campaign marked failed and re-run on every resume.
+        The stage now ends on a harness note instead of an empty turn, so
+        ADK sees a completed turn and the campaign completes."""
         self.with_budget()
         with mock.patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "0"}):
             upstream = ScriptedUpstream([[empty()], [good()]])
             out, err = self.run_turn(upstream)
         self.assertEqual(len(upstream.seen), 1, "no patience, no retry")
         self.assertEqual(len(out), 1)
-        self.assertTrue(is_empty_stop_response(out[0]), "ADK gets the empty turn and flags it as before")
-        self.assertIn("passing the empty turn on", err)
+        self.assertFalse(is_empty_stop_response(out[0]), "ADK gets a completed turn, not MODEL_RETURNED_NO_CONTENT")
+        self.assertEqual(out[0].content.parts[0].text, C.EMPTY_TURN_FINAL_TEXT)
+        self.assertIsNone(getattr(out[0], "error_code", None))
+        self.assertIn("ending the stage's turn with its recorded work in place", err)
 
-    def test_a_request_the_model_keeps_answering_with_nothing_is_passed_on_before_patience_runs_out(self):
+    def test_a_verdict_stage_ends_on_its_fail_closed_verdict(self):
+        from core.schemas import ReproVerdict
+
+        self.with_budget()
+        self.request.append_tools([__import__("google.adk.tools.set_model_response_tool", fromlist=["SetModelResponseTool"]).SetModelResponseTool(ReproVerdict)])
+        with mock.patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "0"}):
+            upstream = ScriptedUpstream([[empty()], [good()]])
+            out, _err = self.run_turn(upstream)
+        text = out[0].content.parts[0].text
+        self.assertIn('"route": "failed_repro"', text, "the sanitizer's fail-closed verdict, as before")
+
+    def test_a_request_the_model_keeps_answering_with_nothing_ends_before_patience_runs_out(self):
         # Patience is an hour; the cap on empty turns per request is what ends this.
         controller = self.with_budget()
         with mock.patch.dict(os.environ, {"MANTIS_LLM_MAX_PATIENCE_SECONDS": "3600",
                                           "MANTIS_LLM_EMPTY_TURN_MAX_ATTEMPTS": "3"}):
             upstream = ScriptedUpstream([[empty(1000)], [empty(1000)], [empty(1000)], [good()]])
             out, err = self.run_turn(upstream)
-        self.assertEqual(len(upstream.seen), 3, "three empty turns, then the third is handed on")
-        self.assertTrue(is_empty_stop_response(out[0]))
-        self.assertIn("3 empty turn(s) in a row on this request (cap 3); passing the empty turn on", err)
+        self.assertEqual(len(upstream.seen), 3, "three empty turns, then the stage ends")
+        self.assertEqual(out[0].content.parts[0].text, C.EMPTY_TURN_FINAL_TEXT)
+        self.assertIn("3 empty turn(s) in a row on this request (cap 3); ending the stage's turn", err)
         self.assertEqual(controller.accumulated_tokens, 3000, "every empty turn was billed, so every one is charged")
         self.assertEqual(err.count("[LLM RETRY] Transient error"), 2, "two backoffs, not three")
+        self.assertEqual(controller.spend_snapshot()["requests"]["empty_turn_ends"], 1)
 
     def test_the_default_cap_is_small_enough_to_matter(self):
         from core.config import DEFAULT_EMPTY_TURN_MAX_ATTEMPTS
@@ -289,20 +313,25 @@ class EndToEndTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_past_patience_the_campaign_fails_as_before_and_every_turn_is_charged(self):
+    def test_past_patience_the_campaign_completes_and_every_turn_is_charged(self):
+        """A model that answers every prompt with nothing: the stages end on
+        the harness note, the campaign completes (no MODEL_RETURNED_NO_CONTENT,
+        no failed row for --resume to re-run), and nothing is credited as
+        examined, since no code was read."""
         code, out = self.run_main(2)
         self.assertIn("[MantisEmptyResponseError: The model returned no content", out)
-        self.assertIn("passing the empty turn on", out)
-        self.assertIn("[EVENT ERROR MODEL_RETURNED_NO_CONTENT]", out, "ADK still sees and names the empty turn")
+        self.assertIn("ending the stage's turn with its recorded work in place", out)
+        self.assertNotIn("[EVENT ERROR MODEL_RETURNED_NO_CONTENT]", out, "a completed turn, not an error event")
         self.assertNotIn("BUDGET PAUSE", out)
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 0, out[-2000:])
         rows = self.ledger()
         self.assertEqual(len(rows), 1, out[-2000:])
         tokens, calls, meta = rows[0]
-        self.assertEqual(json.loads(meta), {"failed": True}, "the terminal state --resume picks up")
+        self.assertEqual(json.loads(meta).get("failed"), False, "not a failure: nothing for --resume to re-run")
         self.assertGreater(self.server.requests, 6, "retried, not just passed on")
         self.assertEqual((tokens, calls), (1000 * self.server.requests, self.server.requests),
                          "every request the server saw is on the ledger: swallowed turns charged, none twice")
+        self.assertIn("stage(s) ended on empty model turns", out)
 
     def test_the_token_budget_pauses_the_run_before_patience_does(self):
         wf = json.loads(Path(_REF_ROOT, "workflow.json").read_text())

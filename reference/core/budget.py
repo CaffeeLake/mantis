@@ -217,11 +217,13 @@ CONTEXT_OBSERVATIONS = (
     "context_edit_cleared_tokens",
 )
 
-#: Request-level events: how often a call had to be retried, and why.
+#: Request-level events: how often a call had to be retried, and why, and
+#: how often a stage ended on a model that kept answering with nothing.
 REQUEST_OBSERVATIONS = (
     "retries",
     "rate_limit_retries",
     "auth_refreshes",
+    "empty_turn_ends",
 )
 
 
@@ -269,6 +271,7 @@ def render_spend_summary(snapshot: Dict[str, Any]) -> list:
             "retries": "retried request(s)",
             "rate_limit_retries": "rate-limit retry(ies)",
             "auth_refreshes": "credential refresh(es)",
+            "empty_turn_ends": "stage(s) ended on empty model turns",
         }
         counters = dict(snapshot.get("context") or {})
         counters.update(snapshot.get("requests") or {})

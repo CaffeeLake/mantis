@@ -419,7 +419,11 @@ async def _drive_campaign(
                                 cprint(part.text, end="", flush=True)
                             if not is_partial:
                                 streamed_partial_text = False
-                                if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
+                                # No usage object at all: estimate. A response
+                                # that carries usage -- including the zero
+                                # usage of a harness-authored final answer,
+                                # which no model billed -- is charged from it.
+                                if budget_controller and usage is None:
                                     budget_controller.record_tokens(len(part.text) // 4)
                             if current_active_node == "reporter" and db_path and run_id:
                                 try:
