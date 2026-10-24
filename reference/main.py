@@ -1283,32 +1283,6 @@ def _campaign_finding_counts(db_path: str, run_id: str, filepath: str) -> dict:
     return counts
 
 
-#: Output that means a re-run PoC never got as far as attacking: the harness
-#: cannot say whether the bug is fixed from such a run. An AssertionError or
-#: an application error is NOT in this list: those are the exploit failing.
-_POC_SETUP_FAILURE_MARKERS = (
-    "ModuleNotFoundError",
-    "ImportError",
-    "SyntaxError",
-    "No such file or directory",
-    "command not found",
-    "SANDBOX-UNAVAILABLE",
-    "SANDBOX-ERROR",
-    # A Go or shell PoC that never got as far as the target: the scaffold it
-    # was built with is not in this guest, or the toolchain is not.
-    "no Go files in",
-    "cannot find package",
-    "cannot find module",
-    "no required module provides package",
-    "directory not found",
-    "is not in std",
-    "go: cannot find main module",
-    "executable file not found",
-    "build failed",
-    "setup failed",
-)
-
-
 def _finding_files(finding: dict) -> set:
     """The target-relative files a finding sits in or cites."""
     files = set()
@@ -1364,7 +1338,7 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
     """
     from core.database import read_artifact, record_regression_check
     from core.poc_scaffold import restore_poc_companions
-    from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence
+    from tools.sandbox_tools import MANTIS_SENTINEL_TOKEN, check_reached_sink_evidence, poc_ran
 
     sandbox = getattr(ctx, "sandbox", None)
     if sandbox is None or type(sandbox).__name__ in ("StaticOnlyEnvironment", "StaticOnlySandbox"):
@@ -1421,12 +1395,8 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
             # build with nothing to build: no. An AssertionError, a 500
             # from the app, a non-zero exit after the request went out:
             # yes -- that is the exploit failing, which is what a fix looks
-            # like from the PoC's side.
-            ran = (
-                exit_code not in (126, 127)
-                and not bool(getattr(res, "timed_out", False))
-                and not any(m in output for m in _POC_SETUP_FAILURE_MARKERS)
-            )
+            # like from the PoC's side. (tools.sandbox_tools.poc_ran.)
+            ran = poc_ran(output, exit_code, timed_out=bool(getattr(res, "timed_out", False)))
             touched = bool(_finding_files(p) & changed)
             if present:
                 outcome, why = "still_present", f"prior PoC re-run reached the sink: {reason}"
@@ -1449,7 +1419,8 @@ async def _rerun_prior_pocs(ctx, db_path: str, run_id: str, prior: list[dict],
         "\nThe harness already re-ran the earlier PoCs, unchanged, against the current code:\n  "
         + "\n  ".join(results)
         + "\nA 'still_present' result is the finding to report again; a 'fixed' result needs no "
-        "re-report; an 'inconclusive' one is for the stages to decide from the code.\n"
+        "re-report; an 'inconclusive' one is for the stages: the reproducer rebuilds its PoC against the "
+        "current code and runs it under the prior id.\n"
     )
 
 
@@ -1510,6 +1481,12 @@ def _regression_brief(db_path: str, run_id: str, focus_files: list[str], root: s
         "settle, calls get_prior_poc(<id>) and runs the PoC UNCHANGED with run_sandbox_with_evidence("
         "finding_id=<id>, ...): evidence present means still present; absent, when the PoC ran, means fixed; a "
         "PoC that no longer runs means 'inconclusive'. Then records the check.\n"
+        "- undecided after that (the stored PoC would not run, or no stage could say from the code): the "
+        "reproducer writes a NEW PoC for the prior finding from its description and the stored PoC's intent, "
+        "against the code as it is now, and runs it with run_sandbox_with_evidence(finding_id=<the PRIOR id>, "
+        "sentinel_path='sentinel_<prior id>', ...): evidence present means still present; absent, when the "
+        "new PoC reached the entry point and ran, means fixed -- record the check either way. A finding that "
+        "reads as fixed is exactly the one that needs this test; do not leave it to the reader.\n"
         "A finding nobody decides about is reported as unverified, not as fixed.\n" + listing
     )
     return prior, text

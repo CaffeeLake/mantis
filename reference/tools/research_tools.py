@@ -1429,6 +1429,10 @@ def record_regression_check(prior_finding_id: int, outcome: str, reason: str, ne
         if verdict == "fixed" and own.get("reproduced"):
             return (f"Error: the PoC for finding {pid} reached its sink in this run (evidence_present=True); "
                     "that is 'still_present', not 'fixed'.")
+        if verdict == "fixed" and own.get("ran") is False:
+            return (f"Error: the PoC for finding {pid} did not run in this run (setup failure: missing module "
+                    "or file, build error, no interpreter, timeout); its absent evidence says nothing about a "
+                    "fix. Repair the PoC and run it again, or record 'inconclusive'.")
         if verdict == "still_present" and not own.get("reproduced") and linked is None:
             return (f"Error: the PoC for finding {pid} did not reach its sink in this run. Record "
                     "'still_present' with the new_finding_id that re-reports it, or 'inconclusive' "

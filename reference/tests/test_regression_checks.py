@@ -170,6 +170,67 @@ class ToolTest(_Base):
         out = rt.record_regression_check(pid, "inconclusive", "PoC import failed")
         self.assertIn("dynamic evidence", out)
 
+    async def test_a_poc_that_never_ran_cannot_call_the_finding_fixed(self):
+        """A rebuilt PoC that fails to build or import reports absent
+        evidence; that is not a fix. The ledger carries whether the PoC
+        ran (tools.sandbox_tools.poc_ran) and the tool refuses 'fixed'
+        on a run that did not."""
+        import tools.research_tools as rt
+        from tools.sandbox_tools import poc_ran
+
+        self.assertFalse(poc_ran("go: no Go files in /workspace/workspace/repro_x\n", 1))
+        self.assertFalse(poc_ran("ModuleNotFoundError: No module named 'requests'", 1))
+        self.assertFalse(poc_ran("", 127))
+        self.assertFalse(poc_ran("", 0, timed_out=True))
+        self.assertTrue(poc_ran("Traceback (most recent call last):\nAssertionError\n", 1), "the exploit failing")
+        self.assertTrue(poc_ran("400 rejected\n", 0))
+
+        old = self.seed_old()
+        pid = old["traversal in b"]["id"]
+        ctx = self.ctx("reproducer")
+        ctx.finding_evidence[str(pid)] = {"reproduced": False, "reason": "EVIDENCE_ABSENT", "ran": False}
+        out = rt.record_regression_check(pid, "fixed", "no sentinel")
+        self.assertIn("did not run", out)
+        self.assertIn("Error", out)
+        self.assertIn("dynamic evidence", rt.record_regression_check(pid, "inconclusive", "build failed"))
+        ctx.finding_evidence[str(pid)] = {"reproduced": False, "reason": "EVIDENCE_ABSENT", "ran": True}
+        self.assertIn("SUCCESS", rt.record_regression_check(pid, "fixed", "request went out, sink not reached"))
+
+    async def test_the_evidence_tool_records_whether_the_poc_ran(self):
+        from tools.sandbox_tools import run_sandbox_with_evidence
+
+        class _SB:
+            is_initialized = True
+
+            def __init__(self, stdout, code):
+                self.stdout, self.code = stdout, code
+
+            async def execute(self, command, *, timeout=None):
+                from google.adk.environment import ExecutionResult
+                return ExecutionResult(stdout=self.stdout, stderr="", exit_code=self.code, timed_out=False)
+
+            async def read_file(self, p):
+                raise FileNotFoundError(str(p))
+
+            async def write_file(self, p, content):
+                pass
+
+        ctx = self.ctx("reproducer", sandbox=_SB("go: cannot find main module\n", 1))
+        await run_sandbox_with_evidence("go run ./workspace/repro_7", finding_id=7)
+        self.assertEqual(ctx.finding_evidence["7"]["ran"], False)
+        ctx.sandbox = _SB("AssertionError: expected 500\n", 1)
+        await run_sandbox_with_evidence("python3 workspace/repro_8.py", finding_id=8)
+        self.assertEqual(ctx.finding_evidence["8"]["ran"], True)
+
+    async def test_the_brief_asks_for_a_rebuilt_poc_when_nothing_else_decides(self):
+        import main
+
+        self.seed_old()
+        _prior, text = main._regression_brief(self.db, NEW, [os.path.join(self.target, "b.py")], self.target, self.target)
+        self.assertIn("writes a NEW PoC for the prior finding", text)
+        self.assertIn("finding_id=<the PRIOR id>", text)
+        self.assertIn("reads as fixed is exactly the one that needs this test", text)
+
     async def test_get_prior_poc_places_the_earlier_poc_in_this_workspace(self):
         import tools.research_tools as rt
 

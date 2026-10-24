@@ -235,6 +235,7 @@ def _record_finding_evidence(
     evidence_present: bool,
     reason: str,
     sink_symbol: str = "",
+    ran: Optional[bool] = None,
 ) -> None:
     """Attributes one evidence verdict to one finding on ctx.finding_evidence.
 
@@ -249,6 +250,10 @@ def _record_finding_evidence(
     patcher the LAST re-attack counts: a patch that is re-attacked, fixed
     again and re-attacked again is judged by the final run. A verdict with
     no finding id is left unattributed; it still moves `sandbox_executed`.
+
+    `ran` is whether the PoC got as far as attacking (see poc_ran): absent
+    evidence from a PoC that never ran is not evidence of a fix, and the
+    regression-check tool refuses to call it one.
     """
     if ctx is None or finding_id is None:
         return
@@ -267,8 +272,50 @@ def _record_finding_evidence(
         if sink_symbol:
             entry["sink_symbol"] = str(sink_symbol)
         entry["reason"] = str(reason or "")
+        if ran is not None:
+            entry["ran"] = bool(ran)
     except Exception:
         pass  # bookkeeping; never fails a run (and never sets anything on error)
+
+
+#: Output that means a PoC never got as far as attacking: a missing module
+#: or file, a shell that cannot find the interpreter, a syntax error, a Go
+#: or shell build that found no scaffold or no toolchain. An AssertionError
+#: or an application error is NOT in this list: those are the exploit
+#: failing, which is what a fix looks like from the PoC's side.
+POC_SETUP_FAILURE_MARKERS = (
+    "ModuleNotFoundError",
+    "ImportError",
+    "SyntaxError",
+    "No such file or directory",
+    "command not found",
+    "SANDBOX-UNAVAILABLE",
+    "SANDBOX-ERROR",
+    "no Go files in",
+    "cannot find package",
+    "cannot find module",
+    "no required module provides package",
+    "directory not found",
+    "is not in std",
+    "go: cannot find main module",
+    "executable file not found",
+    "build failed",
+    "setup failed",
+)
+
+
+def poc_ran(output: str, exit_code: int, timed_out: bool = False) -> bool:
+    """Whether a PoC run got as far as attacking: not a missing interpreter
+    (126/127), not a timeout, none of the setup-failure markers in its
+    output. Absent evidence means a fix only when this is True."""
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        code = 1
+    if code in (126, 127) or timed_out:
+        return False
+    text = str(output or "")
+    return not any(m in text for m in POC_SETUP_FAILURE_MARKERS)
 
 
 async def run_sandbox(command: str) -> str:
@@ -471,9 +518,12 @@ async def run_sandbox_with_evidence(
             sentinel_content=sentinel_content,
         )
     # Which finding this verdict was about -- present or absent, both are
-    # recorded: an absent re-attack is what verifies a patch.
+    # recorded: an absent re-attack is what verifies a patch. Whether the
+    # PoC ran at all travels with it: absent evidence from a PoC that never
+    # attacked is not a fix.
     _record_finding_evidence(current_run_context.get(), finding_id, evidence_present, reason,
-                             sink_symbol=sink_symbol)
+                             sink_symbol=sink_symbol,
+                             ran=True if evidence_present else poc_ran(output, exit_code))
     scaffold: List[str] = []
     if evidence_present and finding_id is not None:
         scaffold = await _keep_poc_scaffold(current_run_context.get(), int(finding_id))
