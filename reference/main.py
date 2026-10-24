@@ -2692,6 +2692,7 @@ async def pipeline(
                 # object shared by every campaign; the evidence ledger is per
                 # campaign, like sandbox_executed.
                 finding_evidence={},
+                node_context={},
                 # What this campaign is about, when narrower than its target.
                 # Reaches every node through its instructions: the seed
                 # message below is seen by the first node only.

@@ -845,18 +845,38 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
         cap = _cap()
         if not cap:
             return tool_response, False
+        # The headroom the stage has left decides the cap for THIS result:
+        # never more than the static per-response cap, never less than the
+        # floor, and within the reserve only what still fits. Cutting a
+        # result before it is appended edits nothing already sent, so the
+        # prefix under any retained reasoning stays intact.
+        room = node_context_headroom(node_id)
+        notice = ""
+        if room is not None:
+            headroom, reserve = room
+            from core.config import MIN_TOOL_RESPONSE_CHARS
+            fits = max(0, headroom - reserve) * NODE_CONTEXT_CHARS_PER_TOKEN
+            cap = max(MIN_TOOL_RESPONSE_CHARS, min(cap, fits))
+            if headroom <= reserve:
+                notice = (
+                    f"\n\n[CONTEXT NOTICE] About {headroom:,} tokens of this stage's working "
+                    "context remain. Record your results through tools and give your final "
+                    "answer now; further tool output will be cut to fit."
+                )
         from core.truncation import bound_fenced_text
         what = f"{tool_name} output" if tool_name else "tool output"
         if isinstance(tool_response, str):
-            if len(tool_response) <= cap:
-                return tool_response, False
-            return bound_fenced_text(tool_response, cap, what), True
+            cut = len(tool_response) > cap
+            text = bound_fenced_text(tool_response, cap, what) if cut else tool_response
+            return (text + notice, True) if (cut or notice) else (tool_response, False)
         if isinstance(tool_response, dict):
             if isinstance(tool_response.get("result"), str):
-                if len(tool_response["result"]) <= cap:
+                cut = len(tool_response["result"]) > cap
+                if not cut and not notice:
                     return tool_response, False
                 updated = dict(tool_response)
-                updated["result"] = bound_fenced_text(tool_response["result"], cap, what)
+                text = bound_fenced_text(tool_response["result"], cap, what) if cut else tool_response["result"]
+                updated["result"] = text + notice
                 return updated, True
             if isinstance(tool_response.get("output"), str) or isinstance(tool_response.get("raw"), str):
                 updated = dict(tool_response)
@@ -866,7 +886,13 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
                     if isinstance(val, str) and len(val) > cap:
                         updated[key] = bound_fenced_text(val, cap, what)
                         cut = True
-                return (updated, True) if cut else (tool_response, False)
+                if notice:
+                    updated["context_notice"] = notice.strip()
+                return (updated, True) if (cut or notice) else (tool_response, False)
+            if notice:
+                updated = dict(tool_response)
+                updated["context_notice"] = notice.strip()
+                return updated, True
         return tool_response, False
 
     def _after_tool(
@@ -877,7 +903,7 @@ def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()
     ) -> Any:
         tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
         tool_response, changed = _bounded(str(tool_name or ""), tool_response)
-        if changed:
+        if changed and "[CONTEXT NOTICE]" not in str(tool_response):
             print(
                 f"[{node_id}] {tool_name} response exceeded the per-response cap for this "
                 f"model ({_cap():,} chars); cut with a marker.",
@@ -1151,12 +1177,18 @@ def _make_stage_experience_before_model_callback(node_id: str):
 
 
 # Share of the model's input window a node's own context may reach before
-# the stage is ended. Below the pre-dispatch refusal (core.config, 0.9) so
-# the stage ends in order -- its findings, notes and evidence already
-# recorded -- instead of the campaign aborting on a request that cannot
-# fit. Above the tool-response cap (0.25 per response) so ordinary stages
-# never see it.
+# the stage is restarted or ended. Below the pre-dispatch refusal
+# (core.config, 0.9) so the stage ends in order -- its findings, notes and
+# evidence already recorded -- instead of the campaign aborting on a
+# request that cannot fit. Above the tool-response cap (0.25 per response)
+# so ordinary stages never see it.
 NODE_CONTEXT_CEILING_RATIO = 0.8
+
+# Share of the window kept in hand below the ceiling. Once a stage's
+# headroom is inside this reserve, every tool result it receives carries a
+# notice to record its work and finish, and each new result is cut to what
+# still fits.
+NODE_CONTEXT_RESERVE_RATIO = 0.08
 
 # Characters per token for the ceiling estimate. Denser than the fail-open
 # constant the request guard uses (4): the payloads that fill a context are
@@ -1165,11 +1197,37 @@ NODE_CONTEXT_CEILING_RATIO = 0.8
 # generous one lets it reach the refusal.
 NODE_CONTEXT_CHARS_PER_TOKEN = 3
 
+# How often a stage is restarted with a fresh context before it is ended.
+# A restart is ADK's own node retry: the retried attempt gets a new anchor
+# and the previous attempt's events leave the prompt -- append-only by
+# construction, which models that bind reasoning to its prefix require.
+# Stages with an output schema cannot be ended with a synthetic text (the
+# schema check would fail the node), so they keep restarting until ADK's
+# retry budget is spent.
+MAX_NODE_CONTEXT_RESTARTS = 1
+
 NODE_CONTEXT_CEILING_TEXT = (
     "[CONTEXT CEILING] This stage's working context has reached the model's "
     "window. The stage ends here; everything it recorded through tools stands, "
     "and the next stage reads it from the store."
 )
+
+NODE_CONTEXT_RESTART_NOTICE = (
+    "\n\n[STAGE RESTARTED] The previous attempt of this stage used its whole "
+    "context window and was restarted with a fresh one. Everything it recorded "
+    "through tools is intact: findings in the store, notes under workspace/. "
+    "Read your workspace notes first, do not re-read what you already recorded, "
+    "and finish within this window -- record results as you go."
+)
+
+
+class NodeContextExhausted(RuntimeError):
+    """A stage's own working context reached the model's window.
+
+    Raised from the before-model callback so ADK's node retry restarts the
+    stage with a fresh context (see MAX_NODE_CONTEXT_RESTARTS). Retryable
+    on purpose: the retried attempt is the recovery.
+    """
 
 
 def _request_chars(llm_request: Any) -> int:
@@ -1195,17 +1253,53 @@ def _request_chars(llm_request: Any) -> int:
     return total
 
 
-def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = None):
-    """Ends a stage whose own context has reached the model's window.
+def _node_context_slot(node_id: str) -> Optional[dict]:
+    """This campaign's budget record for `node_id`, created on first use;
+    None outside a campaign."""
+    try:
+        from core.context import current_run_context
+        ctx = current_run_context.get()
+    except Exception:
+        return None
+    if ctx is None or not hasattr(ctx, "node_context"):
+        return None
+    return ctx.node_context.setdefault(node_id, {"tokens": 0, "limit": 0, "restarts": 0})
 
-    Append-only by construction. Models that bind reasoning to its prefix
-    (preserved thinking) reject a request whose earlier messages, instruction
-    or tools changed under a retained thinking block, so the one thing this
-    must never do is edit the request: no trimming of old tool responses, no
-    summarisation in place. It returns a final response instead -- no model
-    call is made, nothing already sent is altered -- and the node ends the
-    way a node ends when the model stops calling tools. Runs last among the
-    before-model callbacks so the instruction it measures is the one sent.
+
+def node_context_headroom(node_id: str) -> Optional[tuple[int, int]]:
+    """(tokens left below the ceiling, reserve in tokens) for the stage in the
+    current campaign, or None when no request has been measured yet or the
+    window is unknown. The after-tool guard sizes new tool results with it."""
+    slot = _node_context_slot(node_id)
+    if not slot or not slot.get("limit"):
+        return None
+    limit = int(slot["limit"])
+    ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
+    return max(0, ceiling - int(slot.get("tokens") or 0)), int(limit * NODE_CONTEXT_RESERVE_RATIO)
+
+
+def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = None, has_schema: bool = False):
+    """Keeps a stage's own context inside the model's window, append-only.
+
+    Models that bind reasoning to its prefix (preserved thinking) reject a
+    request whose earlier messages, instruction or tools changed under a
+    retained thinking block, so this never edits a request: no trimming of
+    old tool responses, no summarisation in place. Three things instead:
+
+    * every call, it records the request's estimated size in the campaign's
+      budget slot, which the after-tool guard reads to size NEW tool results
+      to the headroom left and to warn the model when the reserve is reached;
+    * at the ceiling, it raises NodeContextExhausted so ADK's node retry
+      restarts the stage with a fresh context (a new anchor; the old events
+      leave the prompt), up to MAX_NODE_CONTEXT_RESTARTS; the retried attempt
+      sees NODE_CONTEXT_RESTART_NOTICE on every one of its calls, so its
+      instruction is the same byte string throughout the attempt;
+    * past the restarts, a schema-less stage ends with a final response (no
+      model call); a stage with an output schema raises again, since a
+      synthetic text would fail its schema and the node with it.
+
+    Runs last among the before-model callbacks so the instruction it
+    measures is the one sent.
     """
     limit_cache: dict[str, Optional[int]] = {}
 
@@ -1221,28 +1315,47 @@ def _make_node_context_ceiling_before_model_callback(node_id: str, model: Any = 
         return limit_cache["limit"]
 
     def _before_model(callback_context: Any = None, llm_request: Any = None):
-        try:
-            if llm_request is None:
-                return None
-            limit = _limit()
-            if not limit:
-                return None
-            estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
-            ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
-            if estimated < ceiling:
-                return None
+        if llm_request is None:
+            return None
+        limit = _limit()
+        if not limit:
+            return None
+        slot = _node_context_slot(node_id)
+        restarts = int(slot.get("restarts") or 0) if slot else 0
+        if restarts and hasattr(llm_request, "append_instructions"):
+            sys_inst = str(getattr(getattr(llm_request, "config", None), "system_instruction", "") or "")
+            if "[STAGE RESTARTED]" not in sys_inst:
+                llm_request.append_instructions([NODE_CONTEXT_RESTART_NOTICE])
+        estimated = _request_chars(llm_request) // NODE_CONTEXT_CHARS_PER_TOKEN
+        if slot is not None:
+            slot["tokens"] = estimated
+            slot["limit"] = limit
+        ceiling = int(limit * NODE_CONTEXT_CEILING_RATIO)
+        if estimated < ceiling:
+            return None
+        if slot is not None and (restarts < MAX_NODE_CONTEXT_RESTARTS or has_schema):
+            slot["restarts"] = restarts + 1
+            slot["tokens"] = 0
             print(
                 f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
-                f"against a {limit:,}-token window (ceiling {ceiling:,}); ending the stage "
-                "with its recorded work in place.",
+                f"against a {limit:,}-token window (ceiling {ceiling:,}); restarting the "
+                f"stage with a fresh context (restart {restarts + 1}).",
                 file=sys.stderr,
             )
-            from google.adk.models import LlmResponse
-            return LlmResponse(
-                content=types.Content(role="model", parts=[types.Part.from_text(text=NODE_CONTEXT_CEILING_TEXT)])
+            raise NodeContextExhausted(
+                f"{node_id}: ~{estimated:,} tokens of working context against a "
+                f"{limit:,}-token window; the stage restarts with a fresh context."
             )
-        except Exception:
-            return None
+        print(
+            f"\n[CONTEXT CEILING] {node_id}: ~{estimated:,} tokens of working context "
+            f"against a {limit:,}-token window (ceiling {ceiling:,}) after {restarts} "
+            "restart(s); ending the stage with its recorded work in place.",
+            file=sys.stderr,
+        )
+        from google.adk.models import LlmResponse
+        return LlmResponse(
+            content=types.Content(role="model", parts=[types.Part.from_text(text=NODE_CONTEXT_CEILING_TEXT)])
+        )
 
     return _before_model
 
@@ -2277,7 +2390,9 @@ def load_workflow_from_json(
                 _make_stage_experience_before_model_callback(node_id),
                 _make_campaign_directive_before_model_callback(node_id),
                 # Last: measures the request as the two above leave it.
-                _make_node_context_ceiling_before_model_callback(node_id, model=node_model_id),
+                _make_node_context_ceiling_before_model_callback(
+                    node_id, model=node_model_id, has_schema=bool(node_cfg.output_schema)
+                ),
             ]
             if node_id == "reflector" or (
                 node_cfg.skill and "mantis-reflect" in node_cfg.skill

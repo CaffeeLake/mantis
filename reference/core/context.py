@@ -63,6 +63,14 @@ class RunContext:
     # stamp, which upgrades only the findings named here. Empty means no
     # evidence was attributed to any finding.
     finding_evidence: dict[str, dict] = field(default_factory=dict)
+    # Each stage's working-context budget, keyed by node id: {"tokens": the
+    # last request's estimated size, "limit": the model's window, "restarts":
+    # how often the stage was restarted with a fresh context}. Written by the
+    # node context ceiling before every model call; read by the after-tool
+    # guard, which sizes each NEW tool result to the headroom left. Per
+    # campaign, like the evidence ledger: with --parallel the same callbacks
+    # serve every campaign in flight.
+    node_context: dict[str, dict] = field(default_factory=dict)
     # Operator-side text every agent node of this campaign must see: what
     # the campaign is about when that is narrower than its target (a
     # change-scoped run). Nodes run with include_contents="none", so only
