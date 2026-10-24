@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1621,6 +1622,11 @@ class ResilientLiteLLMClient(LiteLLMClient):
             chunks_yielded += 1
 
 
+#: Findings listed in a stage's snapshot before the list is cut.
+FINDINGS_SNAPSHOT_MAX_LINES = 150
+FINDINGS_SNAPSHOT_HEADER = "[STATE STORE: RECORDED FINDINGS (DO NOT RE-REPORT)]"
+
+
 class ResilientLiteLlm(LiteLlm):
     """LiteLlm wrapper with resilient full jitter retry (min 5s offset, 1h patience) on quota and rate limits."""
 
@@ -1732,94 +1738,86 @@ class ResilientLiteLlm(LiteLlm):
             )
             reminder_entries.append((reporting_header, reporting_directive))
 
-        contents = getattr(llm_request, "contents", None)
-        if not contents:
+        # Into the instruction, never into the messages. Both reminders are
+        # the same text on every call of a stage, so they belong to the
+        # stable head of the prompt. Appending them to the LAST message
+        # instead -- as this once did -- changed that message between one
+        # request and the next (the session keeps the original), which broke
+        # the provider's prompt cache at the first tool result of every call
+        # (measured: 18% of input served from cache over a run; the system
+        # prompt was the only prefix that still matched) and, for models that
+        # bind reasoning to its prefix, rewrites the prefix under every later
+        # thinking block.
+        for header, text in reminder_entries:
+            ResilientLiteLlm._append_instruction_once(llm_request, header, text)
+
+    @staticmethod
+    def _append_instruction_once(llm_request: Any, header: str, text: str) -> None:
+        """Appends `text` to the request's system instruction unless `header`
+        is already in it. The instruction is rebuilt per request from the
+        agent's, so this runs on every call and lands the same bytes each
+        time -- the property the prompt cache and prefix binding need."""
+        config = getattr(llm_request, "config", None)
+        current = str(getattr(config, "system_instruction", "") or "") if config is not None else ""
+        if header in current:
             return
-
-        last_content = contents[-1]
-        parts = getattr(last_content, "parts", None)
-        if not parts:
-            return
-
-        fr_parts = [p for p in parts if getattr(p, "function_response", None) is not None]
-        if fr_parts:
-            target_fr_part = fr_parts[-1]
-            old_fr = target_fr_part.function_response
-            resp = getattr(old_fr, "response", None)
-            needed = [txt for hdr, txt in reminder_entries if not (resp and hdr in str(resp))]
-            if not needed:
-                return
-            full_reminder = "".join(needed)
-
-            if isinstance(resp, dict):
-                new_resp = dict(resp)
-                if "output" in new_resp and isinstance(new_resp["output"], str):
-                    new_resp["output"] = f"{new_resp['output']}{full_reminder}"
-                elif "result" in new_resp and isinstance(new_resp["result"], str):
-                    new_resp["result"] = f"{new_resp['result']}{full_reminder}"
-                else:
-                    new_resp["_stage_turn_reminder"] = full_reminder.strip()
-            elif isinstance(resp, str):
-                new_resp = f"{resp}{full_reminder}"
-            else:
-                new_resp = {"output": full_reminder.strip()}
-
-            from google.genai import types
-            idx = parts.index(target_fr_part)
-            parts[idx] = types.Part(
-                function_response=types.FunctionResponse(
-                    name=getattr(old_fr, "name", "tool"),
-                    response=new_resp,
-                    id=getattr(old_fr, "id", None),
-                )
-            )
-        elif getattr(last_content, "role", None) == "user":
-            text_parts = [p for p in parts if getattr(p, "text", None)]
-            if text_parts:
-                target_p = text_parts[-1]
-                needed = [txt for hdr, txt in reminder_entries if hdr not in str(target_p.text)]
-                if not needed:
-                    return
-                full_reminder = "".join(needed)
-                idx = parts.index(target_p)
-                from google.genai import types
-                parts[idx] = types.Part.from_text(text=f"{target_p.text}{full_reminder}")
+        append = getattr(llm_request, "append_instructions", None)
+        if callable(append):
+            append([text])
+        elif config is not None:
+            config.system_instruction = current + text
 
     @staticmethod
     def _inject_active_findings_state(llm_request: Any) -> None:
-        """Injects live canonical state store findings into the prompt so agents are immune to context compaction."""
+        """Tells a stage, once, which findings its campaign has already recorded.
+
+        A snapshot taken at the stage's first call and held for the stage's
+        lifetime, appended to the system instruction: the same bytes on every
+        call, so the prompt cache holds and the prefix under retained
+        reasoning never moves. Findings recorded during the stage reach the
+        model through the tool results that recorded them and get_findings.
+
+        The campaign's own findings only (the subtree of its target), fenced
+        and bounded: titles are model-written text, and under --parallel the
+        run's list is every sibling campaign's work. Keyed by the instruction
+        it is appended to, so each stage of a campaign takes its own snapshot
+        and a continued attempt takes a fresh one.
+        """
         from core.context import current_run_context
         from core.database import read_findings
 
         ctx = current_run_context.get()
         if ctx is None or not ctx.db_path or not os.path.exists(ctx.db_path):
             return
-
-        try:
-            findings = read_findings(ctx.db_path, run_id=ctx.run_id)
-        except Exception:
+        header = FINDINGS_SNAPSHOT_HEADER
+        config = getattr(llm_request, "config", None)
+        instruction = str(getattr(config, "system_instruction", "") or "") if config is not None else ""
+        if header in instruction:
             return
+        store = getattr(ctx, "node_context", None)
+        snapshots = store.setdefault("_findings_snapshot", {}) if isinstance(store, dict) else {}
+        key = hashlib.sha256(instruction.encode("utf-8", "replace")).hexdigest()
+        if key not in snapshots:
+            try:
+                findings = read_findings(
+                    ctx.db_path, run_id=ctx.run_id,
+                    scope_path=(getattr(ctx, "target_file", "") or None),
+                )
+            except Exception:
+                return
+            snapshots[key] = ResilientLiteLlm._render_findings_snapshot(findings)
+        block = snapshots[key]
+        if block:
+            ResilientLiteLlm._append_instruction_once(llm_request, header, block)
 
+    @staticmethod
+    def _render_findings_snapshot(findings: list) -> str:
         if not findings:
-            return
-
-        state_header = "[STATE STORE: RECORDED FINDINGS (DO NOT RE-REPORT)]"
-        contents = getattr(llm_request, "contents", None)
-        if not contents:
-            return
-
-        for c in contents:
-            for p in getattr(c, "parts", []):
-                if state_header in str(getattr(p, "text", "")):
-                    return
-                fr = getattr(p, "function_response", None)
-                if fr and state_header in str(getattr(fr, "response", "")):
-                    return
-
-        from core.llm_gateway import SecretScrubber
+            return ""
+        from core.llm_gateway import SecretScrubber, wrap_untrusted_content
 
         lines = []
-        for f in findings:
+        for f in findings[: FINDINGS_SNAPSHOT_MAX_LINES]:
             f_id = f.get("id")
             f_sev = f.get("severity", "UNKNOWN")
             f_fp = f.get("filepath", "")
@@ -1828,53 +1826,16 @@ class ResilientLiteLlm(LiteLlm):
             clean_title = SecretScrubber.scrub(raw_title)[:120]
             f_st = f.get("status", "reported")
             lines.append(f"  • Finding #{f_id} [{f_sev}] {f_fp}:{f_lines} - {clean_title} (status: {f_st})")
-
-        state_block = (
-            f"\n\n{state_header}\n"
-            f"The following {len(findings)} vulnerability finding(s) have ALREADY been recorded in knowledge.db for this run.\n"
-            f"Do NOT call report_findings for these existing findings. If analyzing new code, only report NEW distinct findings:\n"
-            + "\n".join(lines)
+        omitted = len(findings) - len(lines)
+        if omitted > 0:
+            lines.append(f"  … and {omitted} more; get_findings lists them all.")
+        return (
+            f"\n\n{FINDINGS_SNAPSHOT_HEADER}\n"
+            f"The following {len(findings)} vulnerability finding(s) were already recorded for this "
+            "campaign when this stage began. Do NOT call report_findings for them; report only NEW, "
+            "distinct findings. Findings recorded since appear in your tool results and in get_findings.\n"
+            + wrap_untrusted_content("\n".join(lines), filename="recorded_findings_snapshot")
         )
-
-        last_content = contents[-1]
-        parts = getattr(last_content, "parts", None)
-        if not parts:
-            return
-
-        from google.genai import types
-
-        fr_parts = [p for p in parts if getattr(p, "function_response", None) is not None]
-        if fr_parts:
-            target_fr_part = fr_parts[-1]
-            old_fr = target_fr_part.function_response
-            resp = getattr(old_fr, "response", None)
-            if isinstance(resp, dict):
-                new_resp = dict(resp)
-                if "output" in new_resp and isinstance(new_resp["output"], str):
-                    new_resp["output"] = f"{new_resp['output']}{state_block}"
-                elif "result" in new_resp and isinstance(new_resp["result"], str):
-                    new_resp["result"] = f"{new_resp['result']}{state_block}"
-                else:
-                    new_resp["_state_store_findings"] = state_block.strip()
-            elif isinstance(resp, str):
-                new_resp = f"{resp}{state_block}"
-            else:
-                new_resp = {"output": state_block.strip()}
-
-            idx = parts.index(target_fr_part)
-            parts[idx] = types.Part(
-                function_response=types.FunctionResponse(
-                    name=getattr(old_fr, "name", "tool"),
-                    response=new_resp,
-                    id=getattr(old_fr, "id", None),
-                )
-            )
-        elif getattr(last_content, "role", None) == "user":
-            text_parts = [p for p in parts if getattr(p, "text", None)]
-            if text_parts:
-                target_p = text_parts[-1]
-                idx = parts.index(target_p)
-                parts[idx] = types.Part.from_text(text=f"{target_p.text}{state_block}")
 
     @staticmethod
     def _sanitize_structured_response(response: Any, schema_cls: Any) -> Any:

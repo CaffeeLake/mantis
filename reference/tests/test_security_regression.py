@@ -1070,9 +1070,13 @@ class TestSessionStateImmutability(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_session_state_immutability_over_eight_turns(self):
-        class MockRequest:
-            def __init__(self, contents):
-                self.contents = contents
+        """Eight turns of one stage: the request's messages are exactly the
+        session's events on every turn (nothing injected, nothing stacked);
+        the findings snapshot sits in the system instruction, once, and is
+        the same bytes on every turn of the stage -- what the prompt cache
+        and prefix binding need. New findings reach the model through the
+        tool results that recorded them, not through a changing prefix."""
+        from google.adk.models.llm_request import LlmRequest
 
         def make_tool_event(turn_idx: int):
             return types.Content(
@@ -1089,17 +1093,13 @@ class TestSessionStateImmutability(unittest.TestCase):
             )
 
         session_events: list[types.Content] = []
+        instructions: list[str] = []
 
-        def execute_turn():
-            # Build request via ADK's _copy_content_for_request helper
-            copied = [_copy_content_for_request(e, strip_client_function_call_ids=True) for e in session_events]
-            req = MockRequest(copied)
-            ResilientLiteLlm._inject_active_findings_state(req)
-            req_text = "\n".join(str(p.function_response.response) for c in req.contents for p in c.parts if p.function_response)
-            persisted_text = "\n".join(str(p.function_response.response) for e in session_events for p in e.parts if p.function_response)
-            return req_text, persisted_text, req
-
-        # Turns 1 to 8
+        write_findings(
+            self.db, "file_0.py",
+            [{"title": "Vuln 0", "severity": "HIGH", "description": "d", "filepath": "file_0.py", "line_numbers": [1]}],
+            run_id="rh",
+        )
         for i in range(1, 9):
             write_findings(
                 self.db,
@@ -1108,21 +1108,30 @@ class TestSessionStateImmutability(unittest.TestCase):
                 run_id="rh",
             )
             session_events.append(make_tool_event(i))
-            req_str, pers_str, req_obj = execute_turn()
+            req = LlmRequest()
+            req.config.system_instruction = "You are the researcher."
+            req.contents = [_copy_content_for_request(e, strip_client_function_call_ids=True) for e in session_events]
+            ResilientLiteLlm._inject_active_findings_state(req)
+            ResilientLiteLlm._inject_stage_turn_reminder(req)
 
-            # 1. Session history events must never contain injected state blocks
-            self.assertNotIn("[STATE STORE", pers_str, f"Session history was mutated at turn {i}")
+            # 1. The messages are the session's events, byte for byte.
+            req_text = "\n".join(str(p.function_response.response) for c in req.contents for p in c.parts if p.function_response)
+            persisted_text = "\n".join(str(p.function_response.response) for e in session_events for p in e.parts if p.function_response)
+            self.assertEqual(req_text, persisted_text, f"Turn {i}: the request's messages differ from the session")
+            self.assertNotIn("[STATE STORE", req_text)
 
-            # 2. Each request must contain exactly one state block
-            self.assertEqual(req_str.count("[STATE STORE"), 1, f"Turn {i} request has {req_str.count('[STATE STORE')} blocks")
+            # 2. One snapshot in the instruction; repeated injection does not stack.
+            inst = req.config.system_instruction
+            self.assertEqual(inst.count("[STATE STORE"), 1, f"Turn {i}")
+            ResilientLiteLlm._inject_active_findings_state(req)
+            self.assertEqual(req.config.system_instruction.count("[STATE STORE"), 1, "Repeated injection stacked duplicates")
+            instructions.append(inst)
 
-            # 3. Newest finding appears in the refreshed block
-            self.assertIn(f"Vuln {i}", req_str)
-
-            # 4. Repeated invocation against unchanged contents does not stack duplicates
-            ResilientLiteLlm._inject_active_findings_state(req_obj)
-            repeated_str = "\n".join(str(p.function_response.response) for c in req_obj.contents for p in c.parts if p.function_response)
-            self.assertEqual(repeated_str.count("[STATE STORE"), 1, "Repeated injection stacked duplicates")
+        # 3. Frozen for the stage: every turn's instruction is identical, taken
+        # when the stage began (Vuln 0 and 1 present; later ones are not).
+        self.assertEqual(len(set(instructions)), 1, "the snapshot changed between turns of one stage")
+        self.assertIn("Vuln 1", instructions[0])
+        self.assertNotIn("Vuln 8", instructions[0])
 
 
 class TestBudgetCpuCeilings(unittest.TestCase):
