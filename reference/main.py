@@ -764,6 +764,14 @@ def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
                   "pause_trigger": ""}
     report["exit_code"] = exit_code
     report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
+    # The session store's size on disk, for the operator's pruning decision;
+    # measured at exit so a paused run reports it too.
+    try:
+        from core.paths import sessions_store_summary
+        store_path = _SPEND_REPORT.get("sessions_db_path") or ""
+        report["sessions_db_bytes"] = int(sessions_store_summary(store_path).get("bytes") or 0) if store_path else 0
+    except Exception:
+        report["sessions_db_bytes"] = 0
     try:
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -2678,10 +2686,13 @@ async def pipeline(
 
     # SECURITY (INV-4): a relative session-db name is resolved by sqlite against $CWD,
     # which during a campaign is the untrusted checkout. Anchor and symlink-check it.
-    sessions_db_path = resolve_db_path(
+    # Unconfigured, the store sits beside the knowledge database (core.paths).
+    from core.paths import resolve_sessions_db_path
+    sessions_db_path = resolve_sessions_db_path(
         config.get("sessions_db_path") or os.environ.get("MANTIS_SESSIONS_DB") or "",
-        default_name="sessions.db",
+        db_path, resuming=bool(resume_run_id),
     )
+    _SPEND_REPORT["sessions_db_path"] = sessions_db_path
     session_service = _PatientSqliteSessionService(db_path=sessions_db_path)
     runner = Runner(
         app=run_app,
@@ -3273,6 +3284,14 @@ async def pipeline(
             print(("\n🧮 Spend: " if i == 0 else "   ") + line)
     except Exception as exc:
         print(f"[SPEND SUMMARY WARNING] {exc}", file=sys.stderr)
+    # The session store grows with every run and nothing prunes it; the
+    # operator decides, so its size is stated after every run.
+    try:
+        from core.paths import render_sessions_store_note, sessions_store_summary
+        store = sessions_store_summary(_SPEND_REPORT.get("sessions_db_path") or "")
+        print(f"\n💾 {render_sessions_store_note(store)}")
+    except Exception as exc:
+        print(f"[SESSION STORE WARNING] {exc}", file=sys.stderr)
     print(f"\n📊 Summary: {len(active_findings)} active / {len(findings)} total vulnerability finding(s) recorded.")
     for f in findings:
         lines_str = f" (Lines: {f.get('line_numbers')})" if f.get('line_numbers') else ""

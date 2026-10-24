@@ -128,5 +128,8 @@ python3 "$MANTIS_HOME/reference/scripts/advise.py" --file src/server/auth.py
 - **Writes**:
   - `knowledge.db` (`findings`, `campaign_artifacts`, `risk_scores`, `learnings`
     tables).
-  - `sessions.db` (ADK session state trajectories).
+  - `sessions.db` (ADK session state trajectories), beside `knowledge.db` unless
+    `sessions_db_path` / `MANTIS_SESSIONS_DB` says otherwise. It grows with
+    every run and is pruned by nobody; each run ends by stating its size. Only a
+    paused or interrupted run reads its sessions again (`--resume`).
   - Formatted terminal report and execution logs.

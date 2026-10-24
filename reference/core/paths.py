@@ -272,3 +272,98 @@ def resolve_db_path(db_path: Union[str, Path], default_name: str = "knowledge.db
         raise PermissionError(err)
     return str(validated)
 
+
+
+SESSIONS_DB_NAME = "sessions.db"
+
+
+def resolve_sessions_db_path(configured: Union[str, Path], knowledge_db_path: Union[str, Path],
+                             resuming: bool = False) -> str:
+    """Where the ADK session store lives.
+
+    Configured (``sessions_db_path`` / ``MANTIS_SESSIONS_DB``): that path,
+    validated like any database path. Otherwise beside the knowledge
+    database: a run's findings and its sessions travel together, and the
+    store no longer grows under the installation while the operator keeps
+    their data elsewhere. With the default knowledge database the two rules
+    agree (both under the installation).
+
+    A resume looks where the run's sessions were written: when the
+    beside-file does not exist yet but the installation's does, the run
+    predates this rule and the installation's store is used.
+    """
+    raw = str(configured or "").strip()
+    if raw:
+        return resolve_db_path(raw, default_name=SESSIONS_DB_NAME)
+    # The knowledge path goes through the same anchoring as every database
+    # path (a relative name is the installation's, never $CWD's), so the
+    # store lands where the knowledge database actually is.
+    knowledge = Path(resolve_db_path(str(knowledge_db_path or "")))
+    beside = knowledge.parent / SESSIONS_DB_NAME
+    legacy = install_root() / SESSIONS_DB_NAME
+    if resuming and not beside.exists() and legacy.exists():
+        return str(legacy)
+    return resolve_db_path(str(beside), default_name=SESSIONS_DB_NAME)
+
+
+def format_bytes(n: int) -> str:
+    """1536 -> '1.5 KB'; binary units, one decimal above KB."""
+    try:
+        value = float(n)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def sessions_store_summary(sessions_db_path: Union[str, Path]) -> dict:
+    """{path, bytes, sessions, runs} for the session store: size on disk
+    (the database and its WAL/shm sidecars), sessions kept, and distinct
+    runs they belong to. Zeros when the file is missing or unreadable;
+    never raises."""
+    path = str(sessions_db_path or "")
+    out = {"path": path, "bytes": 0, "sessions": 0, "runs": 0}
+    if not path:
+        return out
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            out["bytes"] += os.path.getsize(path + suffix)
+        except OSError:
+            pass
+    if not os.path.exists(path):
+        return out
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+            out["sessions"] = int(row[0] or 0) if row else 0
+            # Session ids are session_run_<run uuid>_<target hash>.
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT substr(id, 1, length('session_run_') + 36)) FROM sessions"
+            ).fetchone()
+            out["runs"] = int(row[0] or 0) if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return out
+
+
+def render_sessions_store_note(summary: dict) -> str:
+    """One console line about the session store, with the fact an operator
+    needs to decide about pruning: only a paused or interrupted run reads
+    its sessions again (``--resume``)."""
+    size = format_bytes(int(summary.get("bytes") or 0))
+    n_sessions = int(summary.get("sessions") or 0)
+    n_runs = int(summary.get("runs") or 0)
+    path = str(summary.get("path") or SESSIONS_DB_NAME)
+    return (
+        f"Session store: {size} at {path} ({n_sessions:,} session(s) from {n_runs:,} run(s)). "
+        "Only a paused or interrupted run reads its sessions again (--resume); the file can be "
+        "deleted once no run needs resuming."
+    )
