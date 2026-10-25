@@ -124,13 +124,15 @@ class SweepCarriesTheModeTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             asyncio.run(sweep.run_sweep(self._cfg(Path(tmp) / "w"), eval_fn=fake_eval, log=lambda s: None))
-            self.assertTrue(all("campaigns" not in kw for kw in seen))
+            self.assertTrue(all("campaigns" not in kw and "transcript_path" not in kw for kw in seen))
             seen.clear()
             asyncio.run(sweep.run_sweep(
-                self._cfg(Path(tmp) / "p", campaigns="per-file", files="gt+clean:1", concurrency=2),
+                self._cfg(Path(tmp) / "p", campaigns="per-file", files="gt+clean:1", concurrency=2, transcripts=True),
                 eval_fn=fake_eval, log=lambda s: None))
             self.assertEqual({(kw["campaigns"], kw["files"], kw["concurrency"]) for kw in seen},
                              {("per-file", "gt+clean:1", 2)})
+            self.assertEqual({kw["transcript_path"].name for kw in seen}, {"transcript.jsonl"})
+            self.assertTrue(all(str(kw["transcript_path"].parent).startswith(str(Path(tmp) / "p" / "cells")) for kw in seen))
 
 
 class _FakeRunner:
@@ -253,6 +255,26 @@ class PerFileCellTest(unittest.TestCase):
         self.assertEqual(crashed["status"], "ungraded")
         self.assertIn("SomeProviderError", crashed["run_errors"][0])
         self.assertEqual(crashed["campaign_stats"][0]["status"], "error")
+        self.assertFalse(crashed["blocked"])
+
+    def test_a_content_filter_stop_is_reported_as_blocked_not_as_a_miss(self):
+        from evals.research_eval import is_blocked_finish
+        self.assertTrue(is_blocked_finish("FinishReason.SAFETY"))
+        self.assertTrue(is_blocked_finish("PROHIBITED_CONTENT"))
+        self.assertFalse(is_blocked_finish("FinishReason.MAX_TOKENS"))
+        self.assertFalse(is_blocked_finish(None))
+        try:
+            _FakeRunner.error_code = "FinishReason.SAFETY"
+            with mock.patch("google.adk.runners.Runner", _FakeRunner), \
+                    mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
+                result = asyncio.run(eval_researcher("m", "low", toolset="baseline", predecessor="planner"))
+        finally:
+            _FakeRunner.error_code = ""
+        self.assertFalse(result["graded"], "a blocked run is not a measurement of recall")
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["blocked_turns"], 1)
+        self.assertEqual(result["campaign_stats"][0]["status"], "blocked")
+        self.assertIn("content filter", result["run_errors"][0])
 
 
 if __name__ == "__main__":

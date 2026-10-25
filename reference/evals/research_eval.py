@@ -102,6 +102,17 @@ DEFAULT_CAMPAIGN_FILES = "gt+clean:7"
 # scores such a run as recall@cap.
 PIPELINE_MAX_LLM_CALLS = 2000
 LLM_CALL_LIMIT_ERROR = "LlmCallsLimitExceededError"
+# Finish reasons that mean the provider's own filter ended the turn: the
+# model was not allowed to answer, which is a fact about the model on this
+# material, not about what it could find. Reported apart from crashes.
+BLOCKED_FINISH_REASONS = frozenset({"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII"})
+
+
+def is_blocked_finish(error_code: Any) -> bool:
+    """True for an ADK error code naming a provider content block
+    ('FinishReason.SAFETY', 'SAFETY', ...)."""
+    name = str(error_code or "").rsplit(".", 1)[-1].upper()
+    return name in BLOCKED_FINISH_REASONS
 
 RESEARCH_PROMPT = (
     "You are the researcher stage of a security review. Audit the application "
@@ -853,6 +864,7 @@ async def eval_researcher(
     rearms = 0
     cap_hit = False
     call_limit_hits = 0
+    blocked_turns = 0
     pseudo_calls = False
     run_errors: List[str] = []
     campaign_stats: List[Dict[str, Any]] = []
@@ -972,7 +984,7 @@ async def eval_researcher(
                 )
 
                 async def _drain(message: types.Content) -> None:
-                    nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens, call_limit_hits
+                    nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens, call_limit_hits, blocked_turns
                     agen = runner.run_async(
                         session_id=session.id, user_id="eval_user", new_message=message,
                         run_config=RunConfig(max_llm_calls=PIPELINE_MAX_LLM_CALLS),
@@ -994,8 +1006,11 @@ async def eval_researcher(
                                     logger.warning("Campaign %s stopped at the LLM call ceiling (%d).",
                                                    rel or "whole", PIPELINE_MAX_LLM_CALLS)
                                 else:
-                                    run_errors.append((f"{rel}: " if rel else "") + f"event error {code}: {detail}")
-                                    stat["status"] = "error"
+                                    kind = "blocked by the model's content filter" if is_blocked_finish(code) else "event error"
+                                    if is_blocked_finish(code):
+                                        blocked_turns += 1
+                                    run_errors.append((f"{rel}: " if rel else "") + f"{kind} {code}: {detail}")
+                                    stat["status"] = "blocked" if is_blocked_finish(code) else "error"
                                 break
                             ev_tokens = extract_event_tokens(event)
                             tokens += ev_tokens
@@ -1130,6 +1145,12 @@ async def eval_researcher(
                 # stop, scored as recall@cap, but a sign the model needs more
                 # calls than a campaign is allowed on this target.
                 "llm_call_limit_hits": call_limit_hits,
+                # Turns the provider's content filter ended. The run is
+                # ungraded like any crash, but a sweep that shows these is
+                # measuring a model that will not do the work, not one that
+                # cannot find it.
+                "blocked_turns": blocked_turns,
+                "blocked": blocked_turns > 0,
                 "latency": latency,
                 "run_errors": run_errors,
                 "total_tokens": tokens,
@@ -1142,6 +1163,11 @@ async def eval_researcher(
                 "cached_tokens": cached_tokens,
                 "tool_calls": tool_calls,
                 "abort_guard_rearms": rearms,
+                # A run that ends without ever calling report_findings is a
+                # zero whatever it read; this says which zeros are that, and
+                # whether a tool call was written out as text on the way.
+                "researcher_reported": telemetry.report_findings_calls > 0,
+                "pseudo_tool_calls": bool(pseudo_calls),
                 "tokens_per_detected": (
                     round(tokens / result["detected"])
                     if tokens and result["detected"]

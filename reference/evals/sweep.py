@@ -103,6 +103,9 @@ class SweepConfig:
     campaigns: str = "whole"
     files: str = ""
     concurrency: int = 4
+    # Keep each cell's event transcript (cells/<key>/transcript.jsonl): the
+    # only way to see why a run ended as it did. Not part of the identity.
+    transcripts: bool = False
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -373,6 +376,8 @@ async def run_sweep(cfg: SweepConfig, eval_fn: Optional[EvalFn] = None, *, dry_r
                 kwargs: Dict[str, Any] = {}
                 if mode_suffix:
                     kwargs = {"campaigns": cfg.campaigns, "files": cfg.files, "concurrency": cfg.concurrency}
+                if cfg.transcripts:
+                    kwargs["transcript_path"] = cell_dir(out_dir, c) / "transcript.jsonl"
                 result = await eval_fn(
                     cfg.model, cfg.effort,
                     target_dir=target_dirs[c.seed],
@@ -423,6 +428,7 @@ def _build_config(args: argparse.Namespace) -> SweepConfig:
         campaigns=args.campaigns,
         files=args.files or "",
         concurrency=args.concurrency,
+        transcripts=args.transcripts,
     )
 
 
@@ -446,6 +452,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="With --campaigns per-file: 'all', 'gt' or 'gt+clean:N' (default).")
     parser.add_argument("--concurrency", type=int, default=4,
                         help="With --campaigns per-file: campaigns in flight at once within a cell.")
+    parser.add_argument("--transcripts", action="store_true",
+                        help="Keep each cell's event transcript in its cell directory, for reading why a run ended as it did.")
     parser.add_argument("--confirm-holdout", action="store_true",
                         help="Allow holdout seeds. One-shot confirmation only; never for tuning.")
     parser.add_argument("--dry-run", action="store_true")
