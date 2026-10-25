@@ -902,8 +902,17 @@ async def eval_researcher(
             stat: Dict[str, Any] = {"file": rel or "", "tokens": 0, "tool_calls": 0, "status": "complete"}
             c_started = time.time()
             try:
+                from google.adk.agents.context_cache_config import ContextCacheConfig
+                from google.adk.apps.app import App
+
+                # Production runs with context caching on (main.py
+                # enable_context_cache): for Claude that is what makes ADK
+                # mark the prompt prefix cacheable at all, and without it the
+                # eval would bill every token of a forked transcript at full
+                # price -- a cost the pipeline never pays. Gemini caches
+                # implicitly either way.
+                cache_config = ContextCacheConfig()
                 if predecessor:
-                    from google.adk.apps.app import App
                     from google.adk.workflow import START, Edge, Workflow
 
                     from core.graph_loader import _make_fork_before_model_callback
@@ -926,25 +935,25 @@ async def eval_researcher(
                         # instruction -- in both planned arms alike.
                         instruction_suffix=briefing,
                     )
-                    workflow = Workflow(name="eval_graph", edges=[
+                    root = Workflow(name="eval_graph", edges=[
                         Edge(from_node=START, to_node=first), Edge(from_node=first, to_node=agent),
                     ])
-                    runner = Runner(app=App(name="eval_app", root_agent=workflow), session_service=session_service)
                     seed_text = (
                         f"Initial Task Input: Evaluate {subject}. You are the {predecessor} "
                         "stage; do your stage's work and record it through your tools."
                     )
                 else:
-                    agent = build_stage_agent(
+                    root = build_stage_agent(
                         "researcher",
                         model_id=model_id,
                         reasoning_effort=effort,
                         tools_override=tool_names,
                     )
-                    runner = Runner(
-                        agent=agent, session_service=session_service, app_name="eval_app"
-                    )
                     seed_text = briefing
+                runner = Runner(
+                    app=App(name="eval_app", root_agent=root, context_cache_config=cache_config),
+                    session_service=session_service,
+                )
                 session = await session_service.create_session(
                     app_name="eval_app", user_id="eval_user"
                 )

@@ -138,9 +138,10 @@ class _FakeRunner:
     target and reports one finding in that file through the real tool."""
 
     targets: list = []
+    apps: list = []
 
     def __init__(self, **kwargs):
-        pass
+        _FakeRunner.apps.append(kwargs.get("app"))
 
     async def run_async(self, session_id=None, user_id=None, new_message=None):
         from core.context import current_run_context
@@ -159,11 +160,18 @@ class _FakeRunner:
 
 
 class PerFileCellTest(unittest.TestCase):
+    @staticmethod
+    def _fake_agent(stage_name, **_kw):
+        # A real (model-less) agent: the eval builds a real App around it,
+        # which validates its root agent; only the Runner is faked.
+        from google.adk.agents import Agent
+        return Agent(name=stage_name)
+
     def test_a_per_file_cell_runs_one_campaign_per_file_with_its_own_target(self):
         _FakeRunner.targets = []
         gt = load_research_ground_truth(DEFAULT_TARGET / GROUND_TRUTH_BASENAME)
         with mock.patch("google.adk.runners.Runner", _FakeRunner), \
-                mock.patch("evals.stage_agents.build_stage_agent", return_value=object()):
+                mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
             result = asyncio.run(eval_researcher(
                 "m", "low", toolset="baseline", campaigns="per-file", files="gt", concurrency=3,
             ))
@@ -180,7 +188,7 @@ class PerFileCellTest(unittest.TestCase):
     def test_whole_mode_is_the_old_shape(self):
         _FakeRunner.targets = []
         with mock.patch("google.adk.runners.Runner", _FakeRunner), \
-                mock.patch("evals.stage_agents.build_stage_agent", return_value=object()):
+                mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
             result = asyncio.run(eval_researcher("m", "low", toolset="baseline"))
         self.assertEqual(_FakeRunner.targets, ["."])
         self.assertEqual(result["campaigns"], "whole")
@@ -189,6 +197,18 @@ class PerFileCellTest(unittest.TestCase):
         self.assertEqual(result["campaigns_run"], 1)
         self.assertEqual(result["campaign_stats"][0]["file"], "")
         self.assertEqual(result["findings_reported"], 1)
+
+    def test_the_eval_runs_with_production_context_caching(self):
+        # main.py turns context caching on by default; for Claude that is
+        # what makes ADK mark the prompt prefix cacheable, so an eval without
+        # it would bill a forked transcript at a price the pipeline never pays.
+        from google.adk.agents.context_cache_config import ContextCacheConfig
+        _FakeRunner.apps = []
+        with mock.patch("google.adk.runners.Runner", _FakeRunner), \
+                mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
+            asyncio.run(eval_researcher("m", "low", toolset="baseline"))
+        self.assertEqual(len(_FakeRunner.apps), 1)
+        self.assertIsInstance(_FakeRunner.apps[0].context_cache_config, ContextCacheConfig)
 
 
 if __name__ == "__main__":
