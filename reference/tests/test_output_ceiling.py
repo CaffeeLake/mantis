@@ -37,7 +37,7 @@ from google.adk.models.lite_llm import LiteLlm  # noqa: E402
 from google.genai import types  # noqa: E402
 
 from core.config import (  # noqa: E402
-    CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS, ResilientLiteLlm, get_llm_kwargs, output_cap_from_error,
+    CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS, ResilientLiteLlm, default_request_timeout, get_llm_kwargs, output_cap_from_error,
 )
 
 _FAST = {
@@ -97,6 +97,39 @@ class DefaultCeilingTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MANTIS_MAX_TOKENS": "4096"}):
             self.assertEqual(self._ceiling("vertex_ai/gemini-known"), 4096)
             self.assertEqual(self._ceiling("vertex_ai/claude-example"), 4096)
+
+
+class RequestTimeoutTest(unittest.TestCase):
+    """Requests are not streamed: the whole thinking turn must arrive inside
+    the timeout, and at the highest effort one turn has been measured past
+    five minutes. The default scales with effort; the operator's wins."""
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"VERTEXAI_PROJECT": "p", "VERTEXAI_LOCATION": "global"}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("LLM_TIMEOUT", "MANTIS_TIMEOUT", "LLM_REQUEST_TIMEOUT"):
+            os.environ.pop(var, None)
+
+    def _timeout(self, model, effort):
+        _, kw = get_llm_kwargs(model_id=model, reasoning_effort=effort)
+        return kw.get("timeout")
+
+    def test_the_default_scales_with_effort(self):
+        self.assertEqual(default_request_timeout("vertex_ai/claude-example", "max"), 1800.0)
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "high"), 900.0)
+        self.assertEqual(default_request_timeout("vertex_ai/gemini-example", "medium"), 300.0)
+        self.assertEqual(self._timeout("vertex_ai/claude-example", "max"), 1800.0)
+        self.assertEqual(self._timeout("vertex_ai/gemini-example", "high"), 900.0)
+
+    def test_thinking_models_keep_a_timeout_at_low_effort_and_others_none(self):
+        self.assertEqual(self._timeout("vertex_ai/claude-example", "low"), 300.0)
+        self.assertEqual(self._timeout("openai/glm-example", "low"), 300.0)
+        self.assertIsNone(self._timeout("vertex_ai/gemini-example", "low"))
+
+    def test_the_operator_s_timeout_wins(self):
+        with mock.patch.dict(os.environ, {"LLM_REQUEST_TIMEOUT": "42"}):
+            self.assertEqual(self._timeout("vertex_ai/claude-example", "max"), 42.0)
 
 
 class OutputCapFromErrorTest(unittest.TestCase):

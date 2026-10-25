@@ -399,6 +399,30 @@ def output_cap_from_error(e: Exception) -> Optional[int]:
     return None
 
 
+# How long one request may take before it is abandoned and retried, when
+# the operator sets no timeout (LLM_TIMEOUT / MANTIS_TIMEOUT /
+# LLM_REQUEST_TIMEOUT). Requests are not streamed, so the whole response
+# -- thinking included -- must arrive inside it. At the highest effort a
+# single thinking turn on a frontier model has been measured past five
+# minutes; a timeout is retried, but the retry re-sends the same long
+# request and times out the same way, so too short a timeout turns a slow
+# turn into a failed stage. Models that do not think get no timeout here
+# and keep LiteLLM's.
+REQUEST_TIMEOUT_BY_EFFORT = {"max": 1800.0, "high": 900.0, "medium": 300.0}
+REQUEST_TIMEOUT_THINKING_MODEL = 300.0
+
+
+def default_request_timeout(model: str, effort: Optional[str]) -> Optional[float]:
+    """The request timeout for `model` at `effort` when none is configured."""
+    level = str(effort or "").lower().strip()
+    if level in REQUEST_TIMEOUT_BY_EFFORT:
+        return REQUEST_TIMEOUT_BY_EFFORT[level]
+    name = str(model or "").lower()
+    if "glm" in name or "claude" in name:
+        return REQUEST_TIMEOUT_THINKING_MODEL
+    return None
+
+
 def resolve_output_ceiling(model: str) -> Optional[int]:
     """The output-token ceiling to request for `model`: the most it allows.
 
@@ -2492,8 +2516,8 @@ def get_llm_kwargs(
         or default_timeout
     )
     effort = reasoning_effort or os.environ.get("REASONING_EFFORT") or default_reasoning_effort
-    if raw_timeout is None and (effort in ("high", "medium") or "glm" in resolved_model or "claude" in resolved_model):
-        raw_timeout = 300.0
+    if raw_timeout is None:
+        raw_timeout = default_request_timeout(resolved_model, effort)
 
     llm_kwargs = {"model": resolved_model}
     if resolved_api_base:
