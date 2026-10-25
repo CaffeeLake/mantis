@@ -95,6 +95,13 @@ CAMPAIGN_MODES = ("whole", "per-file")
 # the key, so recall is measured as a full sweep would measure it while
 # precision is measured over a sample of clean files (and so reads high).
 DEFAULT_CAMPAIGN_FILES = "gt+clean:7"
+# The pipeline's per-campaign LLM call ceiling (workflow.json budget
+# max_llm_calls). ADK's own default is 500, which a frontier model at high
+# effort exhausts on a medium target before it reports; the pipeline raises
+# it and treats the limit as a budget stop, so the eval does the same and
+# scores such a run as recall@cap.
+PIPELINE_MAX_LLM_CALLS = 2000
+LLM_CALL_LIMIT_ERROR = "LlmCallsLimitExceededError"
 
 RESEARCH_PROMPT = (
     "You are the researcher stage of a security review. Audit the application "
@@ -812,6 +819,7 @@ async def eval_researcher(
       and against which answer key. Results that differ in either must not
       be averaged together.
     """
+    from google.adk.agents.run_config import RunConfig
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
     from google.genai import types
@@ -844,6 +852,7 @@ async def eval_researcher(
     tool_calls = 0
     rearms = 0
     cap_hit = False
+    call_limit_hits = 0
     pseudo_calls = False
     run_errors: List[str] = []
     campaign_stats: List[Dict[str, Any]] = []
@@ -963,12 +972,31 @@ async def eval_researcher(
                 )
 
                 async def _drain(message: types.Content) -> None:
-                    nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens
+                    nonlocal tokens, tool_calls, pseudo_calls, cap_hit, billed_tokens, cached_tokens, call_limit_hits
                     agen = runner.run_async(
-                        session_id=session.id, user_id="eval_user", new_message=message
+                        session_id=session.id, user_id="eval_user", new_message=message,
+                        run_config=RunConfig(max_llm_calls=PIPELINE_MAX_LLM_CALLS),
                     )
                     try:
                         async for event in agen:
+                            # ADK reports a failed node as an event with an
+                            # error code, not an exception. The pipeline's call
+                            # ceiling is a budget stop: score as it stands.
+                            # Anything else is a crash: the run is ungraded.
+                            error_code = getattr(event, "error_code", None)
+                            if error_code:
+                                code = str(error_code)
+                                detail = str(getattr(event, "error_message", "") or "")[:160]
+                                if code == LLM_CALL_LIMIT_ERROR:
+                                    cap_hit = True
+                                    call_limit_hits += 1
+                                    stat["status"] = "cap"
+                                    logger.warning("Campaign %s stopped at the LLM call ceiling (%d).",
+                                                   rel or "whole", PIPELINE_MAX_LLM_CALLS)
+                                else:
+                                    run_errors.append((f"{rel}: " if rel else "") + f"event error {code}: {detail}")
+                                    stat["status"] = "error"
+                                break
                             ev_tokens = extract_event_tokens(event)
                             tokens += ev_tokens
                             stat["tokens"] += ev_tokens
@@ -1096,7 +1124,12 @@ async def eval_researcher(
                 "status": "complete" if graded else "ungraded",
                 "zero_findings_complete": graded and not findings,
                 "cap_hit": cap_hit,
-                "caps": {"max_tokens": max_tokens, "max_tool_calls": max_tool_calls},
+                "caps": {"max_tokens": max_tokens, "max_tool_calls": max_tool_calls,
+                         "max_llm_calls": PIPELINE_MAX_LLM_CALLS},
+                # Campaigns the pipeline's call ceiling stopped: a budget
+                # stop, scored as recall@cap, but a sign the model needs more
+                # calls than a campaign is allowed on this target.
+                "llm_call_limit_hits": call_limit_hits,
                 "latency": latency,
                 "run_errors": run_errors,
                 "total_tokens": tokens,

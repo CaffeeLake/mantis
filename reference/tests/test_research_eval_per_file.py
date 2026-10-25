@@ -139,14 +139,23 @@ class _FakeRunner:
 
     targets: list = []
     apps: list = []
+    run_configs: list = []
+    # When set, run_async yields an error event with this code before
+    # anything else, the way ADK surfaces a failed node.
+    error_code: str = ""
 
     def __init__(self, **kwargs):
         _FakeRunner.apps.append(kwargs.get("app"))
 
-    async def run_async(self, session_id=None, user_id=None, new_message=None):
+    async def run_async(self, session_id=None, user_id=None, new_message=None, run_config=None):
         from core.context import current_run_context
         from tools.research_tools import report_findings
 
+        _FakeRunner.run_configs.append(run_config)
+        if _FakeRunner.error_code:
+            yield mock.Mock(author="researcher", content=None, usage_metadata=None, partial=False,
+                            error_code=_FakeRunner.error_code, error_message="node failed")
+            return
         ctx = current_run_context.get()
         rel = Path(ctx.target_file).relative_to(Path(ctx.jail_dir) / "app").as_posix()
         _FakeRunner.targets.append(rel)
@@ -156,7 +165,7 @@ class _FakeRunner:
             "title": f"issue in {cited}", "filepath": f"app/{cited}", "line_numbers": [1],
             "description": "the eval's fake researcher", "severity": "LOW", "cwe": "CWE-1",
         }]})
-        yield mock.Mock(author="researcher", content=None, usage_metadata=None, partial=False)
+        yield mock.Mock(author="researcher", content=None, usage_metadata=None, partial=False, error_code=None)
 
 
 class PerFileCellTest(unittest.TestCase):
@@ -209,6 +218,41 @@ class PerFileCellTest(unittest.TestCase):
             asyncio.run(eval_researcher("m", "low", toolset="baseline"))
         self.assertEqual(len(_FakeRunner.apps), 1)
         self.assertIsInstance(_FakeRunner.apps[0].context_cache_config, ContextCacheConfig)
+
+    def test_the_eval_runs_with_the_pipelines_llm_call_ceiling(self):
+        # ADK's default is 500 calls; the pipeline allows 2000 per campaign.
+        # A frontier model at high effort spends more than 500 on a medium
+        # target before it reports, and scored at ADK's default it reads as
+        # a model that found nothing.
+        from evals.research_eval import PIPELINE_MAX_LLM_CALLS
+        _FakeRunner.run_configs = []
+        with mock.patch("google.adk.runners.Runner", _FakeRunner), \
+                mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
+            asyncio.run(eval_researcher("m", "low", toolset="baseline"))
+        self.assertEqual([rc.max_llm_calls for rc in _FakeRunner.run_configs], [PIPELINE_MAX_LLM_CALLS])
+        self.assertEqual(PIPELINE_MAX_LLM_CALLS, 2000)
+
+    def test_the_call_ceiling_is_a_cap_and_any_other_error_event_ungrades(self):
+        from evals.research_eval import LLM_CALL_LIMIT_ERROR
+        try:
+            _FakeRunner.error_code = LLM_CALL_LIMIT_ERROR
+            with mock.patch("google.adk.runners.Runner", _FakeRunner), \
+                    mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
+                capped = asyncio.run(eval_researcher("m", "low", toolset="baseline"))
+            _FakeRunner.error_code = "SomeProviderError"
+            with mock.patch("google.adk.runners.Runner", _FakeRunner), \
+                    mock.patch("evals.stage_agents.build_stage_agent", side_effect=self._fake_agent):
+                crashed = asyncio.run(eval_researcher("m", "low", toolset="baseline"))
+        finally:
+            _FakeRunner.error_code = ""
+        self.assertTrue(capped["graded"])
+        self.assertTrue(capped["cap_hit"])
+        self.assertEqual(capped["llm_call_limit_hits"], 1)
+        self.assertEqual(capped["campaign_stats"][0]["status"], "cap")
+        self.assertFalse(crashed["graded"])
+        self.assertEqual(crashed["status"], "ungraded")
+        self.assertIn("SomeProviderError", crashed["run_errors"][0])
+        self.assertEqual(crashed["campaign_stats"][0]["status"], "error")
 
 
 if __name__ == "__main__":
