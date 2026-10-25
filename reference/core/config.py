@@ -363,24 +363,66 @@ def extract_retry_after(e: Exception) -> Optional[float]:
     return None
 
 
-# The output-token ceiling Claude models get unless the operator sets one.
-# Thinking counts against it, and at high effort one turn of thinking can
-# pass 32k; current models allow 128k. A model that allows less says so
-# when it rejects the request, and the request is retried at the ceiling
-# it named (output_cap_from_error).
+# The output-token ceiling a Claude model gets when nothing else names one.
+# Anthropic requires max_tokens on every request, so "unset" is never the
+# provider's choice: LiteLLM fills it from its model registry and, for a
+# model the registry does not know yet, with 4096 -- which at high effort
+# a single turn of thinking exceeds. Current models allow 128k. A model
+# that allows less says so when it rejects the request, and the request is
+# retried at the ceiling it named (output_cap_from_error).
 CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS = 128000
-_OUTPUT_CAP_RE = re.compile(r"max_tokens:\s*(\d+)\s*>\s*(\d+)")
+# How providers word a rejected output ceiling. Anthropic: "max_tokens:
+# 65536 > 32000, which is the maximum allowed...". Vertex Gemini: "...a
+# maxOutputTokens value of 1000000 but the supported range is from 1
+# (inclusive) to 65537 (exclusive)". OpenAI: "max_tokens is too large:
+# 200000. This model supports at most 128000 completion tokens".
+_OUTPUT_CAP_PATTERNS = (
+    re.compile(r"max_tokens:\s*(?P<asked>\d+)\s*>\s*(?P<cap>\d+)"),
+    re.compile(r"maxOutputTokens value of (?P<asked>\d+).*?to (?P<cap>\d+)\s*\((?P<bound>inclusive|exclusive)\)", re.S),
+    re.compile(r"too large:\s*(?P<asked>\d+).*?supports at most (?P<cap>\d+)", re.S),
+)
 
 
 def output_cap_from_error(e: Exception) -> Optional[int]:
     """The output-token ceiling a provider names when it rejects a request
-    for asking more ('max_tokens: 65536 > 32000, which is the maximum
-    allowed number of output tokens...'); None for any other error."""
-    m = _OUTPUT_CAP_RE.search(str(e))
-    if not m:
-        return None
-    asked, allowed = int(m.group(1)), int(m.group(2))
-    return allowed if 0 < allowed < asked else None
+    for asking more; None for any other error, and None when the named
+    ceiling is not below what was asked (nothing to retry at)."""
+    text = str(e)
+    for pattern in _OUTPUT_CAP_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        asked, cap = int(m.group("asked")), int(m.group("cap"))
+        if m.groupdict().get("bound") == "exclusive":
+            cap -= 1
+        return cap if 0 < cap < asked else None
+    return None
+
+
+def resolve_output_ceiling(model: str) -> Optional[int]:
+    """The output-token ceiling to request for `model`: the most it allows.
+
+    A ceiling costs nothing until it is used, and a turn that reaches it
+    ends with MAX_TOKENS and fails its stage, so the right value is the
+    model's maximum. LiteLLM's registry knows it for released models and
+    is asked first. A Claude model it does not know gets
+    CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS, because for Anthropic "unset" means
+    LiteLLM's own guess. Any other unknown model gets None: the request
+    names no ceiling and the provider applies the model's own default.
+    Whatever is sent, a model that allows less names its ceiling when it
+    rejects the request, and ResilientLiteLlm retries at that ceiling.
+    """
+    name = str(model or "")
+    try:
+        import litellm
+        known = litellm.get_max_tokens(name)
+        if known:
+            return int(known)
+    except Exception:
+        pass
+    if "claude" in name.lower():
+        return CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS
+    return None
 
 
 def extract_rate_limit_detail(e: Exception) -> str:
@@ -2472,15 +2514,14 @@ def get_llm_kwargs(
             llm_kwargs["max_tokens"] = int(max_tokens_val)
         except (ValueError, TypeError):
             pass
-    elif "claude" in resolved_model:
-        # Thinking shares the output budget: at high effort a single turn
-        # can pass 32k, and the turn then ends with MAX_TOKENS. Models that
-        # allow less than this reject the request and name their ceiling;
-        # ResilientLiteLlm retries at that ceiling (output_cap_from_error).
-        llm_kwargs.setdefault("max_tokens", CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS)
-    elif effort in ("high", "medium"):
-        # Provide a generous output token budget so thinking tokens do not starve response text
-        llm_kwargs.setdefault("max_tokens", 32768)
+    else:
+        # The most the model allows (resolve_output_ceiling): thinking
+        # shares the output budget, and a turn that reaches the ceiling
+        # ends with MAX_TOKENS and fails its stage. None leaves the
+        # provider's own default in place.
+        ceiling = resolve_output_ceiling(resolved_model)
+        if ceiling:
+            llm_kwargs.setdefault("max_tokens", ceiling)
 
     if resolved_model.startswith("vertex_ai/"):
         project = os.environ.get("VERTEXAI_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
