@@ -170,6 +170,11 @@ class GlobalConfig(_Base):
     # the default). 0 ends or fails the stage at its first ceiling.
     max_node_continuations: int = Field(default=6, ge=0)
     enable_context_cache: bool = True
+    # Stream model turns (default). The request timeout then applies
+    # between chunks, so a long thinking turn that keeps producing is never
+    # cut short, while a hung connection still is (core.config
+    # llm_streaming_enabled; MANTIS_LLM_STREAM overrides).
+    llm_streaming: bool = True
     budget: Optional[dict[str, Any]] = None
     # Paths under the target that are not scanned: patterns relative to the
     # target, see core.exclusions. A list, or one comma-separated string.
@@ -647,8 +652,12 @@ READ_FILE_REPEAT_THRESHOLD = 3
 
 
 def count_event_tool_calls(event: Any) -> int:
-    """Function calls carried by one ADK event. Never raises."""
+    """Function calls carried by one ADK event. A streamed turn yields the
+    same call again as partial chunks before the final event; only the
+    final event counts. Never raises."""
     try:
+        if getattr(event, "partial", False):
+            return 0
         parts = getattr(getattr(event, "content", None), "parts", None) or []
         return sum(1 for part in parts if getattr(part, "function_call", None))
     except Exception:
@@ -656,8 +665,11 @@ def count_event_tool_calls(event: Any) -> int:
 
 
 def event_has_pseudo_tool_call(event: Any) -> bool:
-    """True when a text part spells out a tool call instead of making one. Never raises."""
+    """True when a text part spells out a tool call instead of making one.
+    Judged on final events only: a partial chunk is a fragment. Never raises."""
     try:
+        if getattr(event, "partial", False):
+            return False
         parts = getattr(getattr(event, "content", None), "parts", None) or []
         if any(
             PSEUDO_TOOL_CALL_RE.search(getattr(part, "text", None) or "")

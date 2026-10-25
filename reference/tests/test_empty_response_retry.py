@@ -99,6 +99,8 @@ class ScriptedUpstream:
         async def generate_content_async(_self, llm_request, stream=False):
             self.seen.append(stream)
             for response in self.calls.pop(0):
+                if isinstance(response, Exception):
+                    raise response  # a failure part-way through a streamed turn
                 yield response
         return generate_content_async
 
@@ -230,6 +232,74 @@ class EmptyTurnRetryTest(unittest.TestCase):
         self.assertEqual(len(upstream.seen), 1)
         self.assertNotIn("[LLM RETRY]", err)
 
+    def test_a_streamed_turn_that_is_empty_throughout_is_an_empty_turn(self):
+        # Production streams. ADK ends a streamed turn with one final,
+        # non-partial response; when nothing at all was produced, that final
+        # is the same empty STOP the unstreamed path retries, and it is
+        # retried the same way.
+        controller = self.with_budget()
+        upstream = ScriptedUpstream([[empty(1000)], [good("chunk", partial=True), good("done")]])
+        out, err = self.run_turn(upstream, stream=True)
+        self.assertEqual([r.content.parts[0].text for r in out], ["chunk", "done"])
+        self.assertEqual(len(upstream.seen), 2, "one empty streamed turn, then the answer")
+        self.assertEqual(controller.accumulated_tokens, 1000, "the empty turn was billed, so charged")
+        self.assertEqual(err.count("[LLM RETRY]"), 1)
+
+    def test_a_streamed_turn_of_thoughts_with_no_answer_is_an_empty_turn(self):
+        """Measured: a researcher streamed its reasoning for a whole turn and
+        ended without a tool call or a word of text. ADK calls that
+        MODEL_RETURNED_NO_CONTENT (thought-only parts) and failed the stage;
+        it is the empty turn the unstreamed path already retries."""
+        controller = self.with_budget()
+        thought = lambda text: LlmResponse(  # noqa: E731
+            content=types.Content(role="model", parts=[types.Part(text=text, thought=True)]), partial=True)
+        thoughts_only_final = LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text="Analyzing...", thought=True)]),
+            finish_reason=types.FinishReason.STOP, usage_metadata=_usage(2000),
+        )
+        upstream = ScriptedUpstream([
+            [thought("Analyzing"), thought(" findings"), thoughts_only_final],
+            [thought("Reporting"), good("report")],
+        ])
+        out, err = self.run_turn(upstream, stream=True)
+        self.assertEqual(out[-1].content.parts[0].text, "report")
+        self.assertEqual(len(upstream.seen), 2, "the thought-only turn was retried")
+        self.assertEqual(controller.accumulated_tokens, 2000, "and charged")
+        self.assertIn("[LLM RETRY]", err)
+        self.assertTrue(all(not is_empty_stop_response(r) for r in out),
+                        "nothing ADK would flag reaches it")
+
+    def test_a_thought_only_final_followed_by_a_tool_call_is_not_an_empty_turn(self):
+        # An aggregator may emit a thought-only final ahead of the tool call
+        # that ends the turn. The final is held until the stream shows what
+        # follows, then passed on as it came.
+        self.with_budget()
+        thoughts_final = LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text="Thinking", thought=True)]),
+            finish_reason=types.FinishReason.STOP,
+        )
+        call = LlmResponse(content=types.Content(role="model", parts=[
+            types.Part(function_call=types.FunctionCall(name="read_file", args={"filepath": "a.py"}))]))
+        upstream = ScriptedUpstream([[thoughts_final, call]])
+        out, err = self.run_turn(upstream, stream=True)
+        self.assertEqual(len(out), 2, "both passed on, in order")
+        self.assertIsNotNone(out[1].content.parts[0].function_call)
+        self.assertEqual(len(upstream.seen), 1)
+        self.assertNotIn("[LLM RETRY]", err)
+
+    def test_a_stream_cut_after_its_first_chunk_is_retried_as_a_whole_turn(self):
+        # The client layer refuses to splice two samplings; the model layer
+        # may re-issue the turn because the chunks it forwarded were partial
+        # events, which ADK does not persist.
+        self.with_budget()
+        self.assertTrue(is_retryable_llm_error(C.MantisStreamInterruptedError("cut", chunks_yielded=3)))
+        cut = C.MantisStreamInterruptedError("stream interrupted after 3 chunk(s)", chunks_yielded=3)
+        upstream = ScriptedUpstream([[good("chu", partial=True), cut], [good("chunk", partial=True), good("done")]])
+        out, err = self.run_turn(upstream, stream=True)
+        self.assertEqual([r.content.parts[0].text for r in out][-2:], ["chunk", "done"])
+        self.assertEqual(len(upstream.seen), 2)
+        self.assertIn("[LLM RETRY]", err)
+
 
 class _EmptyTurnServer:
     """An OpenAI-compatible endpoint whose every answer is an empty STOP turn
@@ -246,12 +316,35 @@ class _EmptyTurnServer:
                 pass
 
             def do_POST(self):
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 server.requests += 1
+                try:
+                    wants_stream = bool(json.loads(raw or b"{}").get("stream"))
+                except ValueError:
+                    wants_stream = False
+                server.streamed += int(wants_stream)
+                usage = {"prompt_tokens": 999, "completion_tokens": 1, "total_tokens": 1000}
+                if wants_stream:
+                    # The streamed shape of the same empty turn: one chunk with
+                    # an empty delta and finish_reason, then the usage chunk
+                    # include_usage asks for, then the terminator.
+                    chunks = [
+                        {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "fake",
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]},
+                        {"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "fake",
+                         "choices": [], "usage": usage},
+                    ]
+                    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 body = json.dumps({
                     "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 999, "completion_tokens": 1, "total_tokens": 1000},
+                    "usage": usage,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -260,6 +353,7 @@ class _EmptyTurnServer:
                 self.wfile.write(body)
 
         self.requests = 0
+        self.streamed = 0
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -329,6 +423,7 @@ class EndToEndTest(unittest.TestCase):
         tokens, calls, meta = rows[0]
         self.assertEqual(json.loads(meta).get("failed"), False, "not a failure: nothing for --resume to re-run")
         self.assertGreater(self.server.requests, 6, "retried, not just passed on")
+        self.assertEqual(self.server.streamed, self.server.requests, "the default path streams every turn")
         self.assertEqual((tokens, calls), (1000 * self.server.requests, self.server.requests),
                          "every request the server saw is on the ledger: swallowed turns charged, none twice")
         self.assertIn("stage(s) ended on empty model turns", out)

@@ -574,6 +574,8 @@ class ToolTelemetry:
 
     def observe(self, event: Any, cumulative_tokens: int) -> None:
         try:
+            if getattr(event, "partial", False):
+                return  # a streamed fragment; the final event carries the same call
             parts = getattr(getattr(event, "content", None), "parts", None) or []
             for part in parts:
                 call = getattr(part, "function_call", None)

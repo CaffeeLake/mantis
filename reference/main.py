@@ -52,6 +52,7 @@ from core.context import RunContext, current_run_context
 from core.transcript import TranscriptWriter, event_transcript_rows
 from core.paths import resolve_db_path
 from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
+from core.config import configure_llm_streaming, llm_streaming_enabled
 from core.compactor import MantisEventsSummarizer
 from core.llm_gateway import strip_terminal_control
 
@@ -314,7 +315,7 @@ async def _drive_campaign(
         max_calls = budget_controller.config.max_llm_calls
     run_cfg = RunConfig(
         max_llm_calls=max_calls,
-        streaming_mode=StreamingMode.NONE,
+        streaming_mode=StreamingMode.SSE if llm_streaming_enabled() else StreamingMode.NONE,
     )
 
     try:
@@ -441,6 +442,11 @@ async def _drive_campaign(
                                 except Exception:
                                     pass
                         elif hasattr(part, 'function_call') and part.function_call:
+                            # A streamed turn yields the call again as partial
+                            # chunks (name, then argument fragments) before the
+                            # final event. Only the final event is a call.
+                            if is_partial:
+                                continue
                             call = part.function_call
                             call_name = getattr(call, "name", "unknown_tool")
                             call_args = getattr(call, "args", {})
@@ -2798,6 +2804,12 @@ async def pipeline(
     use_context_cache = config.get("enable_context_cache", True) if enable_context_cache is None else enable_context_cache
     if use_context_cache:
         context_cache_config = ContextCacheConfig()
+    # Streamed turns (the default): the request timeout then applies
+    # between chunks, so a long thinking turn that keeps producing is never
+    # cut short, while a hung connection still is. `llm_streaming: false`
+    # in the workflow, or MANTIS_LLM_STREAM=0, returns to whole-response
+    # requests.
+    configure_llm_streaming(config.get("llm_streaming"))
 
     run_app = App(
         name=APP_NAME,

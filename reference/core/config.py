@@ -298,6 +298,14 @@ def is_retryable_llm_error(e: Exception) -> bool:
     # Its cost is metered where it is raised (see MantisEmptyResponseError).
     if isinstance(e, MantisEmptyResponseError):
         return True
+    # A stream cut after its first chunk (a read timeout on a silent
+    # connection, a reset) is retried as a whole turn at the model layer:
+    # the chunks already forwarded were partial events, which ADK does not
+    # persist, so re-issuing the turn splices nothing. The client layer
+    # that raised it refuses to retry for exactly the opposite reason: it
+    # cannot know what its consumer did with the chunks.
+    if isinstance(e, MantisStreamInterruptedError):
+        return True
     if isinstance(e, json.decoder.JSONDecodeError):
         return True
     try:
@@ -399,15 +407,45 @@ def output_cap_from_error(e: Exception) -> Optional[int]:
     return None
 
 
-# How long one request may take before it is abandoned and retried, when
+# Whether model turns are streamed. Streamed, the request timeout applies
+# between chunks rather than to the whole response, so a long thinking
+# turn that keeps producing stays alive while a hung connection still
+# trips it; thinking models stream their reasoning as it happens. Set from
+# the workflow's `llm_streaming` (configure_llm_streaming); the
+# environment's MANTIS_LLM_STREAM overrides either way.
+_LLM_STREAMING: dict = {"enabled": True}
+
+
+def configure_llm_streaming(enabled: Optional[bool]) -> None:
+    """Records the workflow's choice; None leaves the default (on)."""
+    if enabled is not None:
+        _LLM_STREAMING["enabled"] = bool(enabled)
+
+
+def llm_streaming_enabled() -> bool:
+    """Whether to stream model turns: MANTIS_LLM_STREAM when set, else the
+    workflow's `llm_streaming`, else on."""
+    raw = os.environ.get("MANTIS_LLM_STREAM")
+    if raw is not None and raw.strip():
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+    return bool(_LLM_STREAMING["enabled"])
+
+
+# How long one request may wait before it is abandoned and retried, when
 # the operator sets no timeout (LLM_TIMEOUT / MANTIS_TIMEOUT /
-# LLM_REQUEST_TIMEOUT). Requests are not streamed, so the whole response
-# -- thinking included -- must arrive inside it. At the highest effort a
-# single thinking turn on a frontier model has been measured past five
-# minutes; a timeout is retried, but the retry re-sends the same long
-# request and times out the same way, so too short a timeout turns a slow
-# turn into a failed stage. Models that do not think get no timeout here
-# and keep LiteLLM's.
+# LLM_REQUEST_TIMEOUT). Streamed (the default), the timeout runs between
+# chunks, and the providers keep a stream fed while the model thinks in
+# silence (measured: turns of 650 and 905 seconds with no visible chunk
+# completed under per-chunk timeouts of 10 to 60 seconds; a 641k-token
+# prompt's first chunk arrived in 78 seconds), so a server that is
+# working never meets the bound, however long the turn, and one value
+# serves every effort: a dead connection is noticed in minutes.
+# Unstreamed, the whole response -- thinking included -- must arrive
+# inside it, and at the highest effort a single turn has been measured
+# past five minutes; a timed-out turn is retried as the same long
+# request, so the value scales with effort. Models that do not think get
+# no timeout here and keep LiteLLM's.
+REQUEST_TIMEOUT_STREAMED = 300.0
 REQUEST_TIMEOUT_BY_EFFORT = {"max": 1800.0, "high": 900.0, "medium": 300.0}
 REQUEST_TIMEOUT_THINKING_MODEL = 300.0
 
@@ -415,12 +453,15 @@ REQUEST_TIMEOUT_THINKING_MODEL = 300.0
 def default_request_timeout(model: str, effort: Optional[str]) -> Optional[float]:
     """The request timeout for `model` at `effort` when none is configured."""
     level = str(effort or "").lower().strip()
+    name = str(model or "").lower()
+    thinking = level in REQUEST_TIMEOUT_BY_EFFORT or "glm" in name or "claude" in name
+    if not thinking:
+        return None
+    if llm_streaming_enabled():
+        return REQUEST_TIMEOUT_STREAMED
     if level in REQUEST_TIMEOUT_BY_EFFORT:
         return REQUEST_TIMEOUT_BY_EFFORT[level]
-    name = str(model or "").lower()
-    if "glm" in name or "claude" in name:
-        return REQUEST_TIMEOUT_THINKING_MODEL
-    return None
+    return REQUEST_TIMEOUT_THINKING_MODEL
 
 
 def resolve_output_ceiling(model: str) -> Optional[int]:
@@ -642,18 +683,33 @@ def structured_llm_request(prompt: str, system_instruction: str, schema_cls: Any
     return req
 
 
+def response_has_meaningful_content(response: Any) -> bool:
+    """ADK's own rule for whether a response says anything: a function call
+    or result, code, data, or text that is neither a thought nor whitespace.
+    A turn of thought summaries with no answer after them has none. Falls
+    back to "any part at all" if ADK's helper is unavailable."""
+    try:
+        from google.adk.flows.llm_flows.core._finalizer import has_meaningful_content
+        return bool(has_meaningful_content(response))
+    except Exception:
+        content = getattr(response, "content", None)
+        return bool(content and getattr(content, "parts", None))
+
+
 def is_empty_stop_response(response: Any) -> bool:
     """The condition ADK flags as MODEL_RETURNED_NO_CONTENT, checked on the
-    response before ADK sees it. Streaming is the caller's business: a
-    terminal finish-only chunk legitimately follows streamed content."""
+    response before ADK sees it: a final STOP response with no meaningful
+    content -- no parts, or only thought or whitespace parts, which is what
+    a streamed turn of reasoning that never reaches an answer aggregates
+    to. Partial chunks are never judged; a finish-only chunk after streamed
+    content is the caller's business (see ResilientLiteLlm)."""
     if getattr(response, "partial", False) or getattr(response, "error_code", None):
         return False
     from google.genai import types as genai_types
 
     if getattr(response, "finish_reason", None) not in (genai_types.FinishReason.STOP, "STOP"):
         return False
-    content = getattr(response, "content", None)
-    return not content or not getattr(content, "parts", None)
+    return not response_has_meaningful_content(response)
 
 
 def meter_response_usage(response: Any) -> None:
@@ -2246,6 +2302,8 @@ class ResilientLiteLlm(LiteLlm):
         auth_refreshed = False
         current_stream = stream
         while True:
+            streamed_content = False  # per attempt: has this turn yielded an answer yet
+            pending_empty = None      # a final with no answer, held until the stream shows what follows
             try:
                 from google.genai import types as genai_types
                 async for response in super().generate_content_async(llm_request, stream=current_stream):
@@ -2258,16 +2316,37 @@ class ResilientLiteLlm(LiteLlm):
                         and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
                     ):
                         raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
-                    if not current_stream and is_empty_stop_response(response):
-                        # Billed, so charged, before the turn is thrown away.
-                        # A budget ceiling crossed here raises past the
-                        # retry loop below, which does not retry that.
-                        meter_response_usage(response)
-                        raise MantisEmptyResponseError(
-                            "The model returned no content (finish_reason=STOP with empty parts)",
-                            response=response,
-                        )
+                    if pending_empty is not None:
+                        # Something followed it, so it was not the end of the
+                        # turn: pass it on as it came.
+                        yield self._sanitize_structured_response(pending_empty, schema_cls)
+                        pending_empty = None
+                    if is_empty_stop_response(response) and not streamed_content:
+                        # Streamed or not: ADK ends a streamed turn with one
+                        # final, non-partial response, and that is the one
+                        # judged here (is_empty_stop_response ignores
+                        # partial chunks). A finish-only final after an
+                        # answer was streamed in this attempt is not an
+                        # empty turn; streamed thought summaries are not an
+                        # answer, so they do not count as one. Held rather
+                        # than judged at once: an aggregator may emit a
+                        # thought-only final ahead of the tool call that
+                        # ends the turn, and only the stream's end says.
+                        pending_empty = response
+                        continue
+                    if response_has_meaningful_content(response):
+                        streamed_content = True
                     yield self._sanitize_structured_response(response, schema_cls)
+                if pending_empty is not None:
+                    # The turn ended on it: an empty turn. Billed, so charged,
+                    # before it is thrown away. A budget ceiling crossed here
+                    # raises past the retry loop below, which does not retry
+                    # that.
+                    meter_response_usage(pending_empty)
+                    raise MantisEmptyResponseError(
+                        "The model returned no content (finish_reason=STOP with empty parts)",
+                        response=pending_empty,
+                    )
                 return
             except (json.decoder.JSONDecodeError, ValueError, MantisStreamingTruncationError) as e:
                 if current_stream:
@@ -2596,6 +2675,19 @@ def get_llm_kwargs(
     # gateway (openai/gemini-*) takes OpenAI parameters, and litellm rejects
     # this one there. The litellm global stays Vertex-scoped; it only exists
     # for callers that bypass these kwargs.
+    # Prompt caching is per provider. Claude caches a prefix the request
+    # marks, and ADK marks it when the app runs with context caching on.
+    # ADK marks every model the same way, and for a Gemini model LiteLLM
+    # turns the marks into Vertex explicit caching: a cachedContents entry
+    # per distinct prefix, billed for its lifetime, and refused outright
+    # when the prefix is under the model's minimum (measured: a 1,976-token
+    # deduplicator prompt against a 4,096 minimum failed the stage with a
+    # 400). Gemini caches prefixes implicitly without any of that, and
+    # OpenAI caches automatically, so for both the request names no
+    # injection points, which ADK honours as the caller's choice.
+    if "claude" not in resolved_model:
+        llm_kwargs.setdefault("cache_control_injection_points", [])
+
     if resolved_model.startswith(("gemini/", "vertex_ai/")) and "gemini" in resolved_model:
         safety_settings = [
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
