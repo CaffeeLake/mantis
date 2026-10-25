@@ -227,6 +227,7 @@ REQUEST_OBSERVATIONS = (
     "rate_limit_retries",
     "auth_refreshes",
     "empty_turn_ends",
+    "thinking_continuations",
 )
 
 
@@ -276,6 +277,7 @@ def render_spend_summary(snapshot: Dict[str, Any]) -> list:
             "rate_limit_retries": "rate-limit retry(ies)",
             "auth_refreshes": "credential refresh(es)",
             "empty_turn_ends": "stage(s) ended on empty model turns",
+            "thinking_continuations": "turn(s) continued past a thinking segment",
         }
         counters = dict(snapshot.get("context") or {})
         counters.update(snapshot.get("requests") or {})

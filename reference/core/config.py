@@ -114,6 +114,81 @@ try:
 except Exception:
     pass
 
+
+# --- Gemini thinking continuation ----------------------------------------------------------
+#
+# Some Gemini models answer one request with at most a segment of thinking
+# (measured: about 32k thinking tokens, seven minutes at the highest
+# effort), then stop with finish reason CONTINUATION and a continuation
+# token; the same request sent again with the token continues the turn,
+# and the client's output ceiling counts across segments. The Google
+# GenAI SDK does this re-sending itself. LiteLLM at the pinned version
+# does not: it drops the token (it reads only finishReason and index from
+# a candidate) and maps the unknown finish reason to "stop", so the turn
+# ends with a thought and no answer. The fix needs the token surfaced and
+# the request re-sent, and both are done here in the layer that already
+# sees LiteLLM's responses raw. A LiteLLM that surfaces the token itself
+# is left alone, and a response LiteLLM has already continued carries no
+# token, so neither piece acts twice.
+
+CONTINUATION_TOKEN_FIELD = "continuation_token"
+CONTINUATION_RAW_FINISH_FIELD = "finish_reason_raw"
+CONTINUATION_FINISH_REASON = "CONTINUATION"
+
+
+def _install_gemini_continuation_patch() -> None:
+    try:
+        from litellm.litellm_core_utils import core_helpers
+        from litellm.llms.vertex_ai.gemini import vertex_and_google_ai_studio_gemini as _vg
+    except Exception:
+        return
+    try:
+        fmap = getattr(core_helpers, "_FINISH_REASON_MAP", None)
+        if isinstance(fmap, dict):
+            fmap.setdefault(CONTINUATION_FINISH_REASON, "length")
+    except Exception:
+        pass
+    config_cls = getattr(_vg, "VertexGeminiConfig", None)
+    original = getattr(config_cls, "_process_candidates", None)
+    if config_cls is None or original is None or getattr(original, "_mantis_continuation", False):
+        return
+
+    def _process_candidates(_candidates, model_response, standard_optional_params, cumulative_tool_call_index=0):
+        out = original(_candidates, model_response, standard_optional_params, cumulative_tool_call_index)
+        try:
+            choices = list(getattr(model_response, "choices", None) or [])
+            for idx, cand in enumerate(_candidates or []):
+                if not isinstance(cand, dict):
+                    continue
+                token = cand.get("continuationToken") or cand.get(CONTINUATION_TOKEN_FIELD)
+                raw = cand.get("finishReason")
+                if not token and not raw:
+                    continue
+                choice = choices[idx] if idx < len(choices) else (choices[-1] if choices else None)
+                holder = getattr(choice, "message", None) or getattr(choice, "delta", None)
+                if holder is None:
+                    continue
+                fields = dict(getattr(holder, "provider_specific_fields", None) or {})
+                if fields.get(CONTINUATION_TOKEN_FIELD):
+                    continue  # LiteLLM surfaced it itself
+                if token:
+                    fields[CONTINUATION_TOKEN_FIELD] = token
+                if raw:
+                    fields[CONTINUATION_RAW_FINISH_FIELD] = str(raw)
+                try:
+                    holder.provider_specific_fields = fields
+                except Exception:
+                    setattr(holder, "provider_specific_fields", fields)
+        except Exception:
+            pass
+        return out
+
+    _process_candidates._mantis_continuation = True  # type: ignore[attr-defined]
+    config_cls._process_candidates = staticmethod(_process_candidates)
+
+
+_install_gemini_continuation_patch()
+
 try:
     from google.adk.models.lite_llm import LiteLlm, LiteLLMClient, LlmCapabilities
     from pydantic import Field, PrivateAttr
@@ -1518,6 +1593,346 @@ except Exception:
     pass
 
 
+# --- Continuation helpers (pure over LiteLLM response objects) -----------------------------
+
+# A turn is continued until the provider ends it: with the answer, or with
+# MAX_TOKENS when the request's own output ceiling -- cumulative across
+# segments, set by the operator -- is spent. Ending it sooner throws every
+# segment's work away with nothing to show, so there is no cap of this
+# module's own by default. Two bounds remain. The run's budget (tokens,
+# wall clock) is consulted before each segment, since a turn of many
+# segments spends while the pipeline meters only whole turns; a run that
+# could not afford the next segment ends the turn where it is and pauses on
+# the usual path, resumable. And MANTIS_MAX_CONTINUATIONS lets an operator
+# cap the segments of one turn anyway (0, the default, is no cap).
+DEFAULT_MAX_CONTINUATIONS = 0
+
+
+def max_continuations() -> int:
+    """The operator's cap on continuations per turn; 0 for none."""
+    try:
+        return max(0, int(os.environ.get("MANTIS_MAX_CONTINUATIONS", str(DEFAULT_MAX_CONTINUATIONS))))
+    except ValueError:
+        return DEFAULT_MAX_CONTINUATIONS
+
+
+def continuation_allowed(segments_so_far: int, turn_usage: Optional[dict]) -> "tuple[bool, str]":
+    """Whether the turn may open another segment: (True, "") or (False, why).
+
+    `segments_so_far` counts the segments already run; `turn_usage` is their
+    summed usage (prompt/completion/total/cached). The run's budget is read
+    from the current RunContext's controller, with the turn's own spend so
+    far added to what the controller has already metered, since the
+    pipeline meters a turn only when it ends."""
+    cap = max_continuations()
+    if cap and segments_so_far > cap:
+        return False, f"MANTIS_MAX_CONTINUATIONS={cap} reached"
+    try:
+        from core.context import current_run_context
+
+        ctx = current_run_context.get()
+        controller = getattr(ctx, "budget_controller", None) if ctx is not None else None
+        if controller is None:
+            return True, ""
+        cfg = getattr(controller, "config", None)
+        max_tokens = int(getattr(cfg, "max_tokens", 0) or 0)
+        if max_tokens > 0 and turn_usage:
+            discount = float(getattr(cfg, "cache_discount", 0.1) or 0.0)
+            total = int(turn_usage.get("total_tokens", 0) or 0)
+            cached = int(turn_usage.get("cached_tokens", 0) or 0)
+            turn_effective = total - cached + int(cached * discount)
+            metered = int(getattr(controller, "accumulated_tokens", 0) or 0)
+            if metered + turn_effective >= max_tokens:
+                return False, (f"the run's token budget would be exceeded "
+                               f"({metered + turn_effective:,} of {max_tokens:,} with this turn)")
+        max_seconds = float(getattr(cfg, "max_wall_clock_seconds", 0) or 0)
+        if max_seconds > 0:
+            elapsed = float(getattr(controller, "elapsed_seconds", 0) or 0)
+            if elapsed >= max_seconds:
+                return False, f"the run's time budget is spent ({elapsed:.0f}s of {max_seconds:.0f}s)"
+    except Exception:
+        return True, ""
+    return True, ""
+
+
+def continuation_token_of(response_or_chunk: Any) -> Optional[str]:
+    """The provider's continuation token on a response or stream chunk whose
+    turn stopped mid-thought: present only when the raw finish reason was
+    CONTINUATION (a server-side segment end). A MAX_TOKENS stop also carries
+    a token, but means the request's own output ceiling is spent, and
+    sending the token again would stop the same way at once."""
+    try:
+        choices = getattr(response_or_chunk, "choices", None) or []
+        for choice in choices:
+            holder = getattr(choice, "message", None) or getattr(choice, "delta", None)
+            fields = getattr(holder, "provider_specific_fields", None) or {}
+            if not isinstance(fields, dict):
+                continue
+            token = fields.get(CONTINUATION_TOKEN_FIELD)
+            raw = str(fields.get(CONTINUATION_RAW_FINISH_FIELD) or "").upper()
+            if token and raw == CONTINUATION_FINISH_REASON:
+                return str(token)
+    except Exception:
+        return None
+    return None
+
+
+def with_continuation_token(kwargs: dict, token: str) -> dict:
+    """The same request, with the token on the body's top level, where the
+    provider reads it (LiteLLM merges `extra_body` there)."""
+    out = dict(kwargs)
+    extra = dict(out.get("extra_body") or {})
+    extra["continuationToken"] = token
+    out["extra_body"] = extra
+    return out
+
+
+def _add_usage(total: Optional[dict], usage: Any) -> Optional[dict]:
+    """Sums the token fields of LiteLLM usage objects into one dict. The
+    provider counts each segment's prompt again (and serves most of it from
+    cache, the resend being byte-identical), so the cached count is summed
+    with the rest and the turn's cache ratio stays true."""
+    if usage is None:
+        return total
+    out = dict(total or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        try:
+            value = int(getattr(usage, key, None) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        out[key] = int(out.get(key, 0)) + value
+    cached = _cached_tokens_of(usage)
+    if cached or "cached_tokens" in out:
+        out["cached_tokens"] = int(out.get("cached_tokens", 0)) + cached
+    return out
+
+
+def _cached_tokens_of(usage: Any) -> int:
+    details = getattr(usage, "prompt_tokens_details", None)
+    try:
+        if isinstance(details, dict):
+            return int(details.get("cached_tokens") or 0)
+        return int(getattr(details, "cached_tokens", None) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_usage(usage: Any, total: Optional[dict]) -> None:
+    if usage is None or not total:
+        return
+    for key, value in total.items():
+        if key == "cached_tokens":
+            details = getattr(usage, "prompt_tokens_details", None)
+            try:
+                if isinstance(details, dict):
+                    details["cached_tokens"] = value
+                elif details is not None:
+                    setattr(details, "cached_tokens", value)
+                else:
+                    from litellm.types.utils import PromptTokensDetailsWrapper
+                    usage.prompt_tokens_details = PromptTokensDetailsWrapper(cached_tokens=value)
+            except Exception:
+                pass
+            continue
+        try:
+            setattr(usage, key, value)
+        except Exception:
+            pass
+
+
+def _is_usage_only_chunk(chunk: Any) -> bool:
+    return not (getattr(chunk, "choices", None) or []) and getattr(chunk, "usage", None) is not None
+
+
+def _usage_note(usage: Any) -> str:
+    """'; segment used 33,101 prompt (32,900 cached), 32,765 output tokens' for
+    the continuation notice; '' when the segment reported no usage."""
+    if usage is None:
+        return ""
+    try:
+        prompt = int(getattr(usage, "prompt_tokens", None) or 0)
+        completion = int(getattr(usage, "completion_tokens", None) or 0)
+    except (TypeError, ValueError):
+        return ""
+    return f"; segment used {prompt:,} prompt ({_cached_tokens_of(usage):,} cached), {completion:,} output tokens"
+
+
+def _chunk_has_payload(chunk: Any) -> bool:
+    """Whether a stream chunk carries anything besides a finish reason."""
+    for choice in getattr(chunk, "choices", None) or []:
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        if getattr(delta, "content", None) or getattr(delta, "tool_calls", None) or getattr(delta, "reasoning_content", None):
+            return True
+    return False
+
+
+def _strip_finish(chunk: Any) -> Any:
+    for choice in getattr(chunk, "choices", None) or []:
+        try:
+            choice.finish_reason = None
+        except Exception:
+            pass
+    return chunk
+
+
+def merge_continued_response(first: Any, continued: Any) -> Any:
+    """Folds a continuation segment's response into the turn's: text and
+    reasoning appended, tool calls and finish reason taken from the later
+    segment (a turn ends in one place), usage summed, the token kept only
+    while the latest segment still offers one."""
+    try:
+        f_choice = first.choices[0]
+        c_choice = continued.choices[0]
+        f_msg, c_msg = f_choice.message, c_choice.message
+        if getattr(c_msg, "content", None):
+            f_msg.content = (getattr(f_msg, "content", None) or "") + c_msg.content
+        c_reasoning = getattr(c_msg, "reasoning_content", None)
+        if c_reasoning:
+            f_reasoning = getattr(f_msg, "reasoning_content", None) or ""
+            try:
+                f_msg.reasoning_content = f_reasoning + c_reasoning
+            except Exception:
+                pass
+        if getattr(c_msg, "tool_calls", None):
+            f_msg.tool_calls = c_msg.tool_calls
+        f_msg.provider_specific_fields = dict(getattr(c_msg, "provider_specific_fields", None) or {})
+        f_choice.finish_reason = c_choice.finish_reason
+        total = _add_usage(_add_usage(None, getattr(first, "usage", None)), getattr(continued, "usage", None))
+        if getattr(first, "usage", None) is not None:
+            _apply_usage(first.usage, total)
+        elif getattr(continued, "usage", None) is not None:
+            first.usage = continued.usage
+    except Exception:
+        return first
+    return first
+
+
+class _ContinuationSplicer:
+    """Delivers a streamed turn across continuation segments as one stream.
+
+    Within a segment, chunks pass through. A segment's final chunk that
+    carries a continuation token is withheld (its content, if any, is passed
+    on without the finish), its usage chunk is summed and withheld, and the
+    next segment is opened with the token through the same first-chunk retry
+    as the first. The final segment's finish passes through, and its usage
+    chunk carries the sum. A failure after delivery raises
+    MantisStreamInterruptedError, as before.
+    """
+
+    def __init__(self, client: Any, model: Any, messages: Any, tools: Any, kwargs: dict):
+        self.client = client
+        self.model = model
+        self.messages = messages
+        self.tools = tools
+        self.kwargs = kwargs
+        self.chunks_yielded = 0
+        self.usage_total: Optional[dict] = None
+        self.segments = 1
+
+    async def deliver(self, first_chunk: Any, stream_iter: Any):
+        while True:
+            # --- one segment. Chunks that end a turn -- a finish reason, usage
+            # -- are held until the segment is over, because only then is it
+            # known whether this segment ends the turn or a continuation
+            # follows; LiteLLM may put the finish, the token and the usage on
+            # different chunks, in any order, so none of them is judged alone.
+            pending_token: Optional[str] = None
+            held: list = []
+            chunk = first_chunk
+            first_chunk = None
+            while True:
+                if chunk is not None:
+                    token = continuation_token_of(chunk)
+                    if token:
+                        pending_token = token
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        self.usage_total = _add_usage(self.usage_total, usage)
+                    if usage is not None or _chunk_has_finish(chunk):
+                        held.append(chunk)
+                    else:
+                        if held:
+                            # Content after a finish-bearing chunk: the turn did
+                            # not end there after all. Pass the held chunks on.
+                            for h in held:
+                                yield h
+                                self.chunks_yielded += 1
+                            held = []
+                        yield chunk
+                        self.chunks_yielded += 1
+                try:
+                    chunk = await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    raise MantisStreamInterruptedError(
+                        f"Stream from '{self.model}' failed after {self.chunks_yielded} chunk(s) were already delivered "
+                        f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
+                        "two different completions together; the consumer owns the continuation policy.",
+                        chunks_yielded=self.chunks_yielded,
+                        original_exception=e,
+                    ) from e
+            # --- segment over
+            allowed, why = continuation_allowed(self.segments, self.usage_total) if pending_token else (False, "")
+            if pending_token and not allowed:
+                print(
+                    f"\n[CONTINUATION] '{self.model}' stopped mid-thought after {self.segments} segment(s) and is "
+                    f"not continued: {why}. The turn ends here.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if pending_token and allowed:
+                # A continuation follows: the held chunks' content goes on,
+                # their finish and usage do not (the turn is not over).
+                segment_usage = next((getattr(h, "usage", None) for h in reversed(held) if getattr(h, "usage", None) is not None), None)
+                for h in held:
+                    if _chunk_has_payload(h):
+                        _strip_finish(h)
+                        try:
+                            h.usage = None
+                        except Exception:
+                            pass
+                        yield h
+                        self.chunks_yielded += 1
+                self.segments += 1
+                _observe("thinking_continuations")
+                print(
+                    f"\n[CONTINUATION] '{self.model}' stopped mid-thought; continuing the turn "
+                    f"(segment {self.segments}){_usage_note(segment_usage)}...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    first_chunk, stream_iter = await self.client._open_stream_with_retry(
+                        self.model, self.messages, self.tools, with_continuation_token(self.kwargs, pending_token),
+                    )
+                except Exception as e:
+                    raise MantisStreamInterruptedError(
+                        f"Continuation of a turn from '{self.model}' could not be opened after "
+                        f"{self.chunks_yielded} chunk(s) were delivered ({type(e).__name__}: {e}).",
+                        chunks_yielded=self.chunks_yielded,
+                        original_exception=e,
+                    ) from e
+                if first_chunk is None:
+                    held = []
+                    break  # an empty continuation: the turn ends here
+                continue
+            # This segment ends the turn: its held chunks go on as they came,
+            # the usage carrying the whole turn's sum.
+            for h in held:
+                if getattr(h, "usage", None) is not None and self.segments > 1:
+                    _apply_usage(h.usage, self.usage_total)
+                yield h
+                self.chunks_yielded += 1
+            break
+
+
+def _chunk_has_finish(chunk: Any) -> bool:
+    return any(getattr(choice, "finish_reason", None) for choice in (getattr(chunk, "choices", None) or []))
+
+
 class ResilientLiteLLMClient(LiteLLMClient):
     """LiteLLMClient with full jitter exponential backoff (min offset 5s, 1h patience) on 429/quota exhaustion.
 
@@ -1538,6 +1953,11 @@ class ResilientLiteLLMClient(LiteLLMClient):
         **kwargs: Any,
     ) -> Any:
         import litellm
+
+        # A continuation segment's own request: it must not continue again
+        # itself (its caller is the loop that does). Popped before LiteLLM
+        # sees the kwargs.
+        no_continue = bool(kwargs.pop("_mantis_no_continue", False))
 
         # Before the retry loop, not inside it: an oversized request is deterministic, so
         # every pass through the loop would upload the same doomed payload again.
@@ -1570,7 +1990,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
                     **kwargs,
                 )
                 _observe_context_edits(response)
-                return response
+                if no_continue:
+                    return response
+                return await self._continue_turn(response, model, messages, tools, kwargs)
             except Exception as e:
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
@@ -1617,6 +2039,45 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 )
                 await asyncio.sleep(delay)
 
+    async def _continue_turn(self, response: Any, model: Any, messages: Any, tools: Any, kwargs: dict) -> Any:
+        """Continues a whole-response turn the provider ended mid-thought: the
+        same request is sent again with the continuation token, each segment
+        through the full retry loop, and the segments are folded into one
+        response (merge_continued_response). Continues until the provider
+        ends the turn, unless the run's budget or the operator's cap says
+        otherwise (continuation_allowed); then the turn stands as the
+        provider last left it."""
+        segments = 1
+        token = continuation_token_of(response)
+        segment_usage = getattr(response, "usage", None)  # the latest segment's own usage, for the notice
+        turn_usage = _add_usage(None, segment_usage)
+        while token:
+            allowed, why = continuation_allowed(segments, turn_usage)
+            if not allowed:
+                print(
+                    f"\n[CONTINUATION] '{model}' stopped mid-thought after {segments} segment(s) and is "
+                    f"not continued: {why}. The turn ends here.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+            segments += 1
+            _observe("thinking_continuations")
+            print(
+                f"\n[CONTINUATION] '{model}' stopped mid-thought; continuing the turn "
+                f"(segment {segments}){_usage_note(segment_usage)}...",
+                file=sys.stderr,
+                flush=True,
+            )
+            inner = with_continuation_token(kwargs, token)
+            inner["_mantis_no_continue"] = True
+            continued = await self.acompletion(model, messages, tools, stream=False, **inner)
+            segment_usage = getattr(continued, "usage", None)
+            turn_usage = _add_usage(turn_usage, segment_usage)
+            response = merge_continued_response(response, continued)
+            token = continuation_token_of(response)
+        return response
+
     async def _astream_with_retry(
         self,
         model: Any,
@@ -1625,15 +2086,36 @@ class ResilientLiteLLMClient(LiteLLMClient):
         kwargs: dict,
     ) -> Any:
         """Streams a completion with retries confined to the pre-first-chunk window.
-
         Everything up to and including the first chunk re-enters the full jitter
         backoff / auth-refresh loop: no output has been delivered yet, so re-opening
         the stream is indistinguishable from a slow first attempt. The patience clock
         is shared across restarts (never reset per attempt). Once a chunk has been
         yielded, a failure raises MantisStreamInterruptedError instead of retrying:
-        sampling is nondeterministic, so a transparent restart would splice two
+        sampling is nondeterministic, so a transparent retry would splice two
         different completions together behind the consumer's back.
+
+        A turn the provider ends with a continuation token is continued here
+        (see _install_gemini_continuation_patch): the same request is sent again
+        with the token and its chunks follow the first segment's as one stream,
+        the finish and usage of the segments in between withheld, the usage of
+        the whole turn summed on the final usage chunk.
         """
+        first_chunk, stream_iter = await self._open_stream_with_retry(model, messages, tools, kwargs)
+        if first_chunk is None:
+            return
+        splicer = _ContinuationSplicer(self, model, messages, tools, kwargs)
+        async for chunk in splicer.deliver(first_chunk, stream_iter):
+            yield chunk
+
+    async def _open_stream_with_retry(
+        self,
+        model: Any,
+        messages: Any,
+        tools: Any,
+        kwargs: dict,
+    ) -> "tuple[Any, Any]":
+        """Opens a stream and reads its first chunk, retrying everything up to that
+        point. Returns (first_chunk, iterator); (None, None) for an empty stream."""
         import litellm
 
         max_patience = float(os.environ.get("MANTIS_LLM_MAX_PATIENCE_SECONDS", "3600.0"))
@@ -1659,7 +2141,8 @@ class ResilientLiteLLMClient(LiteLLMClient):
                     first_chunk = await stream_iter.__anext__()
                 except StopAsyncIteration:
                     # An empty stream is a successfully completed (if silent) response.
-                    return
+                    return None, None
+                return first_chunk, stream_iter
             except Exception as e:
                 if is_auth_error(e):
                     if not auth_refreshed and is_token_refreshable_auth_error(e) and try_refresh_auth():
@@ -1671,11 +2154,9 @@ class ResilientLiteLLMClient(LiteLLMClient):
                         format_auth_error_message(e, model=str(model)),
                         original_exception=e,
                     ) from None
-
                 elapsed = time.time() - start_time
                 if not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
-
                 remaining = max_patience - elapsed
                 retry_after = extract_retry_after(e)
                 delay = compute_full_jitter_delay(
@@ -1687,7 +2168,6 @@ class ResilientLiteLLMClient(LiteLLMClient):
                     retry_after=retry_after,
                     max_remaining=remaining,
                 )
-
                 attempt += 1
                 model_name = str(model)
                 _observe("retries")
@@ -1706,26 +2186,6 @@ class ResilientLiteLLMClient(LiteLLMClient):
                 )
                 await asyncio.sleep(delay)
                 continue
-
-            break
-
-        yield first_chunk
-        chunks_yielded = 1
-        while True:
-            try:
-                chunk = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                return
-            except Exception as e:
-                raise MantisStreamInterruptedError(
-                    f"Stream from '{model}' failed after {chunks_yielded} chunk(s) were already delivered "
-                    f"({type(e).__name__}: {e}). A transparent retry would re-sample the model and splice "
-                    "two different completions together; the consumer owns the continuation policy.",
-                    chunks_yielded=chunks_yielded,
-                    original_exception=e,
-                ) from e
-            yield chunk
-            chunks_yielded += 1
 
     def completion(
         self,
