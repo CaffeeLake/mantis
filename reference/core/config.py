@@ -363,6 +363,26 @@ def extract_retry_after(e: Exception) -> Optional[float]:
     return None
 
 
+# The output-token ceiling Claude models get unless the operator sets one.
+# Thinking counts against it, and at high effort one turn of thinking can
+# pass 32k; current models allow 128k. A model that allows less says so
+# when it rejects the request, and the request is retried at the ceiling
+# it named (output_cap_from_error).
+CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS = 128000
+_OUTPUT_CAP_RE = re.compile(r"max_tokens:\s*(\d+)\s*>\s*(\d+)")
+
+
+def output_cap_from_error(e: Exception) -> Optional[int]:
+    """The output-token ceiling a provider names when it rejects a request
+    for asking more ('max_tokens: 65536 > 32000, which is the maximum
+    allowed number of output tokens...'); None for any other error."""
+    m = _OUTPUT_CAP_RE.search(str(e))
+    if not m:
+        return None
+    asked, allowed = int(m.group(1)), int(m.group(2))
+    return allowed if 0 < allowed < asked else None
+
+
 def extract_rate_limit_detail(e: Exception) -> str:
     """Extracts a succinct summary of the rate limit reason from the exception."""
     msg = str(e)
@@ -2110,6 +2130,22 @@ class ResilientLiteLlm(LiteLlm):
 
         return response
 
+    def _lower_output_cap(self, cap: int) -> bool:
+        """Lowers this model's `max_tokens` to `cap` for every call from now
+        on. False when the request already asked for no more than that, so
+        a provider message the retry cannot act on is raised as it came."""
+        additional = getattr(self, "_additional_args", None)
+        if not isinstance(additional, dict):
+            return False
+        try:
+            current = int(additional.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current and current <= int(cap):
+            return False
+        additional["max_tokens"] = int(cap)
+        return True
+
     async def generate_content_async(
         self, llm_request: Any, stream: bool = False
     ) -> Any:
@@ -2214,6 +2250,20 @@ class ResilientLiteLlm(LiteLlm):
                         flush=True,
                     )
                     current_stream = False
+                    continue
+
+                output_cap = output_cap_from_error(e)
+                if output_cap and self._lower_output_cap(output_cap):
+                    # The provider named a lower output ceiling than the
+                    # request asked for. Same request, at that ceiling, once;
+                    # the instance remembers it for every later call.
+                    model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
+                    print(
+                        f"\n[LLM RETRY] '{model_name}' allows at most {output_cap} output tokens; "
+                        "retrying at that ceiling...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     continue
 
                 if is_auth_error(e):
@@ -2422,7 +2472,13 @@ def get_llm_kwargs(
             llm_kwargs["max_tokens"] = int(max_tokens_val)
         except (ValueError, TypeError):
             pass
-    elif effort in ("high", "medium") or "claude" in resolved_model:
+    elif "claude" in resolved_model:
+        # Thinking shares the output budget: at high effort a single turn
+        # can pass 32k, and the turn then ends with MAX_TOKENS. Models that
+        # allow less than this reject the request and name their ceiling;
+        # ResilientLiteLlm retries at that ceiling (output_cap_from_error).
+        llm_kwargs.setdefault("max_tokens", CLAUDE_DEFAULT_MAX_OUTPUT_TOKENS)
+    elif effort in ("high", "medium"):
         # Provide a generous output token budget so thinking tokens do not starve response text
         llm_kwargs.setdefault("max_tokens", 32768)
 
